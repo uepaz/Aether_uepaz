@@ -88,7 +88,7 @@
           <!-- Navigation -->
           <nav class="flex items-center gap-2 mx-8 lg:mx-16">
             <button
-              v-for="(section, index) in resolvedSections.slice(0, -1)"
+              v-for="(section, index) in resolvedSections"
               :key="index"
               class="group relative px-3 py-2 text-sm font-medium transition whitespace-nowrap"
               :class="currentSection === index
@@ -100,25 +100,6 @@
               <div
                 class="absolute bottom-0 left-0 right-0 h-0.5 rounded-full transition-all duration-300"
                 :class="currentSection === index ? 'bg-[#cc785c] dark:bg-[#d4a27f] scale-x-100' : 'bg-transparent scale-x-0'"
-              />
-            </button>
-            <RouterLink
-              to="/guide"
-              class="group relative px-3 py-2 text-sm font-medium transition whitespace-nowrap text-[#666663] dark:text-muted-foreground hover:text-[#191919] dark:hover:text-white"
-            >
-              {{ t('site.home.docLink') }}
-            </RouterLink>
-            <button
-              class="group relative px-3 py-2 text-sm font-medium transition whitespace-nowrap"
-              :class="currentSection === SECTIONS.FEATURES
-                ? 'text-[#cc785c] dark:text-[#d4a27f]'
-                : 'text-[#666663] dark:text-muted-foreground hover:text-[#191919] dark:hover:text-white'"
-              @click="scrollToSection(SECTIONS.FEATURES)"
-            >
-              {{ resolvedSections[SECTIONS.FEATURES].name }}
-              <div
-                class="absolute bottom-0 left-0 right-0 h-0.5 rounded-full transition-all duration-300"
-                :class="currentSection === SECTIONS.FEATURES ? 'bg-[#cc785c] dark:bg-[#d4a27f] scale-x-100' : 'bg-transparent scale-x-0'"
               />
             </button>
           </nav>
@@ -194,9 +175,8 @@
                 :type="currentLogoType"
                 :size="windowWidth < 768 ? 200 : 320"
                 :use-adaptive="false"
-                :disable-ripple="currentSection === SECTIONS.GEMINI || currentSection === SECTIONS.FEATURES"
+                :disable-ripple="currentSection === SECTIONS.GEMINI"
                 :anim-delay="logoTransitionDelay"
-                :static="currentSection === SECTIONS.FEATURES"
                 class="logo-active"
                 :class="[currentLogoClass]"
               />
@@ -303,99 +283,6 @@
         content-position="right"
         @copy="copyToClipboard"
       />
-
-      <!-- Section 4: Features -->
-      <section
-        ref="section4"
-        class="min-h-screen snap-start flex items-center justify-center px-4 sm:px-8 md:px-16 lg:px-20 py-12 md:py-20 relative overflow-hidden"
-      >
-        <div class="max-w-4xl mx-auto text-center relative z-10">
-          <div
-            class="inline-flex items-center gap-1.5 md:gap-2 rounded-full bg-[#cc785c]/10 dark:bg-[#cc785c]/20 border border-[#cc785c]/20 dark:border-[#d4a27f]/30 px-3 md:px-4 py-1.5 md:py-2 text-xs md:text-sm font-medium text-[#cc785c] dark:text-[#d4a27f] mb-4 md:mb-6 backdrop-blur-sm transition-all duration-500"
-            :style="getBadgeStyle(SECTIONS.FEATURES)"
-          >
-            <Sparkles class="h-3.5 w-3.5 md:h-4 md:w-4" />
-            {{ t('site.home.projectProgress') }}
-          </div>
-
-          <h2
-            class="text-2xl md:text-5xl font-bold text-[#191919] dark:text-white mb-3 md:mb-6 transition-all duration-700"
-            :style="getTitleStyle(SECTIONS.FEATURES)"
-          >
-            {{ t('site.home.featureProgress') }}
-          </h2>
-
-          <p
-            class="text-base md:text-lg text-[#666663] dark:text-[#c9c3b4] mb-6 md:mb-12 max-w-2xl mx-auto transition-all duration-700"
-            :style="getDescStyle(SECTIONS.FEATURES)"
-          >
-            {{ t('site.home.featureProgressDesc') }}
-          </p>
-
-          <div class="grid md:grid-cols-3 gap-3 md:gap-6">
-            <div
-              v-for="(feature, idx) in resolvedFeatureCards"
-              :key="idx"
-              class="group bg-white/90 dark:bg-[#262624]/80 backdrop-blur-sm rounded-xl md:rounded-2xl p-4 md:p-6 border transition-all duration-700"
-              :class="feature.status === 'completed'
-                ? 'border-[#cc785c]/20 dark:border-[#d4a27f]/20'
-                : 'border-[#e5e4df] dark:border-[rgba(227,224,211,0.16)] border-dashed'"
-              :style="getFeatureCardStyle(SECTIONS.FEATURES, idx)"
-            >
-              <div
-                class="flex h-10 w-10 md:h-12 md:w-12 items-center justify-center rounded-lg md:rounded-xl mb-2 md:mb-4 mx-auto bg-[#cc785c]/8 dark:bg-[#cc785c]/12"
-              >
-                <component
-                  :is="feature.icon"
-                  class="h-5 w-5 md:h-6 md:w-6 text-[#cc785c] dark:text-[#d4a27f]"
-                  :class="{ 'opacity-50': feature.status !== 'completed' }"
-                />
-              </div>
-              <h3
-                class="text-base md:text-lg font-bold mb-1 md:mb-2"
-                :class="feature.status === 'completed'
-                  ? 'text-[#191919] dark:text-white'
-                  : 'text-[#666663] dark:text-[#a0a0a0]'"
-              >
-                {{ feature.title }}
-              </h3>
-              <p class="text-xs md:text-sm text-[#666663] dark:text-[#c9c3b4]">
-                {{ feature.desc }}
-              </p>
-              <div
-                class="mt-2 md:mt-3 inline-flex items-center gap-1.5 px-2 md:px-2.5 py-0.5 md:py-1 rounded-full text-xs font-medium border"
-                :class="feature.status === 'completed'
-                  ? 'bg-[#cc785c]/5 text-[#cc785c] dark:text-[#d4a27f] border-[#cc785c]/20 dark:border-[#d4a27f]/20'
-                  : 'bg-transparent text-[#91918d] dark:text-[#808080] border-[#e5e4df] dark:border-[rgba(227,224,211,0.12)]'"
-              >
-                {{ feature.status === 'completed' ? t('site.home.status.completed') : t('site.home.status.inProgress') }}
-              </div>
-            </div>
-          </div>
-
-          <div
-            class="mt-6 md:mt-12 transition-all duration-700 flex items-center justify-center gap-4 relative z-30"
-            :style="getButtonsStyle(SECTIONS.FEATURES)"
-          >
-            <RouterLink
-              v-if="authStore.isAuthenticated"
-              :to="dashboardPath"
-              class="inline-flex items-center justify-center gap-2 rounded-xl bg-transparent border-2 border-[#cc785c] px-6 py-3 text-base font-semibold text-[#cc785c] dark:text-[#d4a27f] dark:border-[#d4a27f] transition hover:bg-[#cc785c]/10 dark:hover:bg-[#d4a27f]/10 hover:scale-105 w-[160px]"
-            >
-              <Rocket class="h-5 w-5" />
-              {{ t('site.home.enterDashboard') }}
-            </RouterLink>
-            <button
-              v-else
-              class="inline-flex items-center justify-center gap-2 rounded-xl bg-transparent border-2 border-[#cc785c] px-6 py-3 text-base font-semibold text-[#cc785c] dark:text-[#d4a27f] dark:border-[#d4a27f] transition hover:bg-[#cc785c]/10 dark:hover:bg-[#d4a27f]/10 hover:scale-105 w-[160px]"
-              @click="showLoginDialog = true"
-            >
-              <Rocket class="h-5 w-5" />
-              {{ t('site.home.startNow') }}
-            </button>
-          </div>
-        </div>
-      </section>
     </main>
 
     <LoginDialog v-model="showLoginDialog" />
@@ -408,7 +295,6 @@ import { RouterLink } from 'vue-router'
 import {
   ChevronDown,
   Code2,
-  Rocket,
   Sparkles,
   Terminal
 } from 'lucide-vue-next'
@@ -428,7 +314,6 @@ import { platformPresets, getInstallCommand } from '@/config/platform-presets'
 import {
   SECTIONS,
   sections,
-  featureCards,
   useCliConfigs,
   getLogoType,
   getLogoClass
@@ -456,27 +341,20 @@ const resolvedSections = computed(() => sections.map(section => ({
   name: t(section.nameKey)
 })))
 
-const resolvedFeatureCards = computed(() => featureCards.map(card => ({
-  ...card,
-  title: t(card.titleKey),
-  desc: t(card.descKey),
-})))
-
 // Scroll state
 const scrollContainer = ref<HTMLElement | null>(null)
 const currentSection = ref(0)
 const previousSection = ref(0)
 const scrollDirection = ref<'up' | 'down'>('down')
 const windowWidth = ref(typeof window !== 'undefined' ? window.innerWidth : 1024)
-const sectionVisibility = ref<number[]>([0, 0, 0, 0, 0])
+const sectionVisibility = ref<number[]>(sections.map(() => 0))
 let lastScrollY = 0
 
-// Section refs - section0 and section4 are direct HTML elements, section1-3 are CliSection components
+// section0 是首页元素，section1-3 是 CLI 页面组件。
 const section0 = ref<HTMLElement | null>(null)
 const section1 = ref<InstanceType<typeof CliSection> | null>(null)
 const section2 = ref<InstanceType<typeof CliSection> | null>(null)
 const section3 = ref<InstanceType<typeof CliSection> | null>(null)
-const section4 = ref<HTMLElement | null>(null)
 
 // Helper to get DOM element from ref (handles both direct elements and component instances)
 const getSectionElement = (index: number): HTMLElement | null => {
@@ -485,7 +363,6 @@ const getSectionElement = (index: number): HTMLElement | null => {
     case 1: return (section1.value?.sectionEl as HTMLElement | null | undefined) ?? null
     case 2: return (section2.value?.sectionEl as HTMLElement | null | undefined) ?? null
     case 3: return (section3.value?.sectionEl as HTMLElement | null | undefined) ?? null
-    case 4: return section4.value
     default: return null
   }
 }
@@ -501,10 +378,8 @@ const {
   getBadgeStyle,
   getTitleStyle,
   getDescStyle,
-  getButtonsStyle,
   getScrollIndicatorStyle,
-  getCardStyle,
-  getFeatureCardStyle
+  getCardStyle
 } = useSectionAnimations(sectionVisibility)
 
 const { fixedLogoStyle } = useLogoPosition(currentSection, windowWidth)
@@ -516,11 +391,7 @@ const currentLogoClass = computed(() => getLogoClass(currentSection.value))
 
 // Responsive logo size - matches .logo-container.home-section CSS
 const homeLogoSize = computed(() => windowWidth.value < 768 ? 280 : 400)
-const logoTransitionDelay = computed(() => {
-  if (currentSection.value === SECTIONS.FEATURES) return 0
-  if (previousSection.value === SECTIONS.FEATURES) return 200
-  return 500
-})
+const logoTransitionDelay = 500
 
 // Platform states
 const claudePlatform = ref(platformPresets.claude.defaultValue)
@@ -617,13 +488,13 @@ const handleScroll = () => {
   lastScrollY = newScrollY
 
   // Update visibility
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < sections.length; i++) {
     sectionVisibility.value[i] = calculateVisibility(getSectionElement(i))
   }
 
   // Update current section
   const scrollMiddle = newScrollY + containerHeight / 2
-  for (let i = 4; i >= 0; i--) {
+  for (let i = sections.length - 1; i >= 0; i--) {
     const section = getSectionElement(i)
     if (section && section.offsetTop <= scrollMiddle) {
       if (currentSection.value !== i) {

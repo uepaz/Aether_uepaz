@@ -21,7 +21,7 @@ export function resolveHomeRedirect(
 
   // 已登录用户如果是从dashboard返回首页、刷新首页、或者有returnTo参数,允许访问首页
   const isFromApp =
-    from.path.startsWith('/dashboard') || from.path.startsWith('/admin') || from.path.startsWith('/guide') || from.path === '/'
+    from.path.startsWith('/dashboard') || from.path.startsWith('/admin') || from.path === '/'
   if (to.query.returnTo || isFromApp) {
     return ''
   }

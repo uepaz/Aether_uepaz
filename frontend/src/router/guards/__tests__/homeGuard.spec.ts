@@ -36,7 +36,7 @@ describe('resolveHomeRedirect', () => {
 
   it('allows authenticated users to return to the public home from the app shell', () => {
     expect(resolveHomeRedirect(route('/'), route('/dashboard'), authStore({ isAuthenticated: true }))).toBe('')
-    expect(resolveHomeRedirect(route('/', { returnTo: '/guide' }), route('/external'), authStore({ isAuthenticated: true }))).toBe('')
+    expect(resolveHomeRedirect(route('/', { returnTo: '/status' }), route('/external'), authStore({ isAuthenticated: true }))).toBe('')
   })
 
   it('consumes stored redirect path before falling back to dashboard defaults', () => {

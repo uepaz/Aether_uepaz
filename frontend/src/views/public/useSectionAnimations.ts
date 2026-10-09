@@ -7,24 +7,19 @@ const ANIMATION_CONFIG = {
     badge: 0,
     title: 0.1,
     desc: 0.2,
-    buttons: 0.3,
     scrollIndicator: 0.4,
     cardBase: 0.25,
-    cardIncrement: 0.1,
-    featureCardBase: 0.2,
-    featureCardIncrement: 0.15
+    cardIncrement: 0.1
   },
   translateY: {
     home: 30,
     cli: 10,
-    badge: 8,
-    featureCard: 30
+    badge: 8
   },
   translateX: {
     badge: 24,
     title: 32,
     desc: 28,
-    buttons: 24,
     card: 20
   }
 } as const
@@ -87,19 +82,6 @@ export function useSectionAnimations(sectionVisibility: Ref<number[]>) {
     }
   }
 
-  const getButtonsStyle = (index: number): CSSProperties => {
-    const visibility = sectionVisibility.value[index]
-    const adjustedVisibility = Math.max(0, visibility - delays.buttons) / (1 - delays.buttons)
-    const progress = Math.min(1, adjustedVisibility * 2)
-    const yBase = getDirectionMultiplier(index) === 0 ? 20 : translateY.badge
-    const offsetY = (1 - progress) * yBase
-    const offsetX = getHorizontalOffset(index, translateX.buttons, progress)
-    return {
-      opacity: progress,
-      transform: `translate(${offsetX}px, ${offsetY}px)`
-    }
-  }
-
   const getScrollIndicatorStyle = (index: number): CSSProperties => {
     const visibility = sectionVisibility.value[index]
     const adjustedVisibility = Math.max(0, visibility - delays.scrollIndicator) / (1 - delays.scrollIndicator)
@@ -121,27 +103,12 @@ export function useSectionAnimations(sectionVisibility: Ref<number[]>) {
     }
   }
 
-  const getFeatureCardStyle = (sectionIndex: number, cardIndex: number): CSSProperties => {
-    const visibility = sectionVisibility.value[sectionIndex]
-    const totalDelay = delays.featureCardBase + cardIndex * delays.featureCardIncrement
-    const adjustedVisibility = Math.max(0, visibility - totalDelay) / (1 - totalDelay)
-    const opacity = Math.min(1, adjustedVisibility * 2)
-    const offsetY = (1 - Math.min(1, adjustedVisibility * 2)) * translateY.featureCard
-    const scale = 0.9 + Math.min(1, adjustedVisibility * 2) * 0.1
-    return {
-      opacity,
-      transform: `translateY(${offsetY}px) scale(${scale})`
-    }
-  }
-
   return {
     getBadgeStyle,
     getTitleStyle,
     getDescStyle,
-    getButtonsStyle,
     getScrollIndicatorStyle,
-    getCardStyle,
-    getFeatureCardStyle
+    getCardStyle
   }
 }
 

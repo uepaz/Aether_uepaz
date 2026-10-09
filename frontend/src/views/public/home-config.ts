@@ -1,13 +1,11 @@
 import { computed, type Ref } from 'vue'
-import { Layers, Puzzle, Users } from 'lucide-vue-next'
 
 // Section index constants
 export const SECTIONS = {
   HOME: 0,
   CLAUDE: 1,
   CODEX: 2,
-  GEMINI: 3,
-  FEATURES: 4
+  GEMINI: 3
 } as const
 
 export type SectionIndex = (typeof SECTIONS)[keyof typeof SECTIONS]
@@ -17,30 +15,7 @@ export const sections = [
   { nameKey: 'site.home.section.home' },
   { nameKey: 'site.home.section.claude' },
   { nameKey: 'site.home.section.codex' },
-  { nameKey: 'site.home.section.gemini' },
-  { nameKey: 'site.home.section.more' }
-] as const
-
-// Feature cards data
-export const featureCards = [
-  {
-    icon: Layers,
-    titleKey: 'site.home.feature.cards.multi',
-    descKey: 'site.home.feature.cards.multiDesc',
-    status: 'completed' as const
-  },
-  {
-    icon: Puzzle,
-    titleKey: 'site.home.feature.cards.format',
-    descKey: 'site.home.feature.cards.formatDesc',
-    status: 'completed' as const
-  },
-  {
-    icon: Users,
-    titleKey: 'site.home.feature.cards.collaboration',
-    descKey: 'site.home.feature.cards.collaborationDesc',
-    status: 'in-progress' as const
-  }
+  { nameKey: 'site.home.section.gemini' }
 ] as const
 
 // CLI configuration generators
