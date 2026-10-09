@@ -1,4 +1,5 @@
 use chrono::{TimeZone, Utc};
+use futures_util::FutureExt;
 use serde_json::json;
 use sqlx::{Postgres, QueryBuilder, Row};
 use std::sync::Arc;
@@ -28,6 +29,92 @@ use aether_data_contracts::repository::usage::{
 
 fn normalize_newlines(value: &str) -> String {
     value.replace("\r\n", "\n")
+}
+
+async fn assert_live_usage_list_by_ids(prime_single_id_query: bool) {
+    let options = std::env::var("AETHER_TEST_DATABASE_URL")
+        .expect("AETHER_TEST_DATABASE_URL must point at a local test database")
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .unwrap();
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone())
+        .await
+        .unwrap();
+    let database = format!("usage_batch_lookup_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE {database}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    // 单连接确保单条查询与批量查询使用同一个 prepared statement 缓存。
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.database(&database))
+        .await
+        .unwrap();
+
+    let outcome = std::panic::AssertUnwindSafe(async {
+        crate::POSTGRES_MIGRATOR.run(&pool).await.unwrap();
+        let repository = SqlxUsageReadRepository::new(pool.clone());
+        sqlx::query(
+            "INSERT INTO usage(id, request_id, model, provider_name, status, billing_status, created_at) \
+             VALUES ('older', 'older', 'm', 'p', 'pending', 'pending', '2026-10-09 00:00:00+00'), \
+                    ('newer-b', 'newer-b', 'm', 'p', 'streaming', 'pending', '2026-10-09 00:01:00+00'), \
+                    ('newer-a', 'newer-a', 'm', 'p', 'streaming', 'pending', '2026-10-09 00:01:00+00'), \
+                    ('unrequested', 'unrequested', 'm', 'p', 'pending', 'pending', '2026-10-09 00:02:00+00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        if prime_single_id_query {
+            assert!(repository.find_by_id("older").await.unwrap().is_some());
+        }
+        let ids = ["older", "newer-b", "missing", "newer-a", "older"]
+            .map(str::to_owned);
+        for _ in 0..2 {
+            let rows = repository.list_by_ids(&ids).await.unwrap();
+            assert_eq!(
+                rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+                ["newer-a", "newer-b", "older"],
+                "batch lookup must return all matches once, newest first with stable ID ordering"
+            );
+            assert_eq!(
+                repository.find_by_id("older").await.unwrap().unwrap().id,
+                "older"
+            );
+        }
+        assert!(repository.list_by_ids(&[]).await.unwrap().is_empty());
+        assert!(repository
+            .list_by_ids(&["missing".to_owned()])
+            .await
+            .unwrap()
+            .is_empty());
+    })
+    .catch_unwind()
+    .await;
+
+    pool.close().await;
+    sqlx::query(&format!("DROP DATABASE {database}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+    if let Err(error) = outcome {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires local AETHER_TEST_DATABASE_URL with temporary database creation"]
+async fn live_usage_list_by_ids_returns_all_matches() {
+    assert_live_usage_list_by_ids(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires local AETHER_TEST_DATABASE_URL with temporary database creation"]
+async fn live_usage_list_by_ids_after_single_id_lookup_preserves_parameter_types() {
+    assert_live_usage_list_by_ids(true).await;
 }
 
 fn fast_clear_usage_record(

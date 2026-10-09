@@ -1480,7 +1480,15 @@ const UPSERT_USAGE_SETTLEMENT_PRICING_SNAPSHOT_SQL: &str =
 
 const FIND_BY_REQUEST_ID_SQL: &str = include_str!("queries/find_by_request_id_sql.sql");
 
-const FIND_BY_ID_SQL: &str = include_str!("queries/find_by_id_sql.sql");
+// 查询条件单独声明，避免 SQL 文件的 LF/CRLF 差异破坏参数类型和查询语义。
+const FIND_BY_ID_SQL: &str = concat!(
+    include_str!("queries/find_by_id_prefix.sql"),
+    "\nWHERE \"usage\".id = $1\nLIMIT 1\n"
+);
+const LIST_BY_IDS_SQL: &str = concat!(
+    include_str!("queries/find_by_id_prefix.sql"),
+    "\nWHERE \"usage\".id = ANY($1::TEXT[])\nORDER BY \"usage\".created_at DESC, \"usage\".id ASC\n"
+);
 
 const SUMMARIZE_PROVIDER_USAGE_SINCE_SQL: &str =
     include_str!("queries/summarize_provider_usage_since_sql.sql");
@@ -2989,12 +2997,9 @@ ORDER BY request_count DESC, "usage".provider_name ASC
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let sql = FIND_BY_ID_SQL.replacen(
-            "WHERE \"usage\".id = $1\nLIMIT 1",
-            "WHERE \"usage\".id = ANY($1::TEXT[])\nORDER BY \"usage\".created_at DESC, \"usage\".id ASC",
-            1,
-        );
-        let mut rows = sqlx::query(&sql).bind(ids.to_vec()).fetch(&self.pool);
+        let mut rows = sqlx::query(LIST_BY_IDS_SQL)
+            .bind(ids.to_vec())
+            .fetch(&self.pool);
         let mut items = Vec::new();
         while let Some(row) = rows.try_next().await.map_postgres_err()? {
             items.push(map_usage_row(&row, false)?);

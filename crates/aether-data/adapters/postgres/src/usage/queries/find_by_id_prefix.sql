@@ -245,5 +245,3 @@ LEFT JOIN usage_routing_snapshots
   ON usage_routing_snapshots.request_id = "usage".request_id
 LEFT JOIN usage_settlement_snapshots
   ON usage_settlement_snapshots.request_id = "usage".request_id
-WHERE "usage".id = $1
-LIMIT 1
