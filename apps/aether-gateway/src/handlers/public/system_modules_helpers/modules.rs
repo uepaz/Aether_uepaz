@@ -27,6 +27,7 @@ const PUBLIC_AUTH_MODULE_DEFINITIONS: &[PublicAuthModuleDefinition] = &[
 
 // 只暴露用户页面需要的模块开关，不能复用含管理路由和配置的管理员响应。
 const PUBLIC_USER_MODULES: &[(&str, &str)] = &[
+    ("vscodex", "VSCODEX_AVAILABLE"),
     ("health_monitor", "HEALTH_MONITOR_AVAILABLE"),
     ("referral", "REFERRAL_AVAILABLE"),
     ("management_tokens", "MANAGEMENT_TOKENS_AVAILABLE"),

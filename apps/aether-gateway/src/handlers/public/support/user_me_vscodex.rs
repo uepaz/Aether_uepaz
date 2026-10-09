@@ -37,6 +37,27 @@ const VSCODEX_WS_MAX_CONNECTIONS_PER_IP: usize = 16;
 const VSCODEX_DEVICE_PATH_PREFIX: &str = "/api/users/me/vscodex/devices/";
 const VSCODEX_CLIENT_IP_HEADER: &str = "x-aether-client-ip";
 
+// 部署开关仅表示服务可连接；运行许可必须跟随管理员的模块开关。
+async fn vscodex_module_access_response(state: &AppState) -> Option<Response<Body>> {
+    let available = module_available_from_env("VSCODEX_AVAILABLE", true);
+    match crate::handlers::shared::read_module_enabled(state, "vscodex", available).await {
+        Ok(true) => None,
+        Ok(false) => Some(build_auth_error_response(
+            http::StatusCode::FORBIDDEN,
+            "远程控制模块未启用",
+            false,
+        )),
+        Err(err) => {
+            warn!(error = %crate::error::redact_error_detail(&format!("{err:?}")), "VS Codex module status could not be read");
+            Some(build_auth_error_response(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                "远程控制模块状态暂不可用",
+                false,
+            ))
+        }
+    }
+}
+
 static VSCODEX_HTTP_CLIENT: LazyLock<Result<reqwest::Client, reqwest::Error>> =
     LazyLock::new(|| {
         reqwest::Client::builder()
@@ -204,6 +225,9 @@ pub(crate) async fn vscodex_ws_proxy(
             return response;
         }
     };
+    if let Some(response) = vscodex_module_access_response(&state).await {
+        return response;
+    }
     let config = match load_vscodex_sidecar_config() {
         Ok(Some(value)) => value,
         Ok(None) => {
@@ -300,7 +324,7 @@ pub(crate) async fn vscodex_ws_proxy(
 }
 
 pub(super) async fn maybe_build_local_vscodex_response(
-    _state: &AppState,
+    state: &AppState,
     request_context: &GatewayPublicRequestContext,
     client_ip: std::net::IpAddr,
     request_body: Option<&Bytes>,
@@ -322,6 +346,9 @@ pub(super) async fn maybe_build_local_vscodex_response(
         ));
     }
 
+    if let Some(response) = vscodex_module_access_response(state).await {
+        return Some(response);
+    }
     let config = match load_vscodex_sidecar_config() {
         Ok(Some(value)) => value,
         Ok(None) => {
@@ -374,6 +401,9 @@ pub(super) async fn handle_users_me_vscodex_request(
         Ok(value) => value,
         Err(response) => return response,
     };
+    if let Some(response) = vscodex_module_access_response(state).await {
+        return response;
+    }
     let config = match load_vscodex_sidecar_config() {
         Ok(Some(value)) => value,
         Ok(None) => {

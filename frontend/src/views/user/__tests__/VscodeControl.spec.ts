@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h, nextTick, type App } from 'vue'
+import { createPinia, setActivePinia, type Pinia } from 'pinia'
+import { useModuleStore } from '@/stores/modules'
+
+const { replace, authState } = vi.hoisted(() => ({ replace: vi.fn(), authState: { canAccessAdmin: false } }))
+vi.mock('vue-router', () => ({ useRouter: () => ({ replace }) }))
+vi.mock('@/stores/auth', () => ({ useAuthStore: () => authState }))
 
 const vscodexApiMock = vi.hoisted(() => ({
   listDevices: vi.fn(),
@@ -54,6 +60,7 @@ vi.mock('@/components/ui', () => ({
 import VscodeControl from '../VscodeControl.vue'
 
 const mountedApps: Array<{ app: App; root: HTMLElement }> = []
+let pinia: Pinia
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -75,7 +82,7 @@ async function settle() {
 async function mountControl() {
   const root = document.createElement('div')
   document.body.appendChild(root)
-  const app = createApp(VscodeControl)
+  const app = createApp(VscodeControl).use(pinia)
   app.mount(root)
   mountedApps.push({ app, root })
   await settle()
@@ -100,6 +107,10 @@ function dispatchFrameMessage(options: {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  authState.canAccessAdmin = false
+  pinia = createPinia()
+  setActivePinia(pinia)
+  useModuleStore().userModules = { vscodex: { name: 'vscodex', available: true, enabled: true, active: true } }
   vscodexApiMock.listDevices.mockResolvedValue([
     {
       id: 'device-1',
@@ -131,6 +142,49 @@ afterEach(() => {
 })
 
 describe('VscodeControl iframe bridge', () => {
+  it('allows an administrator direct URL before the administrator status has loaded', async () => {
+    authState.canAccessAdmin = true
+    const { root } = await mountControl()
+    expect(root.querySelector('iframe')).not.toBeNull()
+    expect(replace).not.toHaveBeenCalled()
+  })
+
+  it('disconnects and hides an open page when the module is disabled', async () => {
+    const pendingTicket = deferred<{ ticket: string; ws_url: string; expires_at: null }>()
+    vscodexApiMock.createWsTicket.mockReturnValueOnce(pendingTicket.promise)
+    const { root, target } = await mountControl()
+    const postMessage = vi.spyOn(target, 'postMessage')
+    dispatchFrameMessage({ source: target, type: 'aether-vscodex/ready' })
+    await settle()
+
+    useModuleStore().userModules.vscodex.active = false
+    await settle()
+    expect(root.textContent).toBe('')
+    expect(root.querySelector('iframe')).toBeNull()
+    expect(replace).toHaveBeenCalledWith('/dashboard')
+    expect(postMessage).toHaveBeenCalledWith({ v: 1, type: 'aether-vscodex/disconnect' }, window.location.origin)
+    postMessage.mockClear()
+    pendingTicket.resolve({ ticket: 'stale-ticket', ws_url: 'wss://aether.example/api/vscodex/ws', expires_at: null })
+    await settle()
+    dispatchFrameMessage({ source: target, type: 'aether-vscodex/request-ticket' })
+    await settle()
+    expect(postMessage).not.toHaveBeenCalled()
+    expect(vscodexApiMock.createWsTicket).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not mount the frame or load devices when module permission is missing', async () => {
+    useModuleStore().userModules = {}
+    const root = document.createElement('div')
+    const app = createApp(VscodeControl).use(pinia)
+    app.mount(root)
+    mountedApps.push({ app, root })
+    await settle()
+    expect(root.textContent).toBe('')
+    expect(root.querySelector('iframe')).toBeNull()
+    expect(vscodexApiMock.listDevices).not.toHaveBeenCalled()
+    expect(replace).toHaveBeenCalledWith('/dashboard')
+  })
+
   it('confirms and revokes a device credential from the control header', async () => {
     vscodexApiMock.listDevices
       .mockResolvedValueOnce([{

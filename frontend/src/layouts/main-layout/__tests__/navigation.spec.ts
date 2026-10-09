@@ -60,11 +60,16 @@ describe('main layout navigation builder', () => {
     expect(navigation.flatMap(group => group.items.map(item => item.name))).toContain('tx:nav.myReferral')
   })
 
-  it('exposes remote control to users and active administrators', () => {
+  it.each([true, false])('shows the user remote control entry only with active=%s', active => {
+    const items = buildNavigation({ canAccessAdmin: false, modules: {}, isModuleActive: name => name === 'vscodex' && active }).flatMap(group => group.items)
+    expect(items.some(item => item.href === '/dashboard/vscodex')).toBe(active)
+  })
+
+  it('exposes remote control to active users and administrators', () => {
     const userNavigation = buildNavigation({
       canAccessAdmin: false,
       modules: {},
-      isModuleActive: () => false,
+      isModuleActive: name => name === 'vscodex',
       t: translate,
     })
     const adminNavigation = buildNavigation({

@@ -58,8 +58,9 @@ export const useModuleStore = defineStore('modules', () => {
         loaded.value = true
         return nextModules
       } catch (err: unknown) {
-        // 监控展示无法确认时不沿用旧许可，其他模块保留原有处理方式。
+        // 监控及远程控制许可无法确认时，不继续展示页面或保持远程连接。
         delete modules.value.health_monitor
+        delete modules.value.vscodex
         log.error('Failed to fetch modules status', err)
         error.value = parseApiError(err, '获取模块状态失败')
         throw err

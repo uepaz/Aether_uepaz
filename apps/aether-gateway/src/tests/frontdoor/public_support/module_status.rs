@@ -34,9 +34,15 @@ async fn gateway_exposes_only_user_module_status_with_canonical_referral_switch(
         let health_available =
             crate::handlers::shared::module_available_from_env("HEALTH_MONITOR_AVAILABLE", true);
         let enabled = enabled.unwrap_or(false);
+        let vscodex_available =
+            crate::handlers::shared::module_available_from_env("VSCODEX_AVAILABLE", true);
         assert_eq!(
             payload,
             json!({
+                "vscodex": {
+                    "name": "vscodex", "available": vscodex_available,
+                    "enabled": false, "active": false,
+                },
                 "health_monitor": {
                     "name": "health_monitor", "available": health_available,
                     "enabled": health_available, "active": health_available,

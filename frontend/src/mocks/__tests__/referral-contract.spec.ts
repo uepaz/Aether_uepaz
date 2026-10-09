@@ -21,7 +21,7 @@ describe('referral demo contract', () => {
     setMockUserToken('demo-access-token-user')
     const enabled = await handleMockRequest({ method: 'GET', url: '/api/modules/user-status' })
     expect(enabled?.data).toMatchObject({ referral: { enabled: true, active: true } })
-    expect(Object.keys(enabled?.data as object).sort()).toEqual(['health_monitor', 'management_tokens', 'referral'])
+    expect(Object.keys(enabled?.data as object).sort()).toEqual(['health_monitor', 'management_tokens', 'referral', 'vscodex'])
     expect(Object.keys((enabled?.data as Record<string, object>).referral).sort()).toEqual(['active', 'available', 'enabled', 'name'])
 
     const dashboard = await handleMockRequest({ method: 'GET', url: '/api/users/me/referral' })

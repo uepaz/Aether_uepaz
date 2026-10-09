@@ -2156,7 +2156,7 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
   'GET /api/modules/user-status': async () => {
     await delay()
     refreshMockReferralModuleStatus()
-    return createMockResponse(Object.fromEntries(['referral', 'management_tokens', 'health_monitor'].map(name => {
+    return createMockResponse(Object.fromEntries(['referral', 'management_tokens', 'health_monitor', 'vscodex'].map(name => {
       const { available, enabled, active } = MOCK_MODULE_STATUSES[name]
       return [name, { name, available, enabled: available && enabled, active: active && (name !== 'health_monitor' || MOCK_MODULE_STATUSES[name].visibility?.user_enabled !== false) }]
     })))
@@ -2407,6 +2407,9 @@ export async function handleMockRequest(config: AxiosRequestConfig): Promise<Axi
 
   // 演示模式与真实接口一致：仅限制监控展示，保留提供商健康操作和发布配置。
   const path = url.split('?')[0]
+  if (/^\/api\/(users\/me\/vscodex|vscodex)(\/|$)/.test(path) && !MOCK_MODULE_STATUSES.vscodex.active) {
+    throw { response: createMockResponse({ detail: '远程控制模块未启用' }, 403) }
+  }
   const adminMonitor = /^\/api\/admin\/endpoints\/health\/(api-formats|models|providers|related)(\/|$)/.test(path)
     || (path.startsWith('/api/admin/endpoints/health/v2/') && path !== '/api/admin/endpoints/health/v2/publication')
   const userMonitor = /^\/api\/(public|users\/me)\/health\//.test(path)

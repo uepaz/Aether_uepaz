@@ -18,8 +18,8 @@ export async function checkModuleAccess(
     return null
   }
 
-  // 确保模块状态已加载
-  if (!moduleStore.userLoaded || moduleName === 'health_monitor') {
+  // 进入监控或远程控制时刷新，避免沿用管理员关闭模块之前的缓存。
+  if (!moduleStore.userLoaded || moduleName === 'health_monitor' || moduleName === 'vscodex') {
     try {
       await moduleStore.fetchUserModules()
     } catch (error) {

@@ -67,7 +67,8 @@ export const dashboardRoutes: RouteRecordRaw[] = [
       {
         path: 'vscodex',
         name: 'VscodeControl',
-        component: view(() => import('@/views/user/VscodeControl.vue'))
+        component: view(() => import('@/views/user/VscodeControl.vue')),
+        meta: { module: 'vscodex' }
       },
       {
         path: 'async-tasks',

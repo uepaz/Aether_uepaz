@@ -90,7 +90,7 @@ export function buildNavigation(options: {
         items: [
           { name: t('nav.modelCatalog'), href: '/dashboard/models', icon: Box },
           { name: t('nav.apiKeys'), href: '/dashboard/api-keys', icon: Key },
-          { name: t('nav.vscodex'), href: '/dashboard/vscodex', icon: SquareTerminal },
+          ...(isModuleActive('vscodex') ? [{ name: t('nav.vscodex'), href: '/dashboard/vscodex', icon: SquareTerminal }] : []),
         ]
       },
       {

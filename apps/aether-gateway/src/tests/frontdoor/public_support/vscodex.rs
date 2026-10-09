@@ -1,7 +1,8 @@
 use super::{
     any, build_router_with_state, build_test_auth_token, json, sample_auth_session,
-    sample_auth_user, sample_auth_wallet, set_test_env_var, start_auth_gateway_with_state,
-    start_server, AppState, Arc, Json, Mutex, Request, Router, StatusCode, Utc,
+    sample_auth_user, sample_auth_wallet, set_test_env_var, start_auth_gateway_with_builder,
+    start_server, AppState, Arc, InMemoryUserReadRepository, InMemoryWalletRepository, Json, Mutex,
+    Request, Router, StatusCode, Utc,
 };
 use axum::extract::ws::{Message as AxumWsMessage, WebSocketUpgrade};
 use axum::response::IntoResponse;
@@ -206,19 +207,26 @@ async fn run_vscodex_gateway_integration() {
         ]),
         now + chrono::Duration::hours(1),
     );
+    let data = crate::data::GatewayDataState::with_user_and_wallet_for_tests(
+        Arc::new(InMemoryUserReadRepository::seed_auth_users(vec![user])),
+        Arc::new(InMemoryWalletRepository::seed(vec![sample_auth_wallet(
+            "user-auth-1",
+            now,
+        )])),
+    )
+    .with_system_config_values_for_tests([]);
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(data)
+        .with_auth_sessions_for_tests([sample_auth_session(
+            "user-auth-1",
+            "session-vscodex",
+            "browser-device-vscodex",
+            "refresh-vscodex",
+            now,
+        )]);
     let (gateway_url, upstream_hits, gateway_handle, upstream_handle) =
-        start_auth_gateway_with_state(
-            user,
-            sample_auth_wallet("user-auth-1", now),
-            [sample_auth_session(
-                "user-auth-1",
-                "session-vscodex",
-                "browser-device-vscodex",
-                "refresh-vscodex",
-                now,
-            )],
-        )
-        .await;
+        start_auth_gateway_with_builder(|| state.clone()).await;
     let client = reqwest::Client::new();
 
     let unauthenticated = client
@@ -231,6 +239,18 @@ async fn run_vscodex_gateway_integration() {
         .lock()
         .expect("captured request store should lock")
         .is_empty());
+
+    // 部署服务已开启时，缺省关闭和管理员显式关闭仍须阻止用户访问。
+    assert_module_closed(&client, &gateway_url, &access_token).await;
+    assert!(captured_requests
+        .lock()
+        .expect("request store should lock")
+        .is_empty());
+    state
+        .upsert_system_config_json_value("module.vscodex.enabled", &json!(true), None)
+        .await
+        .expect("remote control should enable");
+    assert_remote_control_status(&client, &gateway_url, true).await;
 
     let devices = client
         .get(format!("{gateway_url}/api/users/me/vscodex/devices"))
@@ -436,6 +456,12 @@ async fn run_vscodex_gateway_integration() {
     let limited_gateway = build_router_with_state(
         AppState::new()
             .expect("limited gateway state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::disabled().with_system_config_values_for_tests([(
+                    "module.vscodex.enabled".to_string(),
+                    json!(true),
+                )]),
+            )
             .with_request_concurrency_limit(1),
     );
     let (limited_gateway_url, limited_gateway_handle) = start_server(limited_gateway).await;
@@ -554,6 +580,22 @@ async fn run_vscodex_gateway_integration() {
         .iter()
         .all(|request| request.client_ip.is_none()));
 
+    state
+        .upsert_system_config_json_value("module.vscodex.enabled", &json!(false), None)
+        .await
+        .expect("remote control should disable");
+    assert_module_closed(&client, &gateway_url, &access_token).await;
+    assert_eq!(
+        captured_requests
+            .lock()
+            .expect("request store should lock")
+            .len(),
+        9
+    );
+    state
+        .upsert_system_config_json_value("module.vscodex.enabled", &json!(true), None)
+        .await
+        .expect("remote control should reenable");
     let _disabled = set_test_env_var("AETHER_VSCODEX_ENABLED", "false");
     let disabled = client
         .get(format!("{gateway_url}/api/users/me/vscodex/devices"))
@@ -578,4 +620,70 @@ async fn run_vscodex_gateway_integration() {
     gateway_handle.abort();
     upstream_handle.abort();
     sidecar_handle.abort();
+}
+
+async fn assert_remote_control_status(client: &reqwest::Client, gateway_url: &str, active: bool) {
+    let response = client
+        .get(format!("{gateway_url}/api/modules/user-status"))
+        .send()
+        .await
+        .expect("user module status should load");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("module status should be JSON");
+    assert_eq!(payload["vscodex"]["active"], json!(active));
+}
+
+async fn assert_module_closed(client: &reqwest::Client, gateway_url: &str, access_token: &str) {
+    assert_remote_control_status(client, gateway_url, false).await;
+    for (method, path, body) in [
+        (
+            reqwest::Method::GET,
+            "/api/users/me/vscodex/devices",
+            json!(null),
+        ),
+        (
+            reqwest::Method::POST,
+            "/api/users/me/vscodex/pairings",
+            json!({}),
+        ),
+        (
+            reqwest::Method::POST,
+            "/api/users/me/vscodex/ws-tickets",
+            json!({ "device_id": "host-1" }),
+        ),
+        (
+            reqwest::Method::DELETE,
+            "/api/users/me/vscodex/devices/host-1",
+            json!(null),
+        ),
+        (
+            reqwest::Method::POST,
+            "/api/vscodex/pair",
+            json!({ "code": "PAIR-123" }),
+        ),
+    ] {
+        let response = client
+            .request(method, format!("{gateway_url}{path}"))
+            .bearer_auth(access_token)
+            .header("x-client-device-id", "browser-device-vscodex")
+            .json(&body)
+            .send()
+            .await
+            .expect("disabled module request should complete");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "disabled route {path} should reject access"
+        );
+    }
+    let websocket_url = format!("{gateway_url}/api/vscodex/ws").replace("http://", "ws://");
+    match tokio_tungstenite::connect_async(&websocket_url)
+        .await
+        .expect_err("disabled module should reject WebSocket upgrade")
+    {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(response.status(), StatusCode::FORBIDDEN)
+        }
+        other => panic!("expected HTTP module rejection, got {other:?}"),
+    }
 }

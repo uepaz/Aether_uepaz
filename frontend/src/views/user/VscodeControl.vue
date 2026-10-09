@@ -1,5 +1,8 @@
 <template>
-  <div class="mx-auto flex min-h-[calc(100vh-9rem)] w-full max-w-[1800px] flex-col gap-4 pb-2">
+  <div
+    v-if="remoteControlActive"
+    class="mx-auto flex min-h-[calc(100vh-9rem)] w-full max-w-[1800px] flex-col gap-4 pb-2"
+  >
     <header class="flex flex-col gap-3 border-b border-border/60 pb-4 sm:flex-row sm:items-center sm:justify-between">
       <div class="min-w-0">
         <h1 class="flex items-center gap-2 text-lg font-semibold text-foreground">
@@ -277,6 +280,9 @@ import { LoadingState } from '@/components/common'
 import { Button } from '@/components/ui'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { useI18n } from '@/i18n'
+import { useRouter } from 'vue-router'
+import { useAuthStore } from '@/stores/auth'
+import { useModuleStore } from '@/stores/modules'
 
 const PROTOCOL_VERSION = 1
 const PAIRING_POLL_INTERVAL_MS = 4_000
@@ -284,6 +290,13 @@ const childFrameUrl = `${import.meta.env.BASE_URL}aether-vscodex/index.html?embe
 
 const { locale, t } = useI18n()
 const { isDark } = useDarkMode()
+const router = useRouter()
+const authStore = useAuthStore()
+const moduleStore = useModuleStore()
+// 管理布局首次加载前使用路由守卫已确认的公开状态。
+const remoteControlActive = computed(() => authStore.canAccessAdmin && moduleStore.loaded
+  ? moduleStore.isActive('vscodex')
+  : moduleStore.isUserActive('vscodex'))
 
 const devices = ref<VscodexDevice[]>([])
 const selectedDeviceId = ref('')
@@ -362,6 +375,7 @@ function invalidateConnection(reloadFrame = true): void {
 }
 
 async function refreshDevices(options: { silent?: boolean } = {}): Promise<void> {
+  if (disposed) return
   const requestVersion = ++deviceRequestVersion
   if (!options.silent) {
     loadingDevices.value = true
@@ -397,13 +411,15 @@ async function refreshDevices(options: { silent?: boolean } = {}): Promise<void>
 }
 
 async function createPairing(): Promise<void> {
-  if (creatingPairing.value) return
+  if (disposed || creatingPairing.value) return
   creatingPairing.value = true
   pairingError.value = false
   codeCopied.value = false
 
   try {
-    pairing.value = await vscodexApi.createPairing()
+    const nextPairing = await vscodexApi.createPairing()
+    if (disposed) return
+    pairing.value = nextPairing
     pairingCreatedAt.value = Date.now()
     startPairingPoll()
   } catch {
@@ -422,6 +438,7 @@ async function revokeSelectedDevice(): Promise<void> {
   revokeError.value = false
   try {
     await vscodexApi.deleteDevice(device.id)
+    if (disposed) return
     invalidateConnection()
     devices.value = devices.value.filter(item => item.id !== device.id)
     selectedDeviceId.value = devices.value.find(item => item.status === 'online')?.id
@@ -462,7 +479,7 @@ function postContext(): void {
 }
 
 async function requestTicket(): Promise<void> {
-  if (!selectedDevice.value || !frameReady.value) return
+  if (disposed || !selectedDevice.value || !frameReady.value) return
   if (ticketRequest) return ticketRequest
 
   const requestVersion = connectionVersion
@@ -518,6 +535,7 @@ function isFrameMessage(value: unknown): value is { v: number; type: string } {
 }
 
 function handleFrameMessage(event: MessageEvent): void {
+  if (disposed) return
   const target = frameRef.value?.contentWindow
   if (!target || event.origin !== window.location.origin || event.source !== target) return
   if (!isFrameMessage(event.data)) return
@@ -542,18 +560,32 @@ watch([locale, isDark], () => {
   if (frameReady.value) postContext()
 })
 
+function disposeControl(): void {
+  if (disposed) return
+  invalidateConnection(false)
+  disposed = true
+  deviceRequestVersion += 1
+  stopPairingPoll()
+  window.removeEventListener('message', handleFrameMessage)
+}
+
+// 布局定时刷新模块状态；关闭后先通知 iframe 断开，再移除页面。
+watch(remoteControlActive, active => {
+  if (!active) {
+    disposeControl()
+    void router.replace('/dashboard')
+  }
+}, { flush: 'sync' })
+
 onMounted(() => {
+  if (!remoteControlActive.value) {
+    disposeControl()
+    void router.replace('/dashboard')
+    return
+  }
   window.addEventListener('message', handleFrameMessage)
   void refreshDevices()
 })
 
-onBeforeUnmount(() => {
-  postToFrame({ type: 'aether-vscodex/disconnect' })
-  disposed = true
-  connectionVersion += 1
-  deviceRequestVersion += 1
-  stopPairingPoll()
-  window.removeEventListener('message', handleFrameMessage)
-})
-
+onBeforeUnmount(disposeControl)
 </script>
