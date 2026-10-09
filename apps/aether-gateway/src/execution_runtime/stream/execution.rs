@@ -97,6 +97,9 @@ use crate::execution_runtime::kiro_web_search::maybe_execute_kiro_web_search_str
 use crate::execution_runtime::oauth_retry::refresh_oauth_plan_auth_for_retry;
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::post_stream_plan_to_remote_execution_runtime;
+use crate::execution_runtime::search_downgrade::{
+    attach_search_downgrade_context, downgrade_unsupported_chat_search, has_chat_search,
+};
 use crate::execution_runtime::stream_read_timeout::{
     await_stream_idle_read, resolve_stream_idle_timeout, stream_idle_timeout_message,
 };
@@ -139,9 +142,9 @@ use crate::provider_pool_demand::{
 };
 use crate::request_candidate_runtime::{
     ensure_execution_request_candidate_slot, persist_local_request_candidate_status_record,
-    record_local_request_candidate_status, record_local_request_candidate_status_snapshot,
-    snapshot_local_request_candidate_status, try_enqueue_local_request_candidate_status_snapshot,
-    LocalRequestCandidateStatusSnapshot,
+    record_local_request_candidate_extra_data, record_local_request_candidate_status,
+    record_local_request_candidate_status_snapshot, snapshot_local_request_candidate_status,
+    try_enqueue_local_request_candidate_status_snapshot, LocalRequestCandidateStatusSnapshot,
 };
 use crate::request_diagnostics::{
     attach_current_request_diagnostics_to_report_context,
@@ -1459,6 +1462,45 @@ async fn execute_in_process_stream_with_oauth_retry(
         apply_stream_summary_report_context(&mut execution, report_context);
     }
     Ok(execution)
+}
+
+async fn execute_in_process_stream_with_search_retry(
+    state: &AppState,
+    plan: &mut ExecutionPlan,
+    trace_id: &str,
+    report_context: &mut Option<Value>,
+) -> Result<DirectUpstreamStreamExecution, InProcessStreamExecutionError> {
+    let mut execution =
+        execute_in_process_stream_with_oauth_retry(state, plan, trace_id, report_context.as_ref())
+            .await?;
+    if !has_chat_search(plan) || !matches!(execution.status_code, 400 | 422) {
+        return Ok(execution);
+    }
+    // Inspect and replay error bytes before committing downstream headers. A
+    // successful stream is never inspected or restarted for search fallback.
+    let response_text = prefetch_direct_stream_error_body(&mut execution).await;
+    let Some(record) =
+        downgrade_unsupported_chat_search(plan, execution.status_code, response_text.as_deref())
+    else {
+        return Ok(execution);
+    };
+    attach_search_downgrade_context(report_context, &record);
+    record_local_request_candidate_extra_data(
+        state,
+        plan,
+        report_context.as_ref(),
+        RequestCandidateStatus::Pending,
+        None,
+        Some(stream_elapsed_ms_since(execution.started_at)),
+        record,
+    )
+    .await;
+    warn!(event_name = "chat_search_downgraded", log_type = "ops",
+        trace_id, request_id = %plan.request_id, candidate_id = ?plan.candidate_id,
+        status_code = execution.status_code, search_downgraded = true,
+        "upstream rejected search; retrying the same candidate without search");
+    drop(execution);
+    execute_in_process_stream_with_oauth_retry(state, plan, trace_id, report_context.as_ref()).await
 }
 
 #[derive(Debug)]
@@ -4393,11 +4435,11 @@ async fn execute_execution_runtime_stream_inner(
     #[cfg(not(test))]
     {
         let upstream_headers_started_at = Instant::now();
-        let execution = match execute_in_process_stream_with_oauth_retry(
+        let execution = match execute_in_process_stream_with_search_retry(
             state,
             &mut plan,
             trace_id,
-            report_context.as_ref(),
+            &mut report_context,
         )
         .await
         {
@@ -4533,11 +4575,11 @@ async fn execute_execution_runtime_stream_inner(
             .unwrap_or_default();
         if remote_execution_runtime_base_url.trim().is_empty() {
             let upstream_headers_started_at = Instant::now();
-            let execution = match execute_in_process_stream_with_oauth_retry(
+            let execution = match execute_in_process_stream_with_search_retry(
                 state,
                 &mut plan,
                 trace_id,
-                report_context.as_ref(),
+                &mut report_context,
             )
             .await
             {
@@ -6705,7 +6747,9 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                     Err(_) => {
                         if stream_commit_policy.requires_bounded_frame_wait() {
                             let failure = build_stream_transport_failure_report(
-                                "first_byte_timeout", "Upstream did not produce a semantic event before the first byte deadline", 504,
+                                "first_byte_timeout",
+                                "Upstream did not produce a semantic event before the first byte deadline",
+                                504,
                             );
                             return handle_prefetch_stream_failure(
                                 state,
@@ -7737,10 +7781,12 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                         "gateway failed to normalize execution runtime stream chunk"
                                     );
                                     terminal_failure = Some(build_stream_failure_report(
-                                            "execution_runtime_stream_rewrite_error",
-                                            format!("failed to normalize execution runtime stream chunk: {err:?}"),
-                                            502,
-                                        ));
+                                        "execution_runtime_stream_rewrite_error",
+                                        format!(
+                                            "failed to normalize execution runtime stream chunk: {err:?}"
+                                        ),
+                                        502,
+                                    ));
                                     break;
                                 }
                             }
@@ -7776,7 +7822,9 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                     );
                                     terminal_failure = Some(build_stream_failure_report(
                                         "execution_runtime_stream_rewrite_error",
-                                        format!("failed to rewrite execution runtime stream chunk: {err:?}"),
+                                        format!(
+                                            "failed to rewrite execution runtime stream chunk: {err:?}"
+                                        ),
                                         502,
                                     ));
                                     break;
@@ -7984,7 +8032,9 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
                                     );
                                     let failure = build_stream_failure_report(
                                         "execution_runtime_stream_rewrite_flush_error",
-                                        format!("failed to rewrite normalized private stream chunk during flush: {err:?}"),
+                                        format!(
+                                            "failed to rewrite normalized private stream chunk during flush: {err:?}"
+                                        ),
                                         502,
                                     );
                                     terminal_failure.get_or_insert(failure);
@@ -8619,11 +8669,11 @@ mod tests {
         direct_upstream_response_byte_stream, encode_terminal_sse_error_event_for_plan,
         ensure_stream_terminal_summary_for_missing_observed_finish,
         execute_execution_runtime_stream, execute_in_process_stream_with_oauth_retry,
-        execute_stream_from_frame_stream, execute_stream_from_frame_stream_with_retry_scope,
-        execution_stream_frame_codec, maybe_apply_kiro_prompt_cache_usage_to_stream_summary,
-        merge_stream_terminal_summary, normalize_declared_stream_response_headers,
-        parse_direct_passthrough_mode, prefetch_direct_stream_error_body,
-        prefetched_openai_responses_body_has_output_boundary,
+        execute_in_process_stream_with_search_retry, execute_stream_from_frame_stream,
+        execute_stream_from_frame_stream_with_retry_scope, execution_stream_frame_codec,
+        maybe_apply_kiro_prompt_cache_usage_to_stream_summary, merge_stream_terminal_summary,
+        normalize_declared_stream_response_headers, parse_direct_passthrough_mode,
+        prefetch_direct_stream_error_body, prefetched_openai_responses_body_has_output_boundary,
         record_sync_terminal_usage_with_handoff,
         record_sync_terminal_usage_with_handoff_after_spawn,
         resolve_provider_stream_error_status_code, select_direct_anthropic_prefetch_wait,
@@ -9564,17 +9614,19 @@ mod tests {
                 vec!["{\"warning\":\"capacity", " exhausted\"}"],
             ),
         ] {
-            assert!(execute_generic_stream_precommit(
-                chunks,
-                json!({ "failover_rules": {
+            assert!(
+                execute_generic_stream_precommit(
+                    chunks,
+                    json!({ "failover_rules": {
                     "success_failover_patterns": [{ "pattern": "capacity.*exhausted" }],
                 } }),
-                None,
-                false,
-                content_type,
-            )
-            .await
-            .is_none());
+                    None,
+                    false,
+                    content_type,
+                )
+                .await
+                .is_none()
+            );
         }
     }
 
@@ -10184,19 +10236,46 @@ mod tests {
             "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
         ] {
             let mut state = direct_anthropic_inline_state("req-inline-idle-completed", Vec::new());
-            state.finalizer.as_mut().unwrap().core_mut().requires_anthropic_message_stop = false;
+            state
+                .finalizer
+                .as_mut()
+                .unwrap()
+                .core_mut()
+                .requires_anthropic_message_stop = false;
             state.stream_idle_timeout = Some(Duration::from_millis(5));
-            state.upstream = Some(futures_util::stream::iter(vec![Ok(Bytes::from(terminal))])
-                .chain(futures_util::stream::pending()).boxed());
-            let (first, mut state) = state.next_item().await.expect("terminal chunk should stream");
+            state.upstream = Some(
+                futures_util::stream::iter(vec![Ok(Bytes::from(terminal))])
+                    .chain(futures_util::stream::pending())
+                    .boxed(),
+            );
+            let (first, mut state) = state
+                .next_item()
+                .await
+                .expect("terminal chunk should stream");
             assert_eq!(first.unwrap(), Bytes::from(terminal));
-            assert!(state.finalizer.as_ref().unwrap().core().client_stream_completion_tracker.successful_completion());
+            assert!(
+                state
+                    .finalizer
+                    .as_ref()
+                    .unwrap()
+                    .core()
+                    .client_stream_completion_tracker
+                    .successful_completion()
+            );
             let item = tokio::time::timeout(Duration::from_secs(1), state.next_upstream_item())
-                .await.expect("teardown idle should finish");
+                .await
+                .expect("teardown idle should finish");
             assert!(item.is_none());
             assert!(state.upstream.is_none());
-            assert!(state.finalizer.as_ref().unwrap().terminal_failure().is_none(),
-                "successful protocol terminal must not become a read timeout");
+            assert!(
+                state
+                    .finalizer
+                    .as_ref()
+                    .unwrap()
+                    .terminal_failure()
+                    .is_none(),
+                "successful protocol terminal must not become a read timeout"
+            );
             discard_direct_test_finalizer(&mut state);
         }
     }
@@ -10317,6 +10396,127 @@ mod tests {
 
     fn test_state() -> AppState {
         AppState::new().expect("gateway state should build")
+    }
+
+    #[tokio::test]
+    async fn chat_search_downgrade_stream_retries_only_explicit_rejections_once() {
+        for (status, error, reject_retry, expected_hits) in [
+            (
+                400,
+                json!({"error":{"param":"web_search_options","code":"unsupported_parameter"}}),
+                false,
+                2,
+            ),
+            (
+                422,
+                json!({"error":{"message":"Unknown parameter: web_search_options"}}),
+                false,
+                2,
+            ),
+            (
+                400,
+                json!({"error":{"message":"This model does not support web search"}}),
+                true,
+                2,
+            ),
+            (
+                400,
+                json!({"error":{"param":"web_search_options.search_context_size","message":"Invalid value"}}),
+                false,
+                1,
+            ),
+            (
+                429,
+                json!({"error":{"message":"web_search_options not supported"}}),
+                false,
+                1,
+            ),
+            (200, json!({}), false, 1),
+        ] {
+            let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let seen = requests.clone();
+            let returned_error = error.clone();
+            let app = Router::new().route(
+                "/chat/completions",
+                any(move |Json(body): Json<Value>| {
+                    let seen = seen.clone();
+                    let error = returned_error.clone();
+                    async move {
+                        let first = {
+                            let mut seen = seen.lock().unwrap();
+                            seen.push(body);
+                            seen.len() == 1
+                        };
+                        if status >= 400 && (first || reject_retry) {
+                            (StatusCode::from_u16(status).unwrap(), Json(error)).into_response()
+                        } else {
+                            (
+                                [(header::CONTENT_TYPE, "text/event-stream")],
+                                "data: [DONE]\n\n",
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+            let listener = crate::test_support::bind_loopback_listener().await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut plan =
+                direct_stream_test_plan("search-retry", format!("http://{addr}/chat/completions"));
+            plan.provider_api_format = "openai:chat".to_string();
+            plan.headers.insert(
+                "authorization".to_string(),
+                "Bearer ordinary-key".to_string(),
+            );
+            let original = json!({
+                "model":"deepseek-v4.1-flash", "stream":true,
+                "messages":[{"role":"user","content":"search please"}],
+                "web_search_options":{},
+                "tools":[{"type":"function","function":{"name":"web_search","parameters":{"type":"object"}}}]
+            });
+            plan.body = RequestBody::from_json(original.clone());
+            let mut context = Some(json!({}));
+            let execution = execute_in_process_stream_with_search_retry(
+                &test_state(),
+                &mut plan,
+                "trace-search-retry",
+                &mut context,
+            )
+            .await
+            .unwrap();
+            let response_status = execution.status_code;
+            let response_body = collect_direct_execution_body(execution).await.unwrap();
+            let seen = requests.lock().unwrap();
+            assert_eq!(seen.len(), expected_hits);
+            assert_eq!(seen[0], original);
+            if expected_hits == 2 {
+                let mut expected = original;
+                expected
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("web_search_options");
+                assert_eq!(seen[1], expected);
+                assert_eq!(context.as_ref().unwrap()["search_downgraded"], true);
+                assert_eq!(
+                    context.as_ref().unwrap()["search_downgrade_original_error"]["body"],
+                    error
+                );
+                assert_eq!(response_status, if reject_retry { status } else { 200 });
+            } else {
+                assert_eq!(response_status, status);
+                assert!(context.as_ref().unwrap().get("search_downgraded").is_none());
+            }
+            if response_status >= 400 {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&response_body).unwrap(),
+                    error
+                );
+            } else {
+                assert_eq!(response_body, b"data: [DONE]\n\n");
+            }
+            server.abort();
+        }
     }
 
     #[tokio::test]

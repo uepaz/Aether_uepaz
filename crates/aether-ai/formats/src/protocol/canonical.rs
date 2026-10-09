@@ -1096,7 +1096,9 @@ pub(crate) fn canonical_blocks_to_openai_chat_message(content: &[CanonicalConten
                     .and_then(Value::as_array)
                 {
                     annotations.extend(raw_annotations.iter().map(|annotation| {
-                        offset_openai_annotation_indices(annotation, text_offset)
+                        crate::formats::shared::citations::openai_annotation_to_chat(
+                            &offset_openai_annotation_indices(annotation, text_offset),
+                        )
                     }));
                 }
                 text_offset += text.chars().count() as i64;
@@ -2226,6 +2228,23 @@ pub(crate) fn openai_message_content_blocks(
         openai_content_to_blocks(message.get("content"))?
     };
     if role == CanonicalRole::Assistant {
+        if let Some(annotations) = message.get("annotations").and_then(Value::as_array) {
+            if let Some(CanonicalContentBlock::Text { extensions, .. }) = blocks
+                .iter_mut()
+                .find(|block| matches!(block, CanonicalContentBlock::Text { .. }))
+            {
+                canonical_extension_object_mut(extensions, OPENAI_RESPONSES_EXTENSION_NAMESPACE)
+                    .insert(
+                    "annotations".into(),
+                    Value::Array(
+                        annotations
+                            .iter()
+                            .map(crate::formats::shared::citations::openai_annotation_to_responses)
+                            .collect(),
+                    ),
+                );
+            }
+        }
         let reasoning_blocks = openai_reasoning_blocks(message);
         if !reasoning_blocks.is_empty() {
             blocks.splice(0..0, reasoning_blocks);

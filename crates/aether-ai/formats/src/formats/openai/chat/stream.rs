@@ -14,7 +14,10 @@ use crate::formats::openai::responses::{
     },
     GeminiToolSignatureCarrierDirection,
 };
-use crate::formats::shared::citations::canonical_citations_to_openai_annotations;
+use crate::formats::shared::citations::{
+    canonical_citations_to_openai_annotations, openai_annotation_to_chat,
+    openai_annotations_to_citations,
+};
 use crate::formats::shared::response::build_generated_tool_call_id;
 use crate::formats::shared::sse::{encode_done_sse, encode_json_sse};
 use crate::formats::shared::stream_core::common::*;
@@ -72,6 +75,8 @@ pub struct OpenAIResponsesProviderState {
     started: bool,
     finished: bool,
     text_parts: BTreeMap<String, String>,
+    citation_offsets: BTreeMap<String, i64>,
+    seen_citations: BTreeSet<String>,
     reasoning: String,
     reasoning_parts: BTreeMap<usize, String>,
     tool_calls: BTreeMap<usize, OpenAIResponsesProviderToolState>,
@@ -254,6 +259,19 @@ impl OpenAIChatProviderState {
             };
 
             let mut recognized_delta = false;
+            if let Some(annotations) = delta.get("annotations").and_then(Value::as_array) {
+                recognized_delta = true;
+                let citations = openai_annotations_to_citations(annotations);
+                if !citations.is_empty() && !self.terminal_only {
+                    self.ensure_started(report_context, &mut out);
+                    let (id, model) = self.identity(report_context);
+                    out.push(CanonicalStreamFrame {
+                        id,
+                        model,
+                        event: CanonicalStreamEvent::Citations(citations),
+                    });
+                }
+            }
             if delta.get("role").and_then(Value::as_str) == Some("assistant") {
                 recognized_delta = true;
                 self.ensure_started(report_context, &mut out);
@@ -435,6 +453,44 @@ impl OpenAIChatProviderState {
 }
 
 impl OpenAIResponsesProviderState {
+    fn emit_citations(
+        &mut self,
+        report_context: &Value,
+        out: &mut Vec<CanonicalStreamFrame>,
+        part_key: String,
+        annotations: &[Value],
+    ) {
+        if self.terminal_only {
+            return;
+        }
+        let offset = *self
+            .citation_offsets
+            .entry(part_key.clone())
+            .or_insert_with(|| {
+                self.text_parts
+                    .iter()
+                    .filter(|(key, _)| *key != &part_key)
+                    .map(|(_, text)| text.chars().count() as i64)
+                    .sum()
+            });
+        let citations: Vec<Value> = openai_annotations_to_citations(annotations)
+            .into_iter()
+            .filter(|citation| self.seen_citations.insert(format!("{part_key}:{citation}")))
+            .map(|citation| {
+                crate::protocol::canonical::offset_openai_annotation_indices(&citation, offset)
+            })
+            .collect();
+        if citations.is_empty() {
+            return;
+        }
+        self.ensure_started(report_context, out);
+        let (id, model) = self.identity(report_context);
+        out.push(CanonicalStreamFrame {
+            id,
+            model,
+            event: CanonicalStreamEvent::Citations(citations),
+        });
+    }
     pub(crate) fn terminal_observation() -> Self {
         Self {
             terminal_only: true,
@@ -551,6 +607,14 @@ impl OpenAIResponsesProviderState {
             self.ensure_started(report_context, out);
             return;
         }
+        if !self.citation_offsets.contains_key(&key) {
+            let offset = self
+                .text_parts
+                .values()
+                .map(|text| text.chars().count() as i64)
+                .sum();
+            self.citation_offsets.insert(key.clone(), offset);
+        }
         self.text_parts.entry(key).or_default().push_str(text);
         self.ensure_started(report_context, out);
         let (id, model) = self.identity(report_context);
@@ -573,6 +637,14 @@ impl OpenAIResponsesProviderState {
                 self.ensure_started(report_context, out);
             }
             return;
+        }
+        if !self.citation_offsets.contains_key(&key) {
+            let offset = self
+                .text_parts
+                .values()
+                .map(|text| text.chars().count() as i64)
+                .sum();
+            self.citation_offsets.insert(key.clone(), offset);
         }
         let missing = {
             let current = self.text_parts.entry(key).or_default();
@@ -1204,6 +1276,11 @@ impl OpenAIResponsesProviderState {
                         self.emit_missing_text(report_context, out, key, text);
                     }
                 }
+                if let Some(annotations) = content.get("annotations").and_then(Value::as_array) {
+                    let key =
+                        Self::text_part_key_from_message_item(output_index, item, content_index);
+                    self.emit_citations(report_context, out, key, annotations);
+                }
             }
         }
     }
@@ -1464,6 +1541,14 @@ impl OpenAIResponsesProviderState {
                 );
                 true
             }
+            "web_search_call"
+                if report_context
+                    .get("client_api_format")
+                    .and_then(Value::as_str)
+                    .is_none_or(crate::is_openai_responses_family_format) =>
+            {
+                false
+            }
             "web_search_call" | "file_search_call" | "code_interpreter_call" | "mcp_call" => {
                 if !final_item {
                     self.ensure_started(report_context, out);
@@ -1590,6 +1675,16 @@ impl OpenAIResponsesProviderState {
             .and_then(Value::as_str)
             .unwrap_or_default()
         {
+            "response.output_text.annotation.added" => {
+                if let Some(annotation) = value.get("annotation") {
+                    self.emit_citations(
+                        report_context,
+                        &mut out,
+                        Self::text_part_key_from_event(value),
+                        std::slice::from_ref(annotation),
+                    );
+                }
+            }
             "response.created" | "response.in_progress" => {
                 self.ensure_started(report_context, &mut out);
             }
@@ -1614,6 +1709,15 @@ impl OpenAIResponsesProviderState {
                                 let key = Self::text_part_key_from_event(value);
                                 self.emit_missing_text(report_context, &mut out, key, text);
                             }
+                        }
+                        if let Some(annotations) = part.get("annotations").and_then(Value::as_array)
+                        {
+                            self.emit_citations(
+                                report_context,
+                                &mut out,
+                                Self::text_part_key_from_event(value),
+                                annotations,
+                            );
                         }
                     }
                 }
@@ -1652,6 +1756,18 @@ impl OpenAIResponsesProviderState {
                 if !text.is_empty() {
                     let key = Self::text_part_key_from_event(value);
                     self.emit_missing_text(report_context, &mut out, key, text);
+                }
+                if let Some(annotations) = value
+                    .get("annotations")
+                    .or_else(|| value.get("part").and_then(|part| part.get("annotations")))
+                    .and_then(Value::as_array)
+                {
+                    self.emit_citations(
+                        report_context,
+                        &mut out,
+                        Self::text_part_key_from_event(value),
+                        annotations,
+                    );
                 }
             }
             "response.refusal.delta" => {
@@ -2186,7 +2302,6 @@ struct OpenAIResponsesClientToolState {
     thought_signature_carrier: Option<String>,
     thought_signature_output_index: Option<usize>,
     output_index: Option<usize>,
-    web_search: bool,
 }
 
 #[derive(Clone, Default)]
@@ -2196,19 +2311,6 @@ struct OpenAIResponsesClientToolResultState {
     content: String,
     output_index: Option<usize>,
     item_started: bool,
-}
-
-fn web_search_query_from_arguments(arguments: &str) -> String {
-    serde_json::from_str::<Value>(arguments)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("query")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .or_else(|| value.as_str().map(ToOwned::to_owned))
-        })
-        .unwrap_or_default()
 }
 
 #[derive(Default)]
@@ -2358,7 +2460,10 @@ impl OpenAIChatClientEmitter {
                 Ok(out)
             }
             CanonicalStreamEvent::Citations(citations) => {
-                let annotations = canonical_citations_to_openai_annotations(&citations);
+                let annotations: Vec<Value> = canonical_citations_to_openai_annotations(&citations)
+                    .iter()
+                    .map(openai_annotation_to_chat)
+                    .collect();
                 if annotations.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -3012,26 +3117,6 @@ impl OpenAIResponsesClientEmitter {
             } else {
                 state.name.clone()
             };
-            if state.web_search {
-                out.extend(self.encode_response_event(
-                    "response.output_item.done",
-                    json!({
-                        "type": "response.output_item.done",
-                        "response_id": self.response_id(),
-                        "output_index": output_index,
-                        "item": {
-                            "type": "web_search_call",
-                            "id": item_id,
-                            "status": "completed",
-                            "action": {
-                                "type": "search",
-                                "query": web_search_query_from_arguments(&state.arguments),
-                            },
-                        }
-                    }),
-                )?);
-                continue;
-            }
             out.extend(self.encode_response_event(
                 "response.function_call_arguments.done",
                 json!({
@@ -3201,21 +3286,6 @@ impl OpenAIResponsesClientEmitter {
                     state.call_id.clone()
                 };
                 let item_id = self.tool_call_item_id(*index);
-                if state.web_search {
-                    ordered_output.push((
-                        output_index,
-                        json!({
-                            "type": "web_search_call",
-                            "id": item_id,
-                            "status": "completed",
-                            "action": {
-                                "type": "search",
-                                "query": web_search_query_from_arguments(&state.arguments),
-                            },
-                        }),
-                    ));
-                    continue;
-                }
                 let mut item = json!({
                     "type": "function_call",
                     "id": item_id.clone(),
@@ -3522,37 +3592,21 @@ impl OpenAIResponsesClientEmitter {
                     .map(|(_, child_name)| child_name.to_string())
                     .unwrap_or_else(|| name.clone());
                 let emitted_namespace = namespaced_tool.map(|(namespace, _)| namespace.to_string());
-                let web_search = self
-                    .namespace_tool_aliases
-                    .emits_hosted_web_search_call(&name);
                 let state = self.tool_calls.entry(index).or_default();
                 state.call_id = call_id.clone();
                 state.name = emitted_name;
                 state.namespace = emitted_namespace;
-                state.web_search = web_search;
                 let emitted_call_id = state.call_id.clone();
                 let emitted_name = state.name.clone();
                 let emitted_namespace = state.namespace.clone();
-                let mut item = if state.web_search {
-                    json!({
-                        "type": "web_search_call",
-                        "id": item_id,
-                        "status": "in_progress",
-                        "action": {
-                            "type": "search",
-                            "query": "",
-                        },
-                    })
-                } else {
-                    json!({
-                        "type": "function_call",
-                        "id": item_id,
-                        "call_id": emitted_call_id,
-                        "name": emitted_name,
-                        "arguments": "",
-                        "status": "in_progress",
-                    })
-                };
+                let mut item = json!({
+                    "type": "function_call",
+                    "id": item_id,
+                    "call_id": emitted_call_id,
+                    "name": emitted_name,
+                    "arguments": "",
+                    "status": "in_progress",
+                });
                 if let (Some(namespace), Some(item)) = (emitted_namespace, item.as_object_mut()) {
                     item.insert("namespace".to_string(), Value::String(namespace));
                 }
@@ -3636,9 +3690,6 @@ impl OpenAIResponsesClientEmitter {
                 let response_id = self.response_id().to_string();
                 let state = self.tool_calls.entry(index).or_default();
                 state.arguments.push_str(&arguments);
-                if state.web_search {
-                    return Ok(out);
-                }
                 let call_id = if state.call_id.is_empty() {
                     build_generated_tool_call_id(index)
                 } else {
@@ -6328,7 +6379,70 @@ mod tests {
     }
 
     #[test]
-    fn openai_responses_client_emitter_emits_web_search_call_item() {
+    fn responses_stream_preserves_real_hosted_search_item() {
+        let context = json!({"client_api_format": "openai:responses"});
+        let mut provider = OpenAIResponsesProviderState::default();
+        let mut emitter = OpenAIResponsesClientEmitter::default();
+        let item = json!({"type": "web_search_call", "id": "ws_real", "status": "failed", "action": {"type": "open_page", "url": "https://example.com"}});
+        let event = json!({"type": "response.output_item.done", "output_index": 0, "item": item});
+        let mut bytes = Vec::new();
+        for frame in provider.push_event(&context, &event).unwrap() {
+            bytes.extend(emitter.emit(frame).unwrap());
+        }
+        bytes.extend(emitter.finish().unwrap());
+        let sse = String::from_utf8(bytes).unwrap();
+        assert!(sse.contains(r#""type":"web_search_call""#));
+        assert!(sse.contains(r#""status":"failed""#));
+        assert!(sse.contains(r#""type":"open_page""#));
+        assert!(!sse.contains("function_call"));
+    }
+
+    #[test]
+    fn chat_stream_search_citations_are_converted_to_responses_annotations() {
+        let mut provider = OpenAIChatProviderState::default();
+        let mut emitter = OpenAIResponsesClientEmitter::default();
+        let citation = json!({"url": "https://example.com", "title": "Example", "start_index": 0, "end_index": 2});
+        let chunk = json!({"id": "chatcmpl-search", "model": "chat", "choices": [{"index": 0, "delta": {
+            "role": "assistant", "content": "中文😀", "annotations": [{"type": "url_citation", "url_citation": citation}]
+        }, "finish_reason": null}]});
+        let mut bytes = Vec::new();
+        for frame in provider
+            .push_line(&json!({}), format!("data: {chunk}\n\n").into_bytes())
+            .unwrap()
+        {
+            bytes.extend(emitter.emit(frame).unwrap());
+        }
+        bytes.extend(emitter.finish().unwrap());
+        let sse = String::from_utf8(bytes).unwrap();
+        assert!(sse.contains("response.output_text.annotation.added"));
+        assert!(sse.contains(r#""url":"https://example.com""#));
+        assert!(!sse.contains("url_citation\":{\""));
+        assert!(sse.contains(r#""start_index":0"#));
+    }
+
+    #[test]
+    fn responses_stream_search_citations_are_converted_once_to_chat_annotations() {
+        let mut provider = OpenAIResponsesProviderState::default();
+        let mut emitter = OpenAIChatClientEmitter::default();
+        let annotation = json!({"type": "url_citation", "url": "https://example.com", "title": "Example", "start_index": 0, "end_index": 2});
+        let events = [
+            json!({"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "中文😀"}),
+            json!({"type": "response.output_text.annotation.added", "output_index": 0, "content_index": 0, "annotation_index": 0, "annotation": annotation}),
+            json!({"type": "response.content_part.done", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "中文😀", "annotations": [annotation]}}),
+        ];
+        let mut bytes = Vec::new();
+        for event in events {
+            for frame in provider.push_event(&json!({}), &event).unwrap() {
+                bytes.extend(emitter.emit(frame).unwrap());
+            }
+        }
+        let sse = String::from_utf8(bytes).unwrap();
+        assert!(sse.contains(r#""url_citation":{"end_index":2"#));
+        assert_eq!(sse.matches("https://example.com").count(), 1);
+    }
+
+    #[test]
+    fn openai_responses_client_emitter_does_not_infer_hosted_search_from_function_name() {
         let mut emitter = OpenAIResponsesClientEmitter::default();
         let mut bytes = emitter
             .emit(CanonicalStreamFrame {
@@ -6368,13 +6482,11 @@ mod tests {
 
         let sse = String::from_utf8(bytes).expect("sse should be utf8");
         assert!(sse.contains("event: response.output_item.added\n"));
-        assert!(sse.contains(r#""type":"web_search_call""#));
+        assert!(sse.contains(r#""type":"function_call""#));
         assert!(sse.contains(r#""status":"in_progress""#));
-        assert!(sse.contains(r#""query":"""#));
-        assert!(sse.contains(r#""type":"search""#));
         assert!(sse.contains("event: response.output_item.done\n"));
-        assert!(sse.contains(r#""query":"today tech""#));
-        assert!(!sse.contains("response.function_call_arguments.delta"));
+        assert!(!sse.contains("web_search_call"));
+        assert!(sse.contains("response.function_call_arguments.delta"));
     }
 
     #[test]

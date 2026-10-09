@@ -17,6 +17,7 @@ mod oauth_retry;
 #[cfg(test)]
 pub(crate) mod remote_compat;
 mod response_header_rules;
+mod search_downgrade;
 mod server;
 pub(crate) mod stream;
 mod stream_pump;

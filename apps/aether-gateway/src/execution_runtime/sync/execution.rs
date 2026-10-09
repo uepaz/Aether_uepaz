@@ -52,6 +52,9 @@ use crate::execution_runtime::kiro_cache::{
 use crate::execution_runtime::oauth_retry::refresh_oauth_plan_auth_for_retry;
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::post_sync_plan_to_remote_execution_runtime;
+use crate::execution_runtime::search_downgrade::{
+    attach_search_downgrade_context, downgrade_unsupported_chat_search,
+};
 use crate::execution_runtime::submission::{
     resolve_local_sync_error_status_code, submit_local_core_error_or_sync_finalize,
 };
@@ -2732,6 +2735,46 @@ async fn execute_execution_runtime_sync_impl(
             result.error.as_ref().map(|error| error.message.as_str()),
         );
 
+        if let Some(record) = downgrade_unsupported_chat_search(
+            &mut plan,
+            result.status_code,
+            local_failover_response_text.as_deref(),
+        ) {
+            attach_search_downgrade_context(&mut report_context, &record);
+            record_local_request_candidate_extra_data(
+                state, &plan, report_context.as_ref(), RequestCandidateStatus::Pending,
+                None, Some(elapsed_ms_since(candidate_started_at)), record,
+            ).await;
+            warn!(
+                event_name = "chat_search_downgraded", log_type = "ops",
+                trace_id, request_id = %plan_request_id_for_log, candidate_id = ?plan_candidate_id,
+                status_code = result.status_code, search_downgraded = true,
+                "upstream rejected search; retrying the same candidate without search"
+            );
+            let retry_started_at_unix_ms = current_request_candidate_unix_ms();
+            match crate::execution_runtime::execute_execution_runtime_sync_plan_with_report_context(
+                state, Some(trace_id), &plan, report_context.as_ref(),
+            ).await {
+                Ok(retry_result) => {
+                    provider_response_observation = retry_result.response_observation.clone()
+                        .unwrap_or(ExecutionResponseObservation {
+                            request_started_at_unix_ms: retry_started_at_unix_ms,
+                            response_headers_observed_at_unix_ms: current_request_candidate_unix_ms(),
+                            request_order_id: uuid::Uuid::now_v7().to_string(),
+                        });
+                    candidate_first_byte_elapsed_ms = calibrated_sync_candidate_first_byte_elapsed_ms(
+                        candidate_started_at, &retry_result,
+                    );
+                    result = retry_result;
+                    continue;
+                }
+                Err(err) => {
+                    warn!(event_name = "chat_search_downgrade_retry_failed", log_type = "ops",
+                        trace_id, error = ?err, "search downgrade retry could not execute");
+                }
+            }
+        }
+
         if result.status_code >= 400
             && !oauth_retry_attempted
             && refresh_oauth_plan_auth_for_retry(
@@ -3613,6 +3656,122 @@ mod tests {
             Some("openai:chat".to_string()),
         )
         .with_execution_runtime_candidate(true)
+    }
+
+    #[tokio::test]
+    async fn chat_search_downgrade_sync_retries_same_candidate_and_records_original_error() {
+        use axum::{routing::any, Json, Router};
+        for reject_retry in [false, true] {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+            let seen = requests.clone();
+            let error = json!({"error":{"param":"web_search_options","code":"unsupported_parameter","message":"Search not supported"}});
+            let returned_error = error.clone();
+            let app = Router::new().route("/chat/completions", any(move |Json(body): Json<Value>| {
+                let seen = seen.clone();
+                let error = returned_error.clone();
+                async move {
+                    let first = {
+                        let mut seen = seen.lock().unwrap();
+                        seen.push(body);
+                        seen.len() == 1
+                    };
+                    if first || reject_retry {
+                        (StatusCode::BAD_REQUEST, Json(error))
+                    } else {
+                        (StatusCode::OK, Json(json!({
+                            "id":"chatcmpl-search-fallback", "object":"chat.completion", "model":"deepseek-v4.1-flash",
+                            "choices":[{"index":0,"message":{"role":"assistant","content":"Answer without search"},"finish_reason":"stop"}]
+                        })))
+                    }
+                }
+            }));
+            let listener = crate::test_support::bind_loopback_listener().await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let candidates = Arc::new(InMemoryRequestCandidateRepository::default());
+            let state = AppState::new().unwrap().with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    candidates.clone(), Arc::new(InMemoryUsageReadRepository::default()),
+                ),
+            );
+            let mut plan = test_gemini_chat_plan();
+            plan.provider_api_format = "openai:chat".to_string();
+            plan.client_api_format = "openai:responses".to_string();
+            plan.provider_name = Some("custom".to_string());
+            plan.model_name = Some("deepseek-v4.1-flash".to_string());
+            plan.url = format!("http://{addr}/chat/completions");
+            plan.headers
+                .insert("content-type".to_string(), "application/json".to_string());
+            let original = json!({"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"Search please"}],
+                "web_search_options":{},"tools":[{"type":"function","function":{"name":"ordinary","parameters":{"type":"object"}}}],"stream":false});
+            plan.body = aether_contracts::RequestBody::from_json(original.clone());
+            let context = Some(json!({
+                "candidate_index":0,"retry_index":0,"user_id":"user","api_key_id":"api-key",
+                "candidate_id":"candidate-1","provider_id":"provider-1","endpoint_id":"endpoint-1","key_id":"key-1",
+                "provider_api_format":"openai:chat","client_api_format":"openai:responses","needs_conversion":true,
+                "mapped_model":"deepseek-v4.1-flash", "original_request_body":{"tools":[{"type":"web_search"}]}
+            }));
+            let decision = GatewayControlDecision::synthetic(
+                "/v1/responses",
+                Some("ai_public".to_string()),
+                Some("openai".to_string()),
+                Some("responses".to_string()),
+                Some("openai:responses".to_string()),
+            )
+            .with_execution_runtime_candidate(true);
+            let outcome = execute_execution_runtime_sync_with_retry_scope(
+                &state,
+                "/v1/responses",
+                plan,
+                "trace-search-sync",
+                &decision,
+                "openai_responses_sync",
+                Some("openai_responses_sync".to_string()),
+                context,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                2,
+                "both requests must reach the mock upstream"
+            );
+            match (reject_retry, outcome) {
+                (false, AiAttemptExecutionOutcome::Responded(response)) => {
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["output"][0]["content"][0]["text"], "Answer without search");
+                    assert!(body["output"].as_array().unwrap().iter().all(|item| item["type"] != "web_search_call"));
+                }
+                (true, AiAttemptExecutionOutcome::Retry { .. }) => {}
+                (true, AiAttemptExecutionOutcome::Responded(response)) => {
+                    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                }
+                _ => panic!("search fallback success must respond, and failure must follow the existing failure policy"),
+            }
+            let seen = requests.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0], original);
+            let mut expected = original;
+            expected
+                .as_object_mut()
+                .unwrap()
+                .remove("web_search_options");
+            assert_eq!(seen[1], expected);
+            drop(seen);
+            let stored = candidates.list_by_request_id("req-1").await.unwrap();
+            let extra = stored
+                .iter()
+                .find(|row| row.id == "candidate-1")
+                .unwrap()
+                .extra_data
+                .as_ref()
+                .unwrap();
+            assert_eq!(extra["search_downgraded"], true);
+            assert_eq!(extra["search_downgrade_original_error"]["body"], error);
+            server.abort();
+        }
     }
 
     #[tokio::test]

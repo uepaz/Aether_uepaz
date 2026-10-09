@@ -146,6 +146,19 @@ pub(crate) async fn maybe_build_local_openai_responses_decision_payload_for_cand
         &mut extra_fields,
         resolved.transport.provider.provider_type.as_str(),
     );
+    if resolved
+        .provider_api_format
+        .eq_ignore_ascii_case("openai:chat")
+        && resolved
+            .provider_request_body
+            .get("web_search_options")
+            .is_some()
+    {
+        let notes = aether_ai_formats::openai_responses_chat_search_conversion_notes(body_json);
+        if !notes.is_empty() {
+            extra_fields.insert("search_conversion_notes".to_string(), json!(notes));
+        }
+    }
     let effective_headers = input.effective_headers(&parts.headers);
     let report_context = append_local_failover_policy_to_value(
         append_execution_contract_fields_to_value(

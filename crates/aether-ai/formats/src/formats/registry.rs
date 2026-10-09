@@ -1,4 +1,4 @@
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::formats::openai::namespace::NamespaceToolAliases;
 use crate::formats::{
@@ -182,6 +182,250 @@ pub fn convert_request(
 }
 
 fn normalize_openai_responses_to_chat_body(
+    source: FormatId,
+    target: FormatId,
+    body: &Value,
+) -> Result<Value, FormatError> {
+    if matches!(
+        source,
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+    ) && target == FormatId::OpenAiChat
+        && body.get("web_search_options").is_some()
+    {
+        return Err(FormatError::UnauditedField {
+            source_format: source.as_str().into(),
+            target_format: target.as_str().into(),
+            field: "web_search_options".into(),
+            reason:
+                "web_search_options is a Chat field; Responses must declare hosted search in tools"
+                    .into(),
+        });
+    }
+    let mut normalized = normalize_openai_responses_additional_tools(source, target, body)?;
+    if matches!(
+        source,
+        FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact
+    ) && target == FormatId::OpenAiChat
+    {
+        project_responses_search_to_chat(source, &mut normalized)?;
+    }
+    Ok(normalized)
+}
+
+fn project_responses_search_to_chat(source: FormatId, body: &mut Value) -> Result<(), FormatError> {
+    let Some(object) = body.as_object_mut() else {
+        return Ok(());
+    };
+    if let Some(include) = object.get("include").and_then(Value::as_array) {
+        if let Some(index) = include.iter().position(|value| {
+            value
+                .as_str()
+                .is_some_and(|field| field.starts_with("web_search_call."))
+        }) {
+            return Err(FormatError::LossyConversionBlocked {
+                source_format: source.as_str().into(), target_format: FormatId::OpenAiChat.as_str().into(),
+                field: format!("include[{index}]"), reason: "Chat native search cannot return Responses search execution details or complete sources".into(),
+            });
+        }
+    }
+    let Some(tools) = object.get("tools").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let is_search = |tool: &Value| {
+        matches!(
+            tool.get("type").and_then(Value::as_str),
+            Some("web_search" | "web_search_preview")
+        )
+    };
+    let blocked = |field: String, reason: &str| FormatError::LossyConversionBlocked {
+        source_format: source.as_str().to_string(),
+        target_format: FormatId::OpenAiChat.as_str().to_string(),
+        field,
+        reason: reason.to_string(),
+    };
+    for (index, tool) in tools.iter().enumerate() {
+        if tool
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.starts_with("web_search") && !is_search(tool))
+        {
+            return Err(blocked(format!("tools[{index}].type"), "only web_search and web_search_preview hosted search tools are supported for Chat projection"));
+        }
+    }
+    if !tools.iter().any(is_search) {
+        return Ok(());
+    }
+    let choice = object.get("tool_choice");
+    let allowed_search = if choice
+        .and_then(|choice| choice.get("type"))
+        .and_then(Value::as_str)
+        == Some("allowed_tools")
+    {
+        let allowed = choice
+            .and_then(|choice| choice.get("tools"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                blocked(
+                    "tool_choice.tools".into(),
+                    "allowed_tools must provide an array of tool selectors",
+                )
+            })?;
+        allowed.iter().any(is_search)
+    } else {
+        true
+    };
+    let disabled = choice.and_then(Value::as_str) == Some("none")
+        || choice
+            .and_then(|choice| choice.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|kind| matches!(kind, "function" | "custom"))
+        || !allowed_search;
+    let mut options = None;
+    if !disabled {
+        for (index, tool) in tools.iter().enumerate().filter(|(_, tool)| is_search(tool)) {
+            let tool = tool.as_object().expect("search tool has a type field");
+            for key in tool.keys() {
+                if !matches!(
+                    key.as_str(),
+                    "type" | "search_context_size" | "user_location"
+                ) {
+                    return Err(blocked(format!("tools[{index}].{key}"), "OpenAI Chat web_search_options cannot represent this Responses search constraint"));
+                }
+            }
+            let mut projected = serde_json::Map::new();
+            if let Some(size) = tool.get("search_context_size") {
+                if !matches!(size.as_str(), Some("low" | "medium" | "high")) {
+                    return Err(blocked(
+                        format!("tools[{index}].search_context_size"),
+                        "search_context_size must be low, medium, or high",
+                    ));
+                }
+                projected.insert("search_context_size".into(), size.clone());
+            }
+            if let Some(location) = tool.get("user_location").filter(|value| !value.is_null()) {
+                let Some(location) = location.as_object() else {
+                    return Err(blocked(
+                        format!("tools[{index}].user_location"),
+                        "search user_location must be an approximate location object",
+                    ));
+                };
+                if location.get("type").and_then(Value::as_str) != Some("approximate") {
+                    return Err(blocked(
+                        format!("tools[{index}].user_location.type"),
+                        "Chat search only supports approximate user locations",
+                    ));
+                }
+                let mut approximate = serde_json::Map::new();
+                for (key, value) in location {
+                    if key == "type" {
+                        continue;
+                    }
+                    if !matches!(key.as_str(), "country" | "city" | "region" | "timezone")
+                        || (!value.is_string() && !value.is_null())
+                    {
+                        return Err(blocked(
+                            format!("tools[{index}].user_location.{key}"),
+                            "Chat search cannot represent this user location field",
+                        ));
+                    }
+                    if value.is_null() {
+                        continue;
+                    }
+                    approximate.insert(key.clone(), value.clone());
+                }
+                projected.insert(
+                    "user_location".into(),
+                    json!({"type": "approximate", "approximate": approximate}),
+                );
+            }
+            let projected = Value::Object(projected);
+            if options
+                .as_ref()
+                .is_some_and(|previous| previous != &projected)
+            {
+                return Err(blocked(format!("tools[{index}]"), "multiple search configurations cannot be represented by one Chat web_search_options"));
+            }
+            options = Some(projected);
+        }
+    }
+    let remaining: Vec<Value> = tools
+        .iter()
+        .filter(|tool| !is_search(tool))
+        .cloned()
+        .collect();
+    let has_client_tools = !remaining.is_empty();
+    if has_client_tools {
+        object.insert("tools".into(), Value::Array(remaining));
+    } else {
+        object.remove("tools");
+    }
+    if let Some(options) = options {
+        object.insert("web_search_options".into(), options);
+    }
+    // Chat performs native search before answering; required may be satisfied
+    // by that search and must not accidentally force an unrelated function.
+    match object.get("tool_choice") {
+        Some(Value::String(choice)) if choice == "required" && has_client_tools => {
+            object.insert("tool_choice".into(), json!("auto"));
+        }
+        Some(choice) if is_search(choice) && has_client_tools => {
+            object.insert("tool_choice".into(), json!("none"));
+        }
+        Some(choice) if is_search(choice) || (!has_client_tools && choice.is_string()) => {
+            object.remove("tool_choice");
+        }
+        _ => {}
+    }
+    if !disabled {
+        if let Some(choice) = object.get_mut("tool_choice").and_then(Value::as_object_mut) {
+            if choice.get("type").and_then(Value::as_str) == Some("allowed_tools") {
+                let selectors = choice
+                    .get_mut("tools")
+                    .and_then(Value::as_array_mut)
+                    .expect("allowed tool selectors were checked above");
+                selectors.retain(|tool| !is_search(tool));
+                if selectors.is_empty() {
+                    if has_client_tools {
+                        object.insert("tool_choice".into(), json!("none"));
+                    } else {
+                        object.remove("tool_choice");
+                    }
+                } else {
+                    choice.insert("mode".into(), json!("auto"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compatibility notes for planners that expose Responses-to-Chat search mapping.
+/// No provider capability lookup is needed: Chat search is attempted by default.
+pub fn openai_responses_chat_search_conversion_notes(body: &Value) -> Vec<String> {
+    let Ok(projected) = normalize_openai_responses_to_chat_body(
+        FormatId::OpenAiResponses,
+        FormatId::OpenAiChat,
+        body,
+    ) else {
+        return Vec::new();
+    };
+    if projected.get("web_search_options").is_none() {
+        return Vec::new();
+    }
+    let mut notes = vec!["Responses hosted search is mapped to Chat web_search_options; Chat native search runs before answering, so optional search becomes unconditional".into()];
+    if body.get("tool_choice").and_then(Value::as_str) == Some("required")
+        || body
+            .get("tool_choice")
+            .and_then(|choice| choice.get("mode"))
+            .and_then(Value::as_str)
+            == Some("required")
+    {
+        notes.push("Responses required may be satisfied by native search; Chat function tool_choice is relaxed to auto when client tools remain".into());
+    }
+    notes
+}
+
+fn normalize_openai_responses_additional_tools(
     source: FormatId,
     target: FormatId,
     body: &Value,
@@ -1058,7 +1302,11 @@ fn validate_known_standard_request_root_fields(
         return Ok(());
     };
     for key in object.keys() {
-        if standard_request_root_field_is_audited(source, key) {
+        if standard_request_root_field_is_audited(source, key)
+            // Search projection adds this Chat-native field before parsing IR.
+            || (matches!(source, FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact)
+                && target == FormatId::OpenAiChat && key == "web_search_options")
+        {
             continue;
         }
         return Err(FormatError::UnauditedField {
@@ -1740,7 +1988,8 @@ fn request_extension_key_is_cross_format_safe(
                 | "prompt_cache_options"
                 | "prompt_cache_retention"
                 | "user"
-                | "verbosity",
+                | "verbosity"
+                | "web_search_options",
         ) | (
             FormatId::ClaudeMessages,
             _,
@@ -2719,7 +2968,7 @@ fn validate_openai_responses_to_chat(
                     source_format: FormatId::OpenAiResponses.as_str().to_string(),
                     target_format: FormatId::OpenAiChat.as_str().to_string(),
                     field: "tools".to_string(),
-                    reason: format!("OpenAI Chat only supports function tools, got {tool_type}"),
+                    reason: format!("OpenAI Chat supports function/custom tools and expanded namespaces; hosted {tool_type} has no supported mapping"),
                 });
             }
         }
@@ -3312,6 +3561,19 @@ fn build_request_conversion_report(
             }
         }
     }
+    if matches!(
+        FormatId::parse(source_format),
+        Some(FormatId::OpenAiResponses | FormatId::OpenAiResponsesCompact)
+    ) && FormatId::parse(target_format) == Some(FormatId::OpenAiChat)
+    {
+        for note in openai_responses_chat_search_conversion_notes(body) {
+            report.record(
+                "tools.web_search",
+                ConversionFieldStatus::Mapped,
+                Some(note),
+            );
+        }
+    }
     report
 }
 
@@ -3607,17 +3869,17 @@ mod tests {
             let body = serde_json::to_string(&converted.value).expect("serialize");
             let annotations = find_first_array(&converted.value, "annotations")
                 .unwrap_or_else(|| panic!("{target} dropped the grounding metadata: {body}"));
-            assert_eq!(
-                annotations,
-                &json!([{
-                    "type": "url_citation",
-                    "url": "https://time.gov/",
-                    "title": "time.gov",
-                    "start_index": 0,
-                    "end_index": 9,
-                }]),
-                "{target} annotations"
-            );
+            let mut expected = json!({
+                "type": "url_citation",
+                "url": "https://time.gov/",
+                "title": "time.gov",
+                "start_index": 0,
+                "end_index": 9,
+            });
+            if target == "openai:chat" {
+                expected = crate::formats::shared::citations::openai_annotation_to_chat(&expected);
+            }
+            assert_eq!(annotations, &json!([expected]), "{target} annotations");
         }
 
         let converted =
@@ -3651,7 +3913,7 @@ mod tests {
             &find_first_array(&converted.value, "annotations").expect("annotations")[0];
 
         // "今天是 2026 " is 15 bytes but 9 characters.
-        assert_eq!(annotation["end_index"], json!(9));
+        assert_eq!(annotation["url_citation"]["end_index"], json!(9));
     }
 
     fn grounded_gemini_response() -> serde_json::Value {
@@ -3693,6 +3955,179 @@ mod tests {
                 items.iter().find_map(|item| find_first_array(item, key))
             }
             _ => None,
+        }
+    }
+
+    #[test]
+    fn search_citations_map_between_chat_and_responses() {
+        let citation = json!({"url": "https://example.com", "title": "Example", "start_index": 0, "end_index": 2});
+        let body = json!({"id": "chatcmpl-search", "model": "chat", "choices": [{
+            "message": {"role": "assistant", "content": "中文😀", "annotations": [{"type": "url_citation", "url_citation": citation}]},
+            "index": 0, "finish_reason": "stop"
+        }]});
+        let responses = convert_response(
+            "openai:chat",
+            "openai:responses",
+            &body,
+            &FormatContext::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            responses["output"][0]["content"][0]["annotations"][0]["url"],
+            citation["url"]
+        );
+        let chat = convert_response(
+            "openai:responses",
+            "openai:chat",
+            &responses,
+            &FormatContext::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            chat["choices"][0]["message"]["annotations"][0]["url_citation"],
+            citation
+        );
+    }
+
+    #[test]
+    fn responses_real_search_roundtrip_keeps_action_and_status() {
+        let search = json!({"type": "web_search_call", "id": "ws_1", "status": "failed", "action": {"type": "open_page", "url": "https://example.com"}});
+        let body = json!({"id": "resp-search", "model": "chat", "output": [search], "status": "completed"});
+        let canonical = super::parse_response_pure("openai:responses", &body).unwrap();
+        let converted = super::emit_response_pure("openai:responses", &canonical).unwrap();
+        assert_eq!(converted["output"][0], search);
+    }
+
+    #[test]
+    fn responses_search_maps_to_chat_search_options_in_runtime_and_pure() {
+        let body = json!({
+            "model": "ordinary-chat-model", "input": "search",
+            "tools": [
+                {"type": "web_search", "search_context_size": "high", "user_location": {
+                    "type": "approximate", "country": "HK", "city": "Hong Kong"
+                    , "region": null, "timezone": null
+                }},
+                {"type": "function", "name": "save", "parameters": {"type": "object"}}
+            ], "tool_choice": "auto"
+        });
+        let runtime = convert_request(
+            "openai:responses",
+            "openai:chat",
+            &body,
+            &FormatContext::default(),
+        )
+        .unwrap();
+        let pure = convert_request_pure("openai:responses", "openai:chat", &body).unwrap();
+        assert_eq!(runtime, pure.value);
+        assert_eq!(runtime["web_search_options"]["search_context_size"], "high");
+        assert_eq!(
+            runtime["web_search_options"]["user_location"]["approximate"]["country"],
+            "HK"
+        );
+        assert!(
+            runtime["web_search_options"]["user_location"]["approximate"]
+                .get("region")
+                .is_none()
+        );
+        assert!(
+            runtime["web_search_options"]["user_location"]["approximate"]
+                .get("timezone")
+                .is_none()
+        );
+        assert_eq!(runtime["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(runtime["tools"][0]["function"]["name"], "save");
+    }
+
+    #[test]
+    fn responses_search_choice_and_unsupported_constraints_are_explicit() {
+        for choice in [
+            json!("auto"),
+            json!("required"),
+            json!({"type": "web_search_preview"}),
+            json!("none"),
+        ] {
+            let body = json!({"model": "chat", "input": "search", "tools": [{"type": "web_search_preview"}], "tool_choice": choice});
+            let converted = convert_request_pure("openai:responses", "openai:chat", &body)
+                .unwrap()
+                .value;
+            assert_eq!(
+                converted.get("web_search_options").is_some(),
+                choice != "none"
+            );
+            assert!(converted.get("tools").is_none());
+            assert!(converted.get("tool_choice").is_none());
+        }
+        let body = json!({"model": "chat", "input": "search", "tools": [
+            {"type": "web_search"}, {"type": "function", "name": "save", "parameters": {"type": "object"}}, {"type": "custom", "name": "edit"}
+        ], "tool_choice": "required"});
+        let converted = convert_request_pure("openai:responses", "openai:chat", &body).unwrap();
+        assert_eq!(converted.value["tool_choice"], "auto");
+        assert_eq!(converted.value["tools"].as_array().unwrap().len(), 2);
+        assert!(converted.report.fields.iter().any(|field| field
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("relaxed to auto"))));
+        for (choice, searched, selector_count) in [
+            (
+                json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "web_search"}]}),
+                true,
+                0,
+            ),
+            (
+                json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "web_search"}, {"type": "function", "name": "save"}]}),
+                true,
+                1,
+            ),
+            (json!({"type": "function", "name": "save"}), false, 0),
+        ] {
+            let mut body = body.clone();
+            body["tool_choice"] = choice;
+            let converted = convert_request_pure("openai:responses", "openai:chat", &body)
+                .unwrap()
+                .value;
+            assert_eq!(converted.get("web_search_options").is_some(), searched);
+            if selector_count > 0 {
+                assert_eq!(converted["tool_choice"]["allowed_tools"]["mode"], "auto");
+                assert_eq!(
+                    converted["tool_choice"]["allowed_tools"]["tools"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    selector_count
+                );
+            }
+            if searched && selector_count == 0 {
+                assert_eq!(converted["tool_choice"], "none");
+            }
+        }
+        let mut unknown = body.clone();
+        unknown["tools"][0]["type"] = json!("web_search_preview_2025_03_11");
+        assert!(
+            matches!(convert_request("openai:responses", "openai:chat", &unknown, &FormatContext::default()), Err(FormatError::LossyConversionBlocked { field, .. }) if field == "tools[0].type")
+        );
+        let mut sources = body.clone();
+        sources["include"] = json!(["web_search_call.action.sources"]);
+        assert!(
+            matches!(convert_request("openai:responses", "openai:chat", &sources, &FormatContext::default()), Err(FormatError::LossyConversionBlocked { field, .. }) if field == "include[0]")
+        );
+        for field in ["filters", "external_web_access"] {
+            let mut body =
+                json!({"model": "chat", "input": "search", "tools": [{"type": "web_search"}]});
+            body["tools"][0][field] = json!({});
+            for result in [
+                convert_request(
+                    "openai:responses",
+                    "openai:chat",
+                    &body,
+                    &FormatContext::default(),
+                ),
+                convert_request_pure("openai:responses", "openai:chat", &body)
+                    .map(|converted| converted.value),
+            ] {
+                assert!(
+                    matches!(result, Err(FormatError::LossyConversionBlocked {field: ref path, ..}) if path == &format!("tools[0].{field}"))
+                );
+            }
         }
     }
 

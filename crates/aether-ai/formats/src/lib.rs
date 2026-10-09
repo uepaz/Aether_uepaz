@@ -75,7 +75,8 @@ pub use formats::openai::responses::{
 pub use formats::registry::{
     build_stream_transcoder, convert_request, convert_request_pure,
     convert_request_pure_with_context, convert_response, convert_response_pure, emit_request_pure,
-    emit_response_pure, parse_request_pure, parse_response_pure,
+    emit_response_pure, openai_responses_chat_search_conversion_notes, parse_request_pure,
+    parse_response_pure,
 };
 pub use formats::shared::model_directives::{
     apply_model_directive_mapping_patch, apply_model_directive_overrides_from_model,

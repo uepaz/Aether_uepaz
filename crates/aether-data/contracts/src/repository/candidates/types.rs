@@ -895,6 +895,7 @@ pub fn sanitize_request_candidate_extra_data_for_persistence(
     let mut sanitized = sanitize_candidate_extra_data_object(object);
     for (key, fields) in [
         ("upstream_response", &["headers", "body"][..]),
+        ("search_downgrade_original_error", &["body"][..]),
         ("error_flow", &["message"][..]),
         (
             "failure_diagnostic",
@@ -960,8 +961,26 @@ fn sanitize_candidate_extra_data_object(
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut sanitized = serde_json::Map::new();
 
-    for field in ["gateway_execution_runtime", "stream_completed", "cache_1h"] {
+    for field in [
+        "gateway_execution_runtime",
+        "stream_completed",
+        "cache_1h",
+        "search_downgraded",
+    ] {
         insert_candidate_bool(object, &mut sanitized, field);
+    }
+    insert_candidate_known_string(object, &mut sanitized, "search_downgrade_reason", |value| {
+        (value == "upstream_search_unsupported").then_some("upstream_search_unsupported")
+    });
+    insert_candidate_known_string(object, &mut sanitized, "search_downgrade_policy", |value| {
+        (value == "retry_same_candidate_without_search_once")
+            .then_some("retry_same_candidate_without_search_once")
+    });
+    if let Some(summary) = object
+        .get("search_downgrade_original_error")
+        .and_then(sanitize_candidate_upstream_response)
+    {
+        sanitized.insert("search_downgrade_original_error".to_string(), summary);
     }
     for field in ["first_byte_time_ms", "pool_key_index"] {
         insert_candidate_u64(object, &mut sanitized, field);
@@ -2529,6 +2548,46 @@ mod tests {
         assert!(public["upstream_response"].get("body").is_none());
         assert!(public["error_flow"].get("message").is_none());
         assert!(public.get("failure_diagnostic").is_none());
+    }
+
+    #[test]
+    fn candidate_search_downgrade_metadata_survives_persistence_and_public_projection() {
+        let raw = json!({
+            "search_downgraded":true,
+            "search_downgrade_reason":"upstream_search_unsupported",
+            "search_downgrade_policy":"retry_same_candidate_without_search_once",
+            "search_downgrade_original_error":{"status_code":400,"body":{"error":{"message":"private upstream rejection"}}},
+            "request_body":{"input":"private prompt"}
+        });
+        let admin = super::sanitize_request_candidate_extra_data_for_persistence(Some(raw.clone()))
+            .unwrap();
+        assert_eq!(admin["search_downgraded"], true);
+        assert_eq!(
+            admin["search_downgrade_reason"],
+            raw["search_downgrade_reason"]
+        );
+        assert_eq!(
+            admin["search_downgrade_policy"],
+            raw["search_downgrade_policy"]
+        );
+        assert_eq!(
+            admin["search_downgrade_original_error"],
+            raw["search_downgrade_original_error"]
+        );
+        assert_eq!(
+            super::sanitize_request_candidate_extra_data_for_persistence(Some(admin.clone())),
+            Some(admin.clone())
+        );
+        let public = super::sanitize_request_candidate_extra_data(Some(admin)).unwrap();
+        assert_eq!(public["search_downgraded"], true);
+        assert_eq!(
+            public["search_downgrade_original_error"]["status_code"],
+            400
+        );
+        assert!(public["search_downgrade_original_error"]
+            .get("body")
+            .is_none());
+        assert!(public.get("request_body").is_none());
     }
 
     #[test]

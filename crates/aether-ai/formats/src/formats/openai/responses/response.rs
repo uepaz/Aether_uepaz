@@ -275,36 +275,24 @@ pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, compact: bo
                     }));
                 }
                 let namespaced_tool = namespace_tool_aliases.responses_name(name);
-                if namespace_tool_aliases.emits_hosted_web_search_call(name) {
-                    output.push(json!({
-                        "type": "web_search_call",
-                        "id": id,
-                        "status": "completed",
-                        "action": {
-                            "type": "search",
-                            "query": web_search_query_from_value(input),
-                        },
-                    }));
-                } else {
-                    let response_name = namespaced_tool
-                        .map(|(_, child_name)| child_name)
-                        .unwrap_or(name.as_str());
-                    let mut item = canonical_tool_use_to_openai_responses_item(
-                        id,
-                        response_name,
-                        input,
-                        extensions,
-                    );
-                    if let Some((namespace, _)) = namespaced_tool {
-                        if let Some(item) = item.as_object_mut() {
-                            item.insert(
-                                "namespace".to_string(),
-                                Value::String(namespace.to_string()),
-                            );
-                        }
+                let response_name = namespaced_tool
+                    .map(|(_, child_name)| child_name)
+                    .unwrap_or(name.as_str());
+                let mut item = canonical_tool_use_to_openai_responses_item(
+                    id,
+                    response_name,
+                    input,
+                    extensions,
+                );
+                if let Some((namespace, _)) = namespaced_tool {
+                    if let Some(item) = item.as_object_mut() {
+                        item.insert(
+                            "namespace".to_string(),
+                            Value::String(namespace.to_string()),
+                        );
                     }
-                    output.push(item);
                 }
+                output.push(item);
             }
             CanonicalContentBlock::ToolResult {
                 tool_use_id,
@@ -601,21 +589,12 @@ fn openai_responses_output_format_from_mime_type(mime_type: &str) -> String {
     .to_string()
 }
 
-fn web_search_query_from_value(input: &Value) -> String {
-    input
-        .get("query")
-        .and_then(Value::as_str)
-        .or_else(|| input.as_str())
-        .unwrap_or_default()
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn responses_response_builder_emits_web_search_call_for_web_search_tool_use() {
+    fn responses_response_builder_does_not_infer_hosted_search_from_tool_name() {
         let response = CanonicalResponse {
             id: "resp_test".to_string(),
             model: "gpt-5-5-low".to_string(),
@@ -633,11 +612,10 @@ mod tests {
 
         let body = to_raw(&response, &json!({}), false);
 
-        assert_eq!(body["output"][0]["type"], "web_search_call");
+        assert_eq!(body["output"][0]["type"], "function_call");
         assert_eq!(body["output"][0]["id"], "call_ws_1");
-        assert_eq!(body["output"][0]["status"], "completed");
-        assert_eq!(body["output"][0]["action"]["type"], "search");
-        assert_eq!(body["output"][0]["action"]["query"], "today tech");
+        assert_eq!(body["output"][0]["name"], "web_search");
+        assert_eq!(body["output"][0]["arguments"], r#"{"query":"today tech"}"#);
         assert_eq!(body["output_text"], "");
         assert!(body["created_at"].as_i64().is_some());
         assert!(body["completed_at"].as_i64().is_some());
@@ -682,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_response_builder_emits_web_search_call_for_hosted_web_search_tool() {
+    fn responses_response_builder_does_not_infer_hosted_execution_from_request_tool() {
         let report_context = json!({
             "original_request_body": {"tools": [{"type": "web_search"}]}
         });
@@ -703,8 +681,8 @@ mod tests {
 
         let body = to_raw(&response, &report_context, false);
 
-        assert_eq!(body["output"][0]["type"], "web_search_call");
-        assert_eq!(body["output"][0]["action"]["query"], "today tech");
+        assert_eq!(body["output"][0]["type"], "function_call");
+        assert_eq!(body["output"][0]["name"], "web_search");
     }
 
     #[test]

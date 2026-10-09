@@ -94,8 +94,11 @@ Provider schema refresh is not a runtime dependency. Same-format runtime paths d
 | `tools[].strict` | canonical tool strict | `tools[].function.strict` | mapped, implemented |
 | `function_call.call_id` | canonical tool use id | `tool_calls[].id` | mapped, implemented |
 | `function_call_output.call_id` | canonical tool result id | tool message `tool_call_id` | mapped, implemented |
-| `tools[].type=custom` | raw Responses tool | none | lossy-blocked to Chat |
-| `tools[].type=web_search*` | raw Responses tool | none | lossy-blocked to Chat |
+| `tools[].type=custom` | custom tool mapping | Chat custom tool | mapped |
+| `tools[].type=namespace` | reversible namespace aliases | flattened Chat tools | mapped |
+| `tools[].type=web_search/web_search_preview` | hosted search projection shared by pure and runtime conversion | root `web_search_options` | mapped with explicit compatibility notes |
+| search context size / approximate location | validated search options | context size / nested approximate location | mapped |
+| search filters / external web access / token budget / full sources | no Chat equivalent | none | lossy-blocked at the exact source field |
 | `tool_choice` | canonical tool choice | `tool_choice` | mapped |
 | `reasoning.effort` | OpenAI enum | `reasoning_effort` | mapped; invalid enum blocked |
 | `reasoning.summary` | Responses-only | none | lossy-blocked |
@@ -109,6 +112,29 @@ Provider schema refresh is not a runtime dependency. Same-format runtime paths d
 | `background` | Responses-only | none | lossy-blocked |
 | `max_tool_calls` | Responses-only | none | lossy-blocked |
 | unknown top-level fields | source schema guard | none | unaudited |
+
+Responses-to-Chat search compatibility was updated on 2026-10-09. Native Chat
+search is attempted without a model allowlist or a key capability declaration.
+Hosted search entries leave `tools`; ordinary function, custom and namespace
+tools retain their existing mapping. `tool_choice=none` disables native search.
+Optional Responses search becomes unconditional Chat search, and a mixed
+`required` choice becomes `auto` for client tools because native search can
+satisfy the requirement. These differences are exposed in conversion reports
+and the gateway `search_conversion_notes` report context.
+
+Before sending a response to the client, an explicit HTTP 400/422 rejection of
+search permits one retry on the same candidate with only `web_search_options`
+removed. This policy also relaxes a requested search requirement. Candidate
+extra data and report context retain `search_downgraded`, the reason, retry
+policy and original upstream error. Authentication, rate limits, transport
+failures, server errors and invalid option values do not trigger this downgrade.
+A successful response that silently ignores search cannot be detected.
+
+Chat URL citations use nested `url_citation` objects; Responses annotations
+use flat fields. Both sync and streaming conversion preserve the source
+offsets. Ordinary tool calls named `web_search` never synthesize hosted search
+execution events or completed search items. Only actual Responses hosted
+items retain that lifecycle when emitting Responses.
 
 ## Claude Messages <-> OpenAI Chat / Responses
 

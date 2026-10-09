@@ -53,8 +53,7 @@ fn citation_string<'a>(citation: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
-/// Render a neutral citation as an OpenAI `url_citation` annotation, the shape
-/// both `chat.completions` and `responses` attach to assistant text.
+/// Render a neutral citation as a flat Responses `url_citation` annotation.
 pub(crate) fn canonical_citation_to_openai_annotation(citation: &Value) -> Option<Value> {
     let url = citation_string(citation, "url")?;
     let mut annotation = Map::new();
@@ -101,6 +100,39 @@ pub(crate) fn canonical_citations_to_openai_annotations(citations: &[Value]) -> 
     citations
         .iter()
         .filter_map(canonical_citation_to_openai_annotation)
+        .collect()
+}
+
+/// Chat nests citation fields, while Responses keeps them on the annotation.
+pub(crate) fn openai_annotation_to_chat(annotation: &Value) -> Value {
+    if annotation.get("type").and_then(Value::as_str) != Some("url_citation")
+        || annotation.get("url_citation").is_some()
+    {
+        return annotation.clone();
+    }
+    let mut citation = annotation.as_object().cloned().unwrap_or_default();
+    citation.remove("type");
+    serde_json::json!({"type": "url_citation", "url_citation": citation})
+}
+
+pub(crate) fn openai_annotation_to_responses(annotation: &Value) -> Value {
+    if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+        return annotation.clone();
+    }
+    let Some(citation) = annotation.get("url_citation").and_then(Value::as_object) else {
+        return annotation.clone();
+    };
+    let mut flat = citation.clone();
+    flat.insert("type".into(), Value::String("url_citation".into()));
+    Value::Object(flat)
+}
+
+pub(crate) fn openai_annotations_to_citations(annotations: &[Value]) -> Vec<Value> {
+    annotations
+        .iter()
+        .filter(|annotation| annotation.get("type").and_then(Value::as_str) == Some("url_citation"))
+        .map(openai_annotation_to_responses)
+        .filter(|annotation| annotation.get("url").and_then(Value::as_str).is_some())
         .collect()
 }
 
