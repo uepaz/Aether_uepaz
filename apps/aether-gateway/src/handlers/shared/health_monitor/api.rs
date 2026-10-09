@@ -264,6 +264,11 @@ pub(crate) async fn build_health_v2_response(
     audience: HealthAudience,
 ) -> Response<Body> {
     let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+    if let Some(response) =
+        super::health_monitor_access_response(state, audience == HealthAudience::Admin).await
+    {
+        return response;
+    }
     let request = match HealthRequest::parse(query, audience != HealthAudience::Admin, now_ms) {
         Ok(request) => request,
         Err(detail) => return response_error(StatusCode::BAD_REQUEST, detail),

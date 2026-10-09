@@ -31,7 +31,7 @@
             {{ group.title }}
           </h3>
           <RouterLink
-            v-if="group.key === 'upstream'"
+            v-if="group.key === 'upstream' && moduleStore.adminHealthMonitorActive"
             :to="link('/admin/health-monitor')"
             class="text-xs text-primary hover:underline"
           >
@@ -70,6 +70,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useModuleStore } from '@/stores/modules'
 import { RouterLink } from 'vue-router'
 import { GitBranch, ListTodo, ShieldCheck } from 'lucide-vue-next'
 import { Badge, Card } from '@/components/ui'
@@ -80,6 +81,7 @@ import { useOverviewI18n } from '../i18n'
 import { useOverviewQuery } from '../query'
 
 const props = defineProps<{ snapshot: OverviewLive }>()
+const moduleStore = useModuleStore()
 const { t } = useOverviewI18n()
 const { link } = useOverviewQuery()
 const metrics = computed(() => props.snapshot.metrics || (props.snapshot.metrics_text ? buildGatewayMetricsSummary(props.snapshot.metrics_text) : null))

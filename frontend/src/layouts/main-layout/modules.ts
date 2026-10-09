@@ -1,11 +1,12 @@
-import { onMounted, watch } from 'vue'
+import { onMounted, onUnmounted, watch } from 'vue'
 import { useModuleStore } from '@/stores/modules'
 
 export function useNavigationModules(canAccessAdmin: () => boolean) {
   const moduleStore = useModuleStore()
-  function loadModules(isAdmin: boolean) {
+  let timer: ReturnType<typeof setInterval> | undefined
+  function loadModules(isAdmin: boolean, refresh = false) {
     if (isAdmin) {
-      if (!moduleStore.loaded && !moduleStore.loading) {
+      if ((refresh || !moduleStore.loaded) && !moduleStore.loading) {
         void moduleStore.fetchModules().catch(() => {
           // Store 记录错误，管理员路由守卫会在需要时重试。
         })
@@ -17,7 +18,16 @@ export function useNavigationModules(canAccessAdmin: () => boolean) {
       })
     }
   }
-  onMounted(() => loadModules(canAccessAdmin()))
+  const refresh = () => loadModules(canAccessAdmin(), true)
+  onMounted(() => {
+    loadModules(canAccessAdmin())
+    timer = setInterval(refresh, 30_000)
+    window.addEventListener('focus', refresh)
+  })
+  onUnmounted(() => {
+    clearInterval(timer)
+    window.removeEventListener('focus', refresh)
+  })
   // 同一布局内跨标签页同步身份后，按新权限补齐对应状态。
-  watch(canAccessAdmin, loadModules)
+  watch(canAccessAdmin, isAdmin => loadModules(isAdmin))
 }

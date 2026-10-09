@@ -41,6 +41,23 @@ pub(super) async fn maybe_build_local_admin_endpoints_health_response(
         return Ok(None);
     };
 
+    if decision.route_family.as_deref() == Some("endpoints_health")
+        && matches!(
+            decision.route_kind.as_deref(),
+            Some("health_api_formats" | "health_models" | "health_providers" | "health_related")
+        )
+    {
+        if let Some(response) =
+            crate::handlers::shared::health_monitor::health_monitor_access_response(
+                state.app(),
+                true,
+            )
+            .await
+        {
+            return Ok(Some(response));
+        }
+    }
+
     if decision.route_family.as_deref() == Some("endpoints_health") {
         if decision.route_kind.as_deref() == Some("health_v2") {
             return Ok(Some(

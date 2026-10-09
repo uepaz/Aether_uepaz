@@ -995,6 +995,17 @@ export const messages = {
 } as const
 
 const legacyExactEnglishMessages: Record<string, string> = {
+  '健康监控配置': 'Health monitor settings',
+  '用户端健康监控': 'User health monitor',
+  '管理端健康监控': 'Admin health monitor',
+  '控制用户端和管理端健康监控入口及页面展示': 'Control health monitor navigation and pages for users and administrators',
+  '控制两端健康监控导航和页面展示，不影响健康统计采集、熔断和自动恢复。': 'Control health monitor navigation and pages without affecting health statistics, circuit breakers or automatic recovery.',
+  '健康监控总开关已关闭，两端设置将在启用模块后生效。': 'Health monitoring is disabled. These settings take effect when the module is enabled.',
+  '控制用户端健康监控及公开服务状态页。': 'Control user health monitoring and the public service status page.',
+  '控制管理端健康监控及相关跳转入口。': 'Control administrator health monitoring and related links.',
+  '健康监控配置已保存': 'Health monitor settings saved',
+  '保存健康监控配置失败': 'Could not save health monitor settings',
+  '健康监控已关闭': 'Health monitoring is disabled',
   ...legacyTermEnglishMessages,
   ...Object.fromEntries(
     Object.entries(messages['zh-CN'])

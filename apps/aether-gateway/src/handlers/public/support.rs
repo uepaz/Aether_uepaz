@@ -166,6 +166,19 @@ async fn build_local_public_support_response(
         return None;
     }
 
+    if request_context
+        .request_path
+        .starts_with("/api/public/health/")
+        && decision.route_kind.as_deref() != Some("health_v2")
+    {
+        if let Some(response) =
+            crate::handlers::shared::health_monitor::health_monitor_access_response(state, false)
+                .await
+        {
+            return Some(response);
+        }
+    }
+
     if decision.route_family.as_deref() == Some("health_user") {
         if let Err(response) =
             resolve_authenticated_local_user(state, request_context, headers).await

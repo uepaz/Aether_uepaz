@@ -17,7 +17,10 @@
       </div>
     </header>
     <div class="mx-auto max-w-6xl px-5 py-7">
-      <HealthMonitorView public-page />
+      <HealthMonitorView
+        v-if="monitorAllowed"
+        public-page
+      />
     </div>
   </main>
 </template>
@@ -27,6 +30,8 @@ import { ArrowLeft } from 'lucide-vue-next'
 import HeaderLogo from '@/components/HeaderLogo.vue'
 import { useSiteInfo } from '@/composables/useSiteInfo'
 import HealthMonitorView from '@/features/health-monitor/HealthMonitorView.vue'
+import { useHealthMonitorAccess } from '@/features/health-monitor/useHealthMonitorAccess'
 
 const { siteName } = useSiteInfo()
+const monitorAllowed = useHealthMonitorAccess(false, true)
 </script>

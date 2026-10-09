@@ -33,6 +33,143 @@ const ADMIN_ENDPOINT_HEALTH_DATA_UNAVAILABLE_DETAIL: &str =
     "Admin endpoint health data unavailable";
 
 #[tokio::test]
+async fn health_monitor_visibility_controls_monitor_routes_but_keeps_configuration_accessible() {
+    for (enabled, user, admin) in [
+        (false, true, true),
+        (true, true, true),
+        (true, true, false),
+        (true, false, true),
+        (true, false, false),
+    ] {
+        let data = GatewayDataState::default().with_system_config_values_for_tests(vec![
+            ("module.health_monitor.enabled".into(), json!(enabled)),
+            (
+                "module.health_monitor.visibility".into(),
+                json!({"user_enabled": user, "admin_enabled": admin}),
+            ),
+            (
+                "health_publication_v1".into(),
+                json!({"enabled": true, "objects": []}),
+            ),
+        ]);
+        let gateway =
+            build_router_with_state(AppState::new().unwrap().with_data_state_for_tests(data));
+        let (url, handle) = start_server(gateway).await;
+        let client = reqwest::Client::new();
+        for (path, allowed) in [
+            ("/api/public/health/v2/objects", enabled && user),
+            ("/api/public/health/api-formats", enabled && user),
+            ("/api/admin/endpoints/health/v2/objects", enabled && admin),
+            ("/api/admin/endpoints/health/api-formats", enabled && admin),
+        ] {
+            let response = client
+                .get(format!("{url}{path}"))
+                .header(GATEWAY_HEADER, "rust-phase3b")
+                .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+                .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+                .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+                .send()
+                .await
+                .unwrap();
+            if allowed {
+                assert_ne!(response.status(), StatusCode::FORBIDDEN, "{path}");
+            } else {
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+                assert_eq!(
+                    response.json::<serde_json::Value>().await.unwrap()["code"],
+                    "health_monitor_disabled"
+                );
+            }
+        }
+        let status = client
+            .get(format!("{url}/api/modules/user-status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            status.json::<serde_json::Value>().await.unwrap()["health_monitor"]["active"],
+            enabled && user
+        );
+        let config = client
+            .get(format!("{url}/api/admin/modules/status/health_monitor"))
+            .header(GATEWAY_HEADER, "rust-phase3b")
+            .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+            .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+            .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(config.status(), StatusCode::OK);
+        let payload = config.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(payload["enabled"], enabled);
+        assert_eq!(payload["visibility"]["admin_enabled"], admin);
+        // 提供商管理使用的健康摘要不属于展示模块，不应因模块关闭而被拒绝。
+        let summary = client
+            .get(format!("{url}/api/admin/endpoints/health/summary"))
+            .header(GATEWAY_HEADER, "rust-phase3b")
+            .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+            .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+            .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(summary.status(), StatusCode::FORBIDDEN);
+        handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn health_monitor_defaults_enabled_and_visibility_save_is_validated_atomically() {
+    let data = GatewayDataState::default().with_system_config_values_for_tests(vec![]);
+    let state = AppState::new().unwrap().with_data_state_for_tests(data);
+    let gateway = build_router_with_state(state.clone());
+    let (url, handle) = start_server(gateway).await;
+    let client = reqwest::Client::new();
+    let status = client
+        .get(format!("{url}/api/modules/user-status"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        status.json::<serde_json::Value>().await.unwrap()["health_monitor"]["active"],
+        true
+    );
+    for (visibility, expected) in [
+        (
+            json!({"user_enabled": false, "admin_enabled": true}),
+            StatusCode::OK,
+        ),
+        (
+            json!({"user_enabled": true, "admin_enabled": "false"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (json!({"user_enabled": true}), StatusCode::BAD_REQUEST),
+    ] {
+        let response = client
+            .put(format!(
+                "{url}/api/admin/system/configs/module.health_monitor.visibility"
+            ))
+            .header(GATEWAY_HEADER, "rust-phase3b")
+            .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+            .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+            .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+            .json(&json!({"value": visibility}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    assert_eq!(
+        state
+            .read_system_config_json_value_strong("module.health_monitor.visibility")
+            .await
+            .unwrap(),
+        Some(json!({"user_enabled": false, "admin_enabled": true}))
+    );
+    handle.abort();
+}
+
+#[tokio::test]
 async fn health_v2_publication_requires_admin_and_public_projection_keeps_empty_objects() {
     use aether_data::repository::usage::InMemoryUsageReadRepository;
 
@@ -208,7 +345,12 @@ async fn assert_admin_modules_status_with_smtp_password(
                     .as_object()
                     .expect("module list should be an object")
                     .len(),
-                14
+                15
+            );
+            assert_eq!(payload["health_monitor"]["active"], json!(true));
+            assert_eq!(
+                payload["health_monitor"]["visibility"],
+                json!({"user_enabled": true, "admin_enabled": true})
             );
             assert_eq!(payload["management_tokens"]["active"], json!(true));
             &payload["important_notification"]

@@ -67,6 +67,7 @@
             />
             {{ t('服务韧性', 'Resilience') }}
           </h3><RouterLink
+            v-if="moduleStore.adminHealthMonitorActive"
             :to="link('/admin/health-monitor')"
             class="text-xs text-primary hover:underline"
           >
@@ -161,6 +162,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useModuleStore } from '@/stores/modules'
 import { RouterLink } from 'vue-router'
 import { Activity, Cpu, Database, Layers, ListChecks, ListTodo, Network, Radio, ShieldCheck } from 'lucide-vue-next'
 import { Card } from '@/components/ui'
@@ -171,6 +173,7 @@ import { useOverviewQuery } from '../query'
 import { useOverviewI18n } from '../i18n'
 import { count, timestamp } from '../format'
 const props = defineProps<{ snapshot: OverviewLive; resources?: boolean }>()
+const moduleStore = useModuleStore()
 const { t } = useOverviewI18n()
 const { link } = useOverviewQuery()
 const metrics = computed(() => props.snapshot.metrics || (props.snapshot.metrics_text ? buildGatewayMetricsSummary(props.snapshot.metrics_text) : null))

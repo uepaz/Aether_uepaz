@@ -6,7 +6,7 @@ export const publicRoutes: RouteRecordRaw[] = [
     path: '/status',
     name: 'PublicStatus',
     component: view(() => import('@/views/public/Status.vue')),
-    meta: { requiresAuth: false }
+    meta: { requiresAuth: false, module: 'health_monitor' }
   },
   {
     path: '/',

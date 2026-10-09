@@ -4,7 +4,13 @@ import { buildCacheKey, cache, cachedRequest } from '@/utils/cache'
 const MODULE_MANAGEMENT_ORDER_CONFIG_KEY = 'module_management.extension_order'
 const ALL_SYSTEM_CONFIGS_CACHE_KEY = 'admin:system:configs'
 
+export interface HealthMonitorVisibility {
+  user_enabled: boolean
+  admin_enabled: boolean
+}
+
 export interface ModuleStatus {
+  visibility?: HealthMonitorVisibility
   name: string
   available: boolean
   enabled: boolean
@@ -189,6 +195,9 @@ async function getAllSystemConfigValues(): Promise<Map<string, unknown>> {
 }
 
 export const modulesApi = {
+  async updateHealthMonitorVisibility(visibility: HealthMonitorVisibility): Promise<HealthMonitorVisibility> {
+    return await updateSystemConfigValue('module.health_monitor.visibility', visibility, '健康监控两端展示设置') as HealthMonitorVisibility
+  },
   /** 用户入口只需要功能状态，不读取管理员配置。 */
   async getUserStatus(): Promise<Record<string, UserModuleStatus>> {
     const response = await apiClient.get<Record<string, UserModuleStatus>>('/api/modules/user-status')

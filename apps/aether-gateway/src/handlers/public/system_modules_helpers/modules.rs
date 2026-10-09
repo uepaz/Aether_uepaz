@@ -27,6 +27,7 @@ const PUBLIC_AUTH_MODULE_DEFINITIONS: &[PublicAuthModuleDefinition] = &[
 
 // 只暴露用户页面需要的模块开关，不能复用含管理路由和配置的管理员响应。
 const PUBLIC_USER_MODULES: &[(&str, &str)] = &[
+    ("health_monitor", "HEALTH_MONITOR_AVAILABLE"),
     ("referral", "REFERRAL_AVAILABLE"),
     ("management_tokens", "MANAGEMENT_TOKENS_AVAILABLE"),
 ];
@@ -38,13 +39,18 @@ pub(crate) async fn build_public_user_modules_status_payload(
     for &(name, env_key) in PUBLIC_USER_MODULES {
         let available = module_available_from_env(env_key, true);
         let enabled = read_module_enabled(state, name, available).await?;
+        let active = if name == "health_monitor" {
+            crate::handlers::shared::health_monitor::health_monitor_active(state, false).await?
+        } else {
+            available && enabled
+        };
         payload.insert(
             name.to_string(),
             json!({
                 "name": name,
                 "available": available,
                 "enabled": enabled,
-                "active": available && enabled,
+                "active": active,
             }),
         );
     }

@@ -4,6 +4,7 @@ import type { LocationQuery, RouteLocationNormalizedLoaded } from 'vue-router'
 import { buildBreadcrumbs, buildNavigation } from '@/layouts/main-layout/navigation'
 import type { MessageKey } from '@/i18n'
 import type { ModuleStatus } from '@/api/modules'
+import { healthMonitorModule } from '@/features/health-monitor/__tests__/fixtures'
 
 const translate = (key: MessageKey) => `tx:${key}`
 
@@ -107,15 +108,25 @@ describe('main layout navigation builder', () => {
 
     const overviewItems = adminNavigation.find(group => group.title === 'tx:nav.group.overview')?.items ?? []
     expect(overviewItems.findIndex(item => item.name === '远程控制')).toBe(
-      overviewItems.findIndex(item => item.name === 'tx:nav.healthMonitor') + 1,
+      overviewItems.findIndex(item => item.name === 'tx:nav.costAnalysis') + 1,
     )
   })
 
-  it('keeps the five fixed overview destinations in product order', () => {
-    const navigation = buildNavigation({ canAccessAdmin: true, modules: {}, isModuleActive: () => false })
+  it('keeps enabled overview destinations in product order', () => {
+    const navigation = buildNavigation({ canAccessAdmin: true, modules: { health_monitor: healthMonitorModule() }, isModuleActive: name => name === 'health_monitor' })
     expect(navigation[0]?.items.map(item => item.href)).toEqual([
       '/admin/dashboard', '/admin/operations', '/admin/user-stats', '/admin/cost-analysis', '/admin/health-monitor',
     ])
+  })
+
+  it.each([
+    [false, true, true], [true, true, true], [true, true, false], [true, false, true], [true, false, false],
+  ])('health navigation follows total=%s user=%s admin=%s', (enabled, user, admin) => {
+    const modules = { health_monitor: healthMonitorModule(enabled, user, admin) }
+    const administrator = buildNavigation({ canAccessAdmin: true, modules, isModuleActive: () => enabled })
+    const member = buildNavigation({ canAccessAdmin: false, modules: {}, isModuleActive: () => enabled && user })
+    expect(administrator.flatMap(group => group.items).some(item => item.href === '/admin/health-monitor')).toBe(enabled && admin)
+    expect(member.flatMap(group => group.items).some(item => item.href === '/dashboard/endpoint-status')).toBe(enabled && user)
   })
 
   it('offers one provider destination for management and scheduling', () => {

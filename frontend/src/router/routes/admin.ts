@@ -98,7 +98,8 @@ export const adminRoutes: RouteRecordRaw[] = [
       {
         path: 'health-monitor',
         name: 'HealthMonitor',
-        component: view(() => import('@/views/shared/HealthMonitor.vue'))
+        component: view(() => import('@/views/shared/HealthMonitor.vue')),
+        meta: { module: 'health_monitor' }
       },
       {
         path: 'usage',

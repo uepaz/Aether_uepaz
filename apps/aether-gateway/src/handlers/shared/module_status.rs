@@ -37,5 +37,9 @@ pub(crate) async fn read_module_enabled(
     } else {
         enabled_value
     };
-    Ok(system_config_bool(enabled_value.as_ref(), false))
+    // 健康监控原本固定展示，缺省开启以保持升级前的行为。
+    Ok(system_config_bool(
+        enabled_value.as_ref(),
+        module_name == "health_monitor",
+    ))
 }

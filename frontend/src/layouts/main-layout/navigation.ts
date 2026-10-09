@@ -82,7 +82,7 @@ export function buildNavigation(options: {
         title: t('nav.group.overview'),
         items: [
           { name: t('nav.dashboard'), href: '/dashboard', icon: Home },
-          { name: t('nav.healthMonitor'), href: '/dashboard/endpoint-status', icon: Activity },
+          ...(isModuleActive('health_monitor') ? [{ name: t('nav.healthMonitor'), href: '/dashboard/endpoint-status', icon: Activity }] : []),
         ]
       },
       {
@@ -121,7 +121,8 @@ export function buildNavigation(options: {
         { name: t('nav.operations'), href: '/admin/operations', icon: Activity },
         { name: t('nav.userStats'), href: '/admin/user-stats', icon: Users },
         { name: t('nav.costAnalysis'), href: '/admin/cost-analysis', icon: Gauge },
-        { name: t('nav.healthMonitor'), href: '/admin/health-monitor', icon: Activity },
+        ...(isModuleActive('health_monitor') && modules.health_monitor?.visibility?.admin_enabled !== false
+          ? [{ name: t('nav.healthMonitor'), href: '/admin/health-monitor', icon: Activity }] : []),
         ...activeModuleItems(modules, 'overview'),
       ]
     },
@@ -166,7 +167,7 @@ export function buildBreadcrumbs(options: {
     ]
   }
 
-  if (route.meta?.module) {
+  if (route.meta?.module && route.meta.module !== 'health_monitor') {
     const moduleName = route.meta.module as string
     const moduleStatus = modules[moduleName]
     const displayName = moduleStatus?.display_name || moduleName

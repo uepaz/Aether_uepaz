@@ -1,6 +1,6 @@
 import { onScopeDispose, ref, shallowRef, toValue, watch, type WatchSource } from 'vue'
 
-export function useOverviewRequest<T>(source: WatchSource, fetcher: (signal: AbortSignal) => Promise<T>, options: { scopeKey?: WatchSource<string> } = {}) {
+export function useOverviewRequest<T>(source: WatchSource, fetcher: (signal: AbortSignal) => Promise<T>, options: { scopeKey?: WatchSource<string>; enabled?: WatchSource<boolean> } = {}) {
   const data = shallowRef<T | null>(null)
   const loading = ref(false)
   const error = ref<string | null>(null)
@@ -9,6 +9,13 @@ export function useOverviewRequest<T>(source: WatchSource, fetcher: (signal: Abo
   let previousScope: string | undefined
   async function refresh() {
     controller?.abort()
+    if (options.enabled && !toValue(options.enabled)) {
+      generation += 1
+      data.value = null
+      error.value = null
+      loading.value = false
+      return
+    }
     controller = new AbortController()
     const current = ++generation
     loading.value = true
@@ -24,7 +31,7 @@ export function useOverviewRequest<T>(source: WatchSource, fetcher: (signal: Abo
       if (current === generation) loading.value = false
     }
   }
-  watch(source, () => {
+  watch([source, () => options.enabled ? toValue(options.enabled) : true], () => {
     const scope = options.scopeKey ? toValue(options.scopeKey) : undefined
     if (!options.scopeKey || scope !== previousScope) data.value = null
     previousScope = scope

@@ -1,5 +1,8 @@
 <template>
-  <section class="space-y-3 border-y py-4">
+  <section
+    v-if="moduleStore.adminHealthMonitorActive"
+    class="space-y-3 border-y py-4"
+  >
     <div class="flex flex-wrap items-center justify-between gap-2">
       <RouterLink
         to="/admin/health-monitor?window=1h"
@@ -70,6 +73,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useModuleStore } from '@/stores/modules'
 import { RouterLink } from 'vue-router'
 import { ArrowUpRight } from 'lucide-vue-next'
 import { getAdminHealthSummary } from '@/api/endpoints/health-v2'
@@ -77,7 +81,8 @@ import { useOverviewRequest } from '../useOverviewRequest'
 import { useOverviewI18n } from '../i18n'
 import { count, percent, timestamp } from '../format'
 const props = defineProps<{ revision: number }>()
+const moduleStore = useModuleStore()
 const { t } = useOverviewI18n()
-const { data, loading, error, refresh } = useOverviewRequest(() => props.revision, signal => getAdminHealthSummary({ kind: 'api_format', window: '1h' }, signal), { scopeKey: () => 'api_format:1h' })
+const { data, loading, error, refresh } = useOverviewRequest(() => props.revision, signal => getAdminHealthSummary({ kind: 'api_format', window: '1h' }, signal), { scopeKey: () => 'api_format:1h', enabled: () => moduleStore.adminHealthMonitorActive })
 const status = computed(() => ({ healthy: t('正常', 'Healthy'), degraded: t('降级', 'Degraded'), unavailable: t('不可用', 'Unavailable'), unknown: t('未知', 'Unknown') })[data.value?.data.status || 'unknown'])
 </script>

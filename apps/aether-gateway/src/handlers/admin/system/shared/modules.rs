@@ -25,6 +25,18 @@ pub(crate) struct AdminModuleDefinition {
 
 pub(crate) const ADMIN_MODULE_DEFINITIONS: &[AdminModuleDefinition] = &[
     AdminModuleDefinition {
+        name: "health_monitor",
+        display_name: "健康监控",
+        description: "控制用户端和管理端健康监控入口及页面展示",
+        category: "monitoring",
+        env_key: "HEALTH_MONITOR_AVAILABLE",
+        default_available: true,
+        admin_route: None,
+        admin_menu_icon: Some("Activity"),
+        admin_menu_group: None,
+        admin_menu_order: 0,
+    },
+    AdminModuleDefinition {
         name: "oauth",
         display_name: "OAuth 登录",
         description: "支持通过第三方 OAuth Provider 登录/绑定账号",
@@ -359,7 +371,7 @@ pub(crate) async fn build_admin_module_status_payload(
     } else {
         "unknown"
     };
-    Ok(admin_system_kernel::build_admin_module_status_payload(
+    let mut payload = admin_system_kernel::build_admin_module_status_payload(
         module.name,
         module.display_name,
         module.description,
@@ -373,7 +385,15 @@ pub(crate) async fn build_admin_module_status_payload(
         config_validated,
         config_error,
         health,
-    ))
+    );
+    if module.name == "health_monitor" {
+        payload["visibility"] = serde_json::to_value(
+            crate::handlers::shared::health_monitor::read_health_monitor_visibility(state.app())
+                .await?,
+        )
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    }
+    Ok(payload)
 }
 
 pub(crate) async fn build_admin_modules_status_payload(

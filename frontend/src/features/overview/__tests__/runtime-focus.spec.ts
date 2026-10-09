@@ -1,4 +1,7 @@
 import { createApp, nextTick, type App } from 'vue'
+import { createPinia } from 'pinia'
+import { useModuleStore } from '@/stores/modules'
+import { healthMonitorModule } from '@/features/health-monitor/__tests__/fixtures'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import { afterEach, describe, expect, it } from 'vitest'
 import RuntimeFocus from '../operations/RuntimeFocus.vue'
@@ -24,6 +27,9 @@ async function mount(value: OverviewLive) {
   await router.isReady()
   const root = document.createElement('div')
   app = createApp(RuntimeFocus, { snapshot: value })
+  const pinia = createPinia()
+  app.use(pinia)
+  useModuleStore(pinia).modules = { health_monitor: healthMonitorModule() }
   app.use(router)
   app.mount(root)
   await nextTick()

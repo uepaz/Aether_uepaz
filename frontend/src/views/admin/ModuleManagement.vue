@@ -201,11 +201,11 @@
               </div>
             </div>
             <Button
-              v-if="module.admin_route"
+              v-if="module.admin_route || module.name === 'health_monitor'"
               variant="outline"
               size="sm"
               class="shrink-0 gap-1.5"
-              @click="router.push(module.admin_route)"
+              @click="configureModule(module)"
             >
               <Settings class="w-3.5 h-3.5" />
               {{ t('common.configure') }}
@@ -236,6 +236,7 @@
         </p>
       </div>
     </div>
+    <HealthMonitorConfigDialog v-model="healthConfigOpen" />
   </PageContainer>
 </template>
 
@@ -264,6 +265,7 @@ import { BUILTIN_TOOLS } from '@/config/builtin-tools'
 import { log } from '@/utils/logger'
 import { getErrorMessage } from '@/types/api-error'
 import { modulesApi, type ModuleStatus } from '@/api/modules'
+import HealthMonitorConfigDialog from './modules/HealthMonitorConfigDialog.vue'
 
 const router = useRouter()
 const { success, error } = useToast()
@@ -271,6 +273,11 @@ const { t } = useI18n()
 const moduleStore = useModuleStore()
 
 const loading = ref(false)
+const healthConfigOpen = ref(false)
+function configureModule(module: ModuleStatus) {
+  if (module.name === 'health_monitor') healthConfigOpen.value = true
+  else if (module.admin_route) void router.push(module.admin_route)
+}
 const toggling = ref<Record<string, boolean>>({})
 const searchQuery = ref('')
 const moduleOrder = ref<string[]>([])

@@ -31,10 +31,16 @@ async fn gateway_exposes_only_user_module_status_with_canonical_referral_switch(
             crate::handlers::shared::module_available_from_env("REFERRAL_AVAILABLE", true);
         let tokens_available =
             crate::handlers::shared::module_available_from_env("MANAGEMENT_TOKENS_AVAILABLE", true);
+        let health_available =
+            crate::handlers::shared::module_available_from_env("HEALTH_MONITOR_AVAILABLE", true);
         let enabled = enabled.unwrap_or(false);
         assert_eq!(
             payload,
             json!({
+                "health_monitor": {
+                    "name": "health_monitor", "available": health_available,
+                    "enabled": health_available, "active": health_available,
+                },
                 "referral": {
                     "name": "referral", "available": referral_available,
                     "enabled": referral_available && enabled, "active": referral_available && enabled,

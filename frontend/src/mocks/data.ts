@@ -1055,6 +1055,13 @@ export const MOCK_SYSTEM_CONFIGS: Array<{ key: string; value: unknown; descripti
 
 const MOCK_MODULE_DEFINITIONS: Array<Omit<ModuleStatus, 'active' | 'health'> & { health?: ModuleStatus['health'] }> = [
   {
+    name: 'health_monitor', display_name: '健康监控',
+    description: '控制用户端和管理端健康监控入口及页面展示', category: 'monitoring',
+    available: true, enabled: true, config_validated: true, config_error: null,
+    admin_route: null, admin_menu_icon: 'Activity', admin_menu_group: null, admin_menu_order: 0,
+    visibility: { user_enabled: true, admin_enabled: true },
+  },
+  {
     name: 'management_tokens',
     display_name: '访问令牌',
     description: '管理 API 访问令牌，支持细粒度权限控制和 IP 限制',

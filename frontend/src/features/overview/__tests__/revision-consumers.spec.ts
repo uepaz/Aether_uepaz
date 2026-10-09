@@ -1,5 +1,8 @@
 import { createApp, h, nextTick, ref, type App, type VNode } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
+import { createPinia } from 'pinia'
+import { useModuleStore } from '@/stores/modules'
+import { healthMonitorModule } from '@/features/health-monitor/__tests__/fixtures'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { OverviewMetrics } from '@/api/overview'
 import ConsumptionTable from '../users/ConsumptionTable.vue'
@@ -35,6 +38,9 @@ async function mount(render: () => VNode) {
   await router.push({ path: '/admin/user-stats/member-a', query: range })
   const root = document.createElement('div')
   const app = createApp({ render }).use(router)
+  const pinia = createPinia()
+  app.use(pinia)
+  useModuleStore(pinia).modules = { health_monitor: healthMonitorModule() }
   app.mount(root)
   mounted.push(app)
   await settle()
@@ -44,6 +50,20 @@ beforeEach(() => vi.resetAllMocks())
 afterEach(() => { for (const app of mounted.splice(0)) app.unmount() })
 
 describe('revision-driven overview snapshots', () => {
+  it('unmounts health summary and stops requesting when administrator monitoring is disabled', async () => {
+    api.health.mockResolvedValue({ meta, data: { status: 'healthy', requests: { service_availability: { value: 1 } }, degraded_count: 0, unavailable_count: 0, unknown_count: 0, object_count: 2 } })
+    const revision = ref(0)
+    const root = await mount(() => h(HealthSummary, { revision: revision.value }))
+    expect(root.querySelector('section')).not.toBeNull()
+    const store = useModuleStore()
+    store.modules.health_monitor!.visibility!.admin_enabled = false
+    await settle()
+    expect(root.querySelector('section')).toBeNull()
+    const calls = api.health.mock.calls.length
+    revision.value++
+    await settle()
+    expect(api.health).toHaveBeenCalledTimes(calls)
+  })
   it('retains consumption while refreshing or after failure but clears another member’s data', async () => {
     api.consumption.mockResolvedValue({ meta, data: { total: 1, limit: 25, offset: 0, items: [{
       id: 'usage-a', request_id: 'request-a', started_at: range.from, user_id: 'member-a', model: 'model-a',

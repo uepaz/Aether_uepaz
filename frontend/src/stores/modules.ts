@@ -58,6 +58,8 @@ export const useModuleStore = defineStore('modules', () => {
         loaded.value = true
         return nextModules
       } catch (err: unknown) {
+        // 监控展示无法确认时不沿用旧许可，其他模块保留原有处理方式。
+        delete modules.value.health_monitor
         log.error('Failed to fetch modules status', err)
         error.value = parseApiError(err, '获取模块状态失败')
         throw err
@@ -90,6 +92,10 @@ export const useModuleStore = defineStore('modules', () => {
   function isActive(moduleName: string): boolean {
     return modules.value[moduleName]?.active ?? false
   }
+
+  const adminHealthMonitorActive = computed(() =>
+    isActive('health_monitor') && modules.value.health_monitor?.visibility?.admin_enabled !== false
+  )
 
   /**
    * 设置模块启用状态
@@ -150,6 +156,7 @@ export const useModuleStore = defineStore('modules', () => {
     isAvailable,
     isEnabled,
     isActive,
+    adminHealthMonitorActive,
     setEnabled,
     availableAdminMenuItems,
     availableAdminMenuItemsByGroup,

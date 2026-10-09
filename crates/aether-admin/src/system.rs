@@ -1983,7 +1983,8 @@ pub fn build_admin_module_health(
     gemini_files_has_capable_key: bool,
 ) -> &'static str {
     match module_name {
-        "management_tokens"
+        "health_monitor"
+        | "management_tokens"
         | "model_directives"
         | "proxy_nodes"
         | "important_notification"

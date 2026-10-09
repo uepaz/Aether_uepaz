@@ -160,6 +160,14 @@ pub(crate) async fn apply_admin_system_config_update(
     let normalized_key = update.normalized_key;
     let description = update.description;
 
+    if normalized_key == crate::handlers::shared::health_monitor::HEALTH_MONITOR_VISIBILITY_KEY {
+        if serde_json::from_value::<crate::handlers::shared::health_monitor::HealthMonitorVisibility>(value.clone()).is_err() {
+            return Ok(Err((http::StatusCode::BAD_REQUEST, json!({
+                "detail": "健康监控配置需要 user_enabled 和 admin_enabled 两个布尔值"
+            }))));
+        }
+    }
+
     if crate::AppState::is_referral_settings_key(&normalized_key) {
         state
             .app()

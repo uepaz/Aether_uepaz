@@ -2145,16 +2145,17 @@ const mockHandlers: Record<string, (config: AxiosRequestConfig) => Promise<Axios
   'GET /api/modules/user-status': async () => {
     await delay()
     refreshMockReferralModuleStatus()
-    return createMockResponse(Object.fromEntries(['referral', 'management_tokens'].map(name => {
+    return createMockResponse(Object.fromEntries(['referral', 'management_tokens', 'health_monitor'].map(name => {
       const { available, enabled, active } = MOCK_MODULE_STATUSES[name]
-      return [name, { name, available, enabled: available && enabled, active }]
+      return [name, { name, available, enabled: available && enabled, active: active && (name !== 'health_monitor' || MOCK_MODULE_STATUSES[name].visibility?.user_enabled !== false) }]
     })))
   },
   'GET /api/admin/modules/status': async () => {
     await delay()
     requireAdmin()
     refreshMockReferralModuleStatus()
-    return createMockResponse(MOCK_MODULE_STATUSES)
+    // HTTP 响应是状态快照，不能让模拟服务写入绕过前端的响应式更新。
+    return createMockResponse(structuredClone(MOCK_MODULE_STATUSES))
   },
 
   // ========== Admin: System ==========
@@ -2392,6 +2393,20 @@ export async function handleMockRequest(config: AxiosRequestConfig): Promise<Axi
 
   const method = config.method?.toUpperCase() || 'GET'
   const url = config.url || ''
+
+  // 演示模式与真实接口一致：仅限制监控展示，保留提供商健康操作和发布配置。
+  const path = url.split('?')[0]
+  const adminMonitor = /^\/api\/admin\/endpoints\/health\/(api-formats|models|providers|related)(\/|$)/.test(path)
+    || (path.startsWith('/api/admin/endpoints/health/v2/') && path !== '/api/admin/endpoints/health/v2/publication')
+  const userMonitor = /^\/api\/(public|users\/me)\/health\//.test(path)
+  if (adminMonitor || userMonitor) {
+    if (adminMonitor) requireAdmin()
+    const module = MOCK_MODULE_STATUSES.health_monitor
+    const visible = adminMonitor ? module.visibility?.admin_enabled : module.visibility?.user_enabled
+    if (!module.active || visible === false) {
+      throw { response: createMockResponse({ detail: '健康监控已关闭', code: 'health_monitor_disabled' }, 403) }
+    }
+  }
 
   // 尝试匹配 handler
   const handler = matchHandler(method, url)
@@ -2873,6 +2888,12 @@ registerDynamicRoute('PUT', '/api/admin/system/configs/:configKey', async (confi
   requireAdmin()
   const key = decodeURIComponent(params.configKey)
   const body = JSON.parse(config.data || '{}') as { value?: unknown; description?: string }
+  if (key === 'module.health_monitor.visibility') {
+    const visibility = body.value as { user_enabled?: unknown; admin_enabled?: unknown } | null
+    if (!visibility || typeof visibility.user_enabled !== 'boolean' || typeof visibility.admin_enabled !== 'boolean' || Object.keys(visibility).length !== 2) {
+      throw { response: createMockResponse({ detail: '健康监控配置需要两个布尔值' }, 400) }
+    }
+  }
   if (key.startsWith('referral_') || key === 'require_email_verification') validateMockReferralSettings({ [key]: body.value })
   const index = MOCK_SYSTEM_CONFIGS.findIndex(item => item.key === key)
   const entry = {
@@ -2896,6 +2917,9 @@ registerDynamicRoute('PUT', '/api/admin/system/configs/:configKey', async (confi
   }
   if (key === 'referral_enabled') {
     refreshMockReferralModuleStatus()
+  }
+  if (key === 'module.health_monitor.visibility') {
+    MOCK_MODULE_STATUSES.health_monitor.visibility = body.value as { user_enabled: boolean; admin_enabled: boolean }
   }
   return createMockResponse(entry)
 })
@@ -2922,7 +2946,7 @@ registerDynamicRoute('GET', '/api/admin/modules/status/:moduleName', async (_con
   if (!moduleStatus) {
     throw { response: createMockResponse({ detail: '模块不存在' }, 404) }
   }
-  return createMockResponse(moduleStatus)
+  return createMockResponse(structuredClone(moduleStatus))
 })
 
 // 模块启用状态更新

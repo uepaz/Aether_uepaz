@@ -36,7 +36,8 @@ export const dashboardRoutes: RouteRecordRaw[] = [
       {
         path: 'endpoint-status',
         name: 'EndpointStatus',
-        component: view(() => import('@/views/shared/HealthMonitor.vue'))
+        component: view(() => import('@/views/shared/HealthMonitor.vue')),
+        meta: { module: 'health_monitor' }
       },
       {
         path: 'settings',

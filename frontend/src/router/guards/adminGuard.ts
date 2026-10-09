@@ -25,6 +25,15 @@ export async function checkAdminAccess(
     return null
   }
 
+  if (moduleName === 'health_monitor') {
+    try {
+      await moduleStore.fetchModules()
+      return moduleStore.adminHealthMonitorActive ? null : '/admin/dashboard'
+    } catch {
+      return '/admin/dashboard'
+    }
+  }
+
   // 确保模块状态已加载
   if (!moduleStore.loaded) {
     try {

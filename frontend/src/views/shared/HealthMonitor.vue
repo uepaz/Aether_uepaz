@@ -1,5 +1,8 @@
 <template>
-  <div class="space-y-6 pb-8">
+  <div
+    v-if="monitorAllowed"
+    class="space-y-6 pb-8"
+  >
     <Card
       variant="default"
       class="overflow-hidden"
@@ -182,6 +185,7 @@
 <script setup lang="ts">
 import { computed, ref, type Component } from 'vue'
 import { useRoute } from 'vue-router'
+import { useHealthMonitorAccess } from '@/features/health-monitor/useHealthMonitorAccess'
 import { Activity, Bot, Gauge, Server, Zap } from 'lucide-vue-next'
 import Card from '@/components/ui/card.vue'
 import Badge from '@/components/ui/badge.vue'
@@ -200,6 +204,7 @@ import {
 
 const route = useRoute()
 const isAdminPage = computed(() => route.path.startsWith('/admin'))
+const monitorAllowed = useHealthMonitorAccess(isAdminPage)
 const detailOpen = ref(false)
 const detailTarget = ref<HealthMonitorDetailTarget | null>(null)
 const sectionSummaries = ref<Partial<Record<HealthMonitorSourceKind, HealthMonitorSectionSummary>>>({})
