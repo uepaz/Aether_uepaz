@@ -732,7 +732,6 @@ fn chat_compatible_openai_responses_extension_object(
             matches!(
                 key.as_str(),
                 "verbosity"
-                    | "web_search_options"
                     | "store"
                     | "service_tier"
                     | "prompt_cache_key"
