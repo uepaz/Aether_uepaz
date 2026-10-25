@@ -1,9 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { getAllSystemConfigsMock, updateSystemConfigMock, updateReferralSettingsMock } = vi.hoisted(() => ({
+const { getAllSystemConfigsMock, updateSystemConfigMock, updateReferralSettingsMock, fetchModulesMock, successMock, errorMock, logErrorMock } = vi.hoisted(() => ({
   getAllSystemConfigsMock: vi.fn(),
   updateSystemConfigMock: vi.fn(),
   updateReferralSettingsMock: vi.fn(),
+  fetchModulesMock: vi.fn(),
+  successMock: vi.fn(),
+  errorMock: vi.fn(),
+  logErrorMock: vi.fn(),
 }))
 
 vi.mock('@/api/admin', () => ({
@@ -17,8 +21,8 @@ vi.mock('@/api/admin', () => ({
 
 vi.mock('@/composables/useToast', () => ({
   useToast: () => ({
-    success: vi.fn(),
-    error: vi.fn(),
+    success: successMock,
+    error: errorMock,
   }),
 }))
 
@@ -30,8 +34,12 @@ vi.mock('@/composables/useSiteInfo', () => ({
 
 vi.mock('@/utils/logger', () => ({
   log: {
-    error: vi.fn(),
+    error: logErrorMock,
   },
+}))
+
+vi.mock('@/stores/modules', () => ({
+  useModuleStore: () => ({ fetchModules: fetchModulesMock }),
 }))
 
 import { useSystemConfig } from '../composables/useSystemConfig'
@@ -41,6 +49,10 @@ describe('useSystemConfig', () => {
     getAllSystemConfigsMock.mockReset()
     updateSystemConfigMock.mockReset()
     updateReferralSettingsMock.mockReset()
+    fetchModulesMock.mockReset().mockResolvedValue({})
+    successMock.mockReset()
+    errorMock.mockReset()
+    logErrorMock.mockReset()
   })
 
   it('loads config keys in one request and keeps change detection disabled until the baseline is ready', async () => {
@@ -80,6 +92,8 @@ describe('useSystemConfig', () => {
     await state.loadSystemConfig()
 
     expect(state.systemConfig.value.request_record_level).toBe('basic')
+    expect(state.systemConfig.value.request_record_compact_base64_images).toBe(false)
+    expect(state.systemConfig.value.request_record_max_body_size_kb).toBe(0)
     expect(state.systemConfig.value).not.toHaveProperty('max_request_body_size')
     expect(state.systemConfig.value).not.toHaveProperty('max_response_body_size')
   })
@@ -102,6 +116,7 @@ describe('useSystemConfig', () => {
     )
     expect(state.hasProxyConfigChanges.value).toBe(false)
   })
+
   it('saves referral rules together without overwriting email verification or issuing individual referral writes', async () => {
     getAllSystemConfigsMock.mockResolvedValue([])
     updateReferralSettingsMock.mockResolvedValue(undefined)
@@ -117,6 +132,39 @@ describe('useSystemConfig', () => {
       referral_recharge_percent: 5, referral_headcount_amount_usd: 0,
     })
     expect(updateSystemConfigMock.mock.calls.map(([key]) => key).some(key => key.startsWith('referral_'))).toBe(false)
+    expect(fetchModulesMock).toHaveBeenCalledOnce()
+    expect(updateReferralSettingsMock.mock.invocationCallOrder[0]).toBeLessThan(fetchModulesMock.mock.invocationCallOrder[0])
+    expect(fetchModulesMock.mock.invocationCallOrder[0]).toBeLessThan(updateSystemConfigMock.mock.invocationCallOrder[0])
+    expect(state.hasBasicConfigChanges.value).toBe(false)
+  })
+
+  it('refreshes referral navigation even when a later basic setting fails to save', async () => {
+    getAllSystemConfigsMock.mockResolvedValue([])
+    updateReferralSettingsMock.mockResolvedValue(undefined)
+    updateSystemConfigMock.mockRejectedValue(new Error('basic setting unavailable'))
+    const state = useSystemConfig()
+    await state.loadSystemConfig()
+    state.systemConfig.value.referral_enabled = true
+    await state.saveBasicConfig()
+    expect(fetchModulesMock).toHaveBeenCalledOnce()
+    expect(fetchModulesMock.mock.invocationCallOrder[0]).toBeLessThan(updateSystemConfigMock.mock.invocationCallOrder[0])
+    expect(errorMock).toHaveBeenCalled()
+    expect(state.hasBasicConfigChanges.value).toBe(true)
+  })
+
+  it('keeps a successful save when refreshing module navigation fails', async () => {
+    getAllSystemConfigsMock.mockResolvedValue([])
+    updateReferralSettingsMock.mockResolvedValue(undefined)
+    updateSystemConfigMock.mockResolvedValue(undefined)
+    const refreshError = new Error('module status unavailable')
+    fetchModulesMock.mockRejectedValue(refreshError)
+    const state = useSystemConfig()
+    await state.loadSystemConfig()
+    state.systemConfig.value.referral_enabled = true
+    await state.saveBasicConfig()
+    expect(logErrorMock).toHaveBeenCalledWith('返利配置已保存，刷新模块状态失败:', refreshError)
+    expect(successMock).toHaveBeenCalledWith('基础配置已保存')
+    expect(errorMock).not.toHaveBeenCalled()
     expect(state.hasBasicConfigChanges.value).toBe(false)
   })
 
@@ -128,7 +176,37 @@ describe('useSystemConfig', () => {
     state.systemConfig.value.referral_enabled = true
     await state.saveBasicConfig()
     expect(updateSystemConfigMock).not.toHaveBeenCalled()
+    expect(fetchModulesMock).not.toHaveBeenCalled()
     expect(state.hasBasicConfigChanges.value).toBe(true)
   })
 
+  it('loads and saves request-record body storage controls', async () => {
+    getAllSystemConfigsMock.mockResolvedValue([
+      { key: 'request_record_compact_base64_images', value: true },
+      { key: 'request_record_max_body_size_kb', value: 512 },
+    ])
+    updateSystemConfigMock.mockResolvedValue({})
+
+    const state = useSystemConfig()
+    await state.loadSystemConfig()
+
+    expect(state.systemConfig.value.request_record_compact_base64_images).toBe(true)
+    expect(state.systemConfig.value.request_record_max_body_size_kb).toBe(512)
+    state.systemConfig.value.request_record_max_body_size_kb = 256
+    expect(state.hasLogConfigChanges.value).toBe(true)
+
+    await state.saveLogConfig()
+
+    expect(updateSystemConfigMock).toHaveBeenCalledWith(
+      'request_record_compact_base64_images',
+      true,
+      '请求记录 Base64 图片精简开关'
+    )
+    expect(updateSystemConfigMock).toHaveBeenCalledWith(
+      'request_record_max_body_size_kb',
+      256,
+      '请求记录单个 Body 大小上限（KB），0 表示不限制'
+    )
+    expect(state.hasLogConfigChanges.value).toBe(false)
+  })
 })
