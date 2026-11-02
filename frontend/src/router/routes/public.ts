@@ -27,12 +27,6 @@ export const publicRoutes: RouteRecordRaw[] = [
     meta: { requiresAuth: false }
   },
   {
-    path: '/logo-demo',
-    name: 'LogoColorDemo',
-    component: view(() => import('@/views/public/LogoColorDemo.vue')),
-    meta: { requiresAuth: false }
-  },
-  {
     path: '/auth/callback',
     name: 'AuthCallback',
     component: view(() => import('@/views/public/AuthCallback.vue')),

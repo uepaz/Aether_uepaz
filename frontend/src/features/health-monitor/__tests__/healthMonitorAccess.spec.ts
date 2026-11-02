@@ -7,11 +7,29 @@ import { checkAdminAccess } from '@/router/guards/adminGuard'
 import { checkModuleAccess } from '@/router/guards/moduleGuard'
 import { useHealthMonitorAccess } from '../useHealthMonitorAccess'
 import { healthMonitorModule } from './fixtures'
+import HealthMonitorPage from '@/views/shared/HealthMonitor.vue'
+import { createI18n, setI18nLocale } from '@/i18n'
 
 const { getAllStatus, getUserStatus } = vi.hoisted(() => ({ getAllStatus: vi.fn(), getUserStatus: vi.fn() }))
 vi.mock('@/api/modules', () => ({ modulesApi: { getAllStatus, getUserStatus } }))
+const monitorQueries = vi.hoisted(() => ({
+  getEndpointStatusMonitor: vi.fn(), getPublicEndpointStatusMonitor: vi.fn(),
+  getModelStatusMonitor: vi.fn(), getPublicModelStatusMonitor: vi.fn(),
+  getProviderStatusMonitor: vi.fn(),
+}))
+vi.mock('@/api/endpoints/health', async importOriginal => ({
+  ...await importOriginal<typeof import('@/api/endpoints/health')>(),
+  ...monitorQueries,
+}))
 let app: App | undefined
-beforeEach(() => { vi.resetAllMocks(); setActivePinia(createPinia()) })
+beforeEach(() => {
+  vi.resetAllMocks()
+  setActivePinia(createPinia())
+  setI18nLocale('zh-CN')
+  for (const query of Object.values(monitorQueries)) {
+    query.mockResolvedValue({ generated_at: null, formats: [], models: [], providers: [] })
+  }
+})
 afterEach(() => { app?.unmount(); app = undefined; vi.useRealTimers() })
 function route(path: string, module?: string) {
   return { path, matched: [{ meta: { module } }] } as unknown as RouteLocationNormalized
@@ -63,5 +81,34 @@ describe('health monitor page access', () => {
     await nextTick()
     expect(root.textContent).toBe('')
     expect(router.currentRoute.value.path).toBe(admin ? '/admin/dashboard' : '/dashboard')
+  })
+
+  it.each([true, false])('unmounts the current monitoring components and stops their requests with admin=%s', async admin => {
+    vi.useFakeTimers()
+    getAllStatus.mockResolvedValue({ health_monitor: healthMonitorModule() })
+    getUserStatus.mockResolvedValue(userStatus(true, true))
+    const router = createRouter({ history: createMemoryHistory(), routes: [
+      { path: '/:pathMatch(.*)*', component: { render: () => null } },
+    ] })
+    await router.push(admin ? '/admin/health-monitor' : '/dashboard/endpoint-status')
+    const root = document.createElement('div')
+    app = createApp(HealthMonitorPage).use(router).use(createI18n())
+    app.mount(root)
+    await vi.advanceTimersByTimeAsync(0)
+    await nextTick()
+    expect(root.textContent).toContain('健康监控')
+    expect(admin ? monitorQueries.getEndpointStatusMonitor : monitorQueries.getPublicEndpointStatusMonitor).toHaveBeenCalledOnce()
+    expect(admin ? monitorQueries.getModelStatusMonitor : monitorQueries.getPublicModelStatusMonitor).toHaveBeenCalledOnce()
+    expect(monitorQueries.getProviderStatusMonitor).toHaveBeenCalledTimes(admin ? 1 : 0)
+
+    getAllStatus.mockResolvedValue({ health_monitor: healthMonitorModule(true, true, false) })
+    getUserStatus.mockResolvedValue(userStatus(true, false))
+    await vi.advanceTimersByTimeAsync(30_000)
+    await nextTick()
+    expect(root.querySelector('section')).toBeNull()
+    expect(root.textContent).toBe('')
+    const requests = Object.values(monitorQueries).map(query => query.mock.calls.length)
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(Object.values(monitorQueries).map(query => query.mock.calls.length)).toEqual(requests)
   })
 })

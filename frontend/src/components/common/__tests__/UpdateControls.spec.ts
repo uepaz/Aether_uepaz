@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h, nextTick, type App, type Component } from 'vue'
-import { setI18nLocale } from '@/i18n'
+import { createI18n, setI18nLocale } from '@/i18n'
 import type { CheckUpdateResponse, ReleaseEntry } from '@/api/admin'
 import VersionButton from '../VersionButton.vue'
 import UpdateDialog from '../UpdateDialog.vue'
@@ -40,7 +40,7 @@ function mount(component: Component, props: Record<string, unknown>) {
   const root = document.createElement('div')
   document.body.append(root)
   const app = createApp(defineComponent({ setup: () => () => h(component, props) }))
-  app.config.globalProperties.$legacyT = (text: string) => text
+  app.use(createI18n())
   app.mount(root)
   mounted.push({ app, root })
   return root
@@ -120,5 +120,18 @@ describe('version controls without repository entries', () => {
     expectNoRepositoryEntry(root)
     expect(root.textContent).toContain('手动安装目标版本')
     expect(root.textContent).not.toContain('立即更新')
+  })
+
+  it('updates the manual installation hint when the language changes', async () => {
+    const root = mount(UpdateDialog, {
+      modelValue: true, currentVersion: '1.0.0', latestVersion: '1.1.0', releaseNotes: null,
+      publishedAt: null, updateSupported: false, updateBlocker: 'source build: use git pull and rebuild',
+    })
+    expect(root.textContent).toContain('手动安装目标版本')
+    setI18nLocale('en-US')
+    await nextTick()
+    expect(root.textContent).toContain('Install the target version manually.')
+    expect(root.textContent).not.toMatch(/git pull|source build|手动安装目标版本/)
+    expectNoRepositoryEntry(root)
   })
 })

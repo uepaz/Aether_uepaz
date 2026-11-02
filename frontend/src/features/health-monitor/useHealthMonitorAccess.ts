@@ -9,7 +9,7 @@ export function useHealthMonitorAccess(admin: MaybeRefOrGetter<boolean>, publicP
   const store = useModuleStore()
   const router = useRouter()
   const { info } = useToast()
-  const { legacyT } = useI18n()
+  const { t } = useI18n()
   const checked = ref(false)
   const allowed = computed(() => toValue(admin) ? store.adminHealthMonitorActive : store.isUserActive('health_monitor'))
   let timer: ReturnType<typeof setInterval> | undefined
@@ -25,7 +25,7 @@ export function useHealthMonitorAccess(admin: MaybeRefOrGetter<boolean>, publicP
   }
   watch([checked, allowed], ([ready, active]) => {
     if (ready && !active) {
-      info(legacyT('健康监控已关闭'))
+      info(t('healthMonitor.access.disabled'))
       void router.replace(publicPage ? '/' : toValue(admin) ? '/admin/dashboard' : '/dashboard')
     }
   })
