@@ -66,6 +66,7 @@ pub(crate) struct LocalExecutionCandidateAttempt {
 
 pub(crate) struct LocalExecutionCandidateAttemptSource<'a> {
     items: VecDeque<LocalExecutionCandidateAttemptSourceItem<'a>>,
+    next_candidate_index: u32,
     skipped_provider_ids: BTreeSet<String>,
     skipped_endpoint_ids: BTreeSet<String>,
     skipped_credential_ids: BTreeSet<String>,
@@ -114,6 +115,11 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
     pub(crate) fn from_static_attempts_for_image_bridge(
         attempts: Vec<LocalExecutionCandidateAttempt>,
     ) -> Self {
+        let next_candidate_index = attempts
+            .iter()
+            .map(|attempt| attempt.candidate_index.saturating_add(1))
+            .max()
+            .unwrap_or(0);
         let mut items = VecDeque::new();
         if !attempts.is_empty() {
             items.push_back(LocalExecutionCandidateAttemptSourceItem::Static {
@@ -122,10 +128,16 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
         }
         Self {
             items,
+            next_candidate_index,
             skipped_provider_ids: BTreeSet::new(),
             skipped_endpoint_ids: BTreeSet::new(),
             skipped_credential_ids: BTreeSet::new(),
         }
+    }
+
+    /// Includes slots reserved by the current page and its skipped candidates.
+    pub(crate) fn next_candidate_index(&self) -> u32 {
+        self.next_candidate_index
     }
 
     pub(crate) async fn next_attempt(
@@ -217,7 +229,9 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
                     for key_id in &self.skipped_credential_ids {
                         cursor.skip_credential(key_id);
                     }
-                    let Some(attempt) = cursor.next_attempt().await? else {
+                    let attempt = cursor.next_attempt().await?;
+                    self.next_candidate_index = cursor.next_candidate_index;
+                    let Some(attempt) = attempt else {
                         self.items.pop_front();
                         continue;
                     };
@@ -698,15 +712,18 @@ where
             &candidates,
         );
     }
+    let skipped_starting_candidate_index = persistence_policy
+        .starting_candidate_index
+        .saturating_add(u32::try_from(candidates.len()).unwrap_or(u32::MAX));
     persist_skipped_local_execution_candidates_with_context(
         state.app(),
         trace_id,
         persistence_policy.skipped,
-        u32::try_from(candidates.len()).unwrap_or(u32::MAX),
+        skipped_starting_candidate_index,
         attach_routing_trace_to_skipped_candidates(
             routing_policy,
             client_api_format,
-            u32::try_from(candidates.len()).unwrap_or(u32::MAX),
+            skipped_starting_candidate_index,
             skipped_candidates,
         ),
     )
@@ -715,7 +732,7 @@ where
     let (items, _) = build_logical_candidate_items(
         state,
         candidates,
-        0,
+        persistence_policy.starting_candidate_index,
         Some(trace_id),
         persistence_policy.skipped.record_runtime_miss_diagnostic,
         sticky_session_token,
@@ -734,6 +751,8 @@ where
     (
         LocalExecutionCandidateAttemptSource {
             items,
+            next_candidate_index: skipped_starting_candidate_index
+                .saturating_add(u32::try_from(skipped_candidate_count).unwrap_or(u32::MAX)),
             skipped_provider_ids: BTreeSet::new(),
             skipped_endpoint_ids: BTreeSet::new(),
             skipped_credential_ids: BTreeSet::new(),
@@ -874,7 +893,7 @@ where
         skipped_endpoint_ids: BTreeSet::new(),
         skipped_credential_ids: BTreeSet::new(),
         candidate_count: 0,
-        next_candidate_index: 0,
+        next_candidate_index: persistence_policy.starting_candidate_index,
         remembered_affinity: false,
         scheduler_cache_affinity_enabled,
         auth_api_key_concurrency_wait_deadline: None,
@@ -884,6 +903,7 @@ where
         cursor.deferred_error = Some(error);
     }
     let candidate_count = cursor.candidate_count;
+    let next_candidate_index = cursor.next_candidate_index;
     let mut items = VecDeque::new();
     if !cursor.pending_items.is_empty() || cursor.deferred_error.is_some() {
         items.push_back(
@@ -895,6 +915,7 @@ where
     (
         LocalExecutionCandidateAttemptSource {
             items,
+            next_candidate_index,
             skipped_provider_ids: BTreeSet::new(),
             skipped_endpoint_ids: BTreeSet::new(),
             skipped_credential_ids: BTreeSet::new(),
@@ -2448,6 +2469,7 @@ mod tests {
             sticky_session_token: None,
             request_auth_channel: None,
             persistence_policy: LocalCandidatePersistencePolicy {
+                starting_candidate_index: 0,
                 available: LocalAvailableCandidatePersistenceContext {
                     user_id: "user-1",
                     api_key_id: "api-key-1",
@@ -2814,6 +2836,7 @@ mod tests {
     #[tokio::test]
     async fn dynamic_attempt_source_does_not_drain_unexecuted_single_keys() {
         let mut source = LocalExecutionCandidateAttemptSource {
+            next_candidate_index: 0,
             items: VecDeque::from([LocalExecutionCandidateAttemptSourceItem::Static {
                 attempts: dispatch_sequence_from_attempts(
                     build_unpersisted_local_execution_candidate_attempts(
@@ -2863,6 +2886,7 @@ mod tests {
                 ),
             };
         let mut source = LocalExecutionCandidateAttemptSource {
+            next_candidate_index: 0,
             items: VecDeque::from([
                 static_item(key_a, 0),
                 static_item(key_b, 1),
@@ -2922,6 +2946,7 @@ mod tests {
             build_unpersisted_local_execution_candidate_attempts(fallback, 1).into(),
         );
         let mut source = LocalExecutionCandidateAttemptSource {
+            next_candidate_index: 0,
             items: VecDeque::from([
                 LocalExecutionCandidateAttemptSourceItem::Pool {
                     cursor: pool_cursor,
@@ -2971,6 +2996,7 @@ mod tests {
             build_unpersisted_local_execution_candidate_attempts(fallback, 1).into(),
         );
         let mut source = LocalExecutionCandidateAttemptSource {
+            next_candidate_index: 0,
             items: VecDeque::from([
                 LocalExecutionCandidateAttemptSourceItem::Pool {
                     cursor: pool_cursor,
@@ -3044,6 +3070,7 @@ mod tests {
             None,
         );
         let mut source = LocalExecutionCandidateAttemptSource {
+            next_candidate_index: 0,
             items: VecDeque::from([LocalExecutionCandidateAttemptSourceItem::Pool {
                 cursor,
                 candidate_index: 0,

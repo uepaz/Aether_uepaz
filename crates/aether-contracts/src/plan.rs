@@ -46,6 +46,7 @@ pub struct ExecutionTimeouts {
     pub connect_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_ms: Option<u64>,
+    /// 流式首字等待预算；Some(0) 关闭限制，None 沿用默认值。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_byte_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]

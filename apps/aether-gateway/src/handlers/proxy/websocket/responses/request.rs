@@ -589,6 +589,7 @@ mod tests {
 
     fn websocket_context() -> WebSocketRequestContext {
         WebSocketRequestContext {
+            request_id: "request-planning-parts".to_string(),
             trace_id: "trace-planning-parts".to_string(),
             headers: HeaderMap::new(),
             uri: Uri::from_static("/v1/responses"),

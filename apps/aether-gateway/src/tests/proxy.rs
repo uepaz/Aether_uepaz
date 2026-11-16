@@ -9,7 +9,7 @@ use super::{
     GATEWAY_HEADER, TRACE_ID_HEADER, TRUSTED_AUTH_ACCESS_ALLOWED_HEADER,
     TRUSTED_AUTH_API_KEY_ID_HEADER, TRUSTED_AUTH_USER_ID_HEADER,
     TUNNEL_AFFINITY_FORWARDED_BY_HEADER, TUNNEL_AFFINITY_NODE_ID_HEADER,
-    TUNNEL_AFFINITY_OWNER_INSTANCE_HEADER,
+    TUNNEL_AFFINITY_OWNER_INSTANCE_HEADER, TUNNEL_AFFINITY_REQUEST_ID_HEADER,
 };
 
 use aether_contracts::tunnel::{
@@ -38,6 +38,7 @@ const RELAY_TEST_SECRET: &str = "relay-test-secret-at-least-32-bytes";
 const AFFINITY_TEST_SENDER: &str = "gateway-a";
 const AFFINITY_TEST_OWNER: &str = "gateway-b";
 const AFFINITY_TEST_NODE: &str = "node-owner";
+const AFFINITY_TEST_REQUEST_ID: &str = "825a3122-4a2b-4eb3-80bc-8457cf88ea22";
 
 fn hash_api_key(value: &str) -> String {
     let mut hasher = Sha256::new();
@@ -352,6 +353,10 @@ fn signed_affinity_headers(
         HeaderValue::from_static(AFFINITY_TEST_NODE),
     );
     headers.insert(
+        TUNNEL_AFFINITY_REQUEST_ID_HEADER,
+        HeaderValue::from_static(AFFINITY_TEST_REQUEST_ID),
+    );
+    headers.insert(
         TRUSTED_AUTH_USER_ID_HEADER,
         HeaderValue::from_str(user_id).expect("trusted user id should be a valid header"),
     );
@@ -504,6 +509,10 @@ async fn gateway_uses_signed_tunnel_affinity_identity_once_and_rejects_replay() 
     )
     .await;
     assert_eq!(first.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        crate::tests::response_request_id(first.headers()),
+        AFFINITY_TEST_REQUEST_ID
+    );
     let first_payload: serde_json::Value = serde_json::from_slice(
         &to_bytes(first.into_body(), usize::MAX)
             .await
@@ -800,41 +809,111 @@ async fn gateway_rejects_execution_runtime_loop_guarded_ai_request() {
 }
 
 #[tokio::test]
-async fn gateway_shapes_execution_loop_rejections_for_claude_routes() {
-    let gateway = build_router().expect("gateway should build");
-    let (gateway_url, gateway_handle) = start_server(gateway).await;
+async fn gateway_blocks_claude_count_tokens_before_proxy_and_usage() {
+    use aether_data::repository::usage::InMemoryUsageReadRepository;
+    use aether_data_contracts::repository::usage::{UsageAuditListQuery, UsageReadRepository};
+    use tower::ServiceExt;
 
-    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
-        let response = reqwest::Client::new()
-            .post(format!("{gateway_url}{path}"))
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            crate::data::GatewayDataState::with_usage_repository_for_tests(Arc::clone(
+                &usage_repository,
+            )),
+        )
+        .with_usage_runtime_for_tests(crate::usage::UsageRuntimeConfig {
+            enabled: true,
+            ..crate::usage::UsageRuntimeConfig::default()
+        });
+    let usage_runtime = state.usage_runtime.clone();
+    let gateway = build_router_with_state(state);
+
+    for path in [
+        "/v1/messages/count_tokens",
+        "/v1/messages/count_tokens/",
+        "/v1/messages/count_tokens?beta=true",
+        "/v1/messages/count_tokens/?beta=true",
+    ] {
+        // 无凭证、永不结束的请求体仍应立即返回，证明没有进入鉴权或正文处理。
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(TRACE_ID_HEADER, "trace-disabled-token-count")
             .header(
                 EXECUTION_RUNTIME_LOOP_GUARD_HEADER,
                 EXECUTION_RUNTIME_LOOP_GUARD_VALUE,
             )
-            .header(http::header::CONTENT_TYPE, "application/json")
-            .body(r#"{"model":"claude-sonnet-4","messages":[]}"#)
-            .send()
-            .await
-            .expect("request should succeed");
-
-        assert_eq!(response.status(), StatusCode::LOOP_DETECTED, "path: {path}");
+            .body(Body::from_stream(futures_util::stream::pending::<
+                Result<axum::body::Bytes, std::io::Error>,
+            >()))
+            .expect("request should build");
+        let response =
+            tokio::time::timeout(Duration::from_secs(1), gateway.clone().oneshot(request))
+                .await
+                .expect("disabled route must not wait for the request body")
+                .expect("disabled route should respond");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "path: {path}");
         assert_eq!(
-            response
-                .headers()
-                .get(EXECUTION_PATH_HEADER)
-                .and_then(|value| value.to_str().ok()),
-            Some(EXECUTION_PATH_LOCAL_EXECUTION_LOOP_DETECTED),
-            "path: {path}"
+            response.headers()[TRACE_ID_HEADER],
+            "trace-disabled-token-count"
         );
-        let payload: serde_json::Value = response.json().await.expect("body should parse");
-        assert_eq!(payload["type"], "error", "path: {path}");
-        assert_eq!(payload["error"]["type"], "api_error", "path: {path}");
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["type"], "error");
+        assert_eq!(payload["error"]["type"], "not_found_error");
         assert_eq!(
             payload["error"]["message"],
-            "Gateway detected an execution runtime request loop back into the local frontdoor",
-            "path: {path}"
+            "Token counting endpoint is disabled"
         );
     }
+
+    usage_runtime
+        .shutdown(Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        usage_repository
+            .count_usage_audits(&UsageAuditListQuery::default())
+            .await
+            .unwrap(),
+        0,
+        "disabled helper calls must not create pending or terminal usage records",
+    );
+}
+
+#[tokio::test]
+async fn gateway_shapes_execution_loop_rejections_for_claude_messages() {
+    let gateway = build_router().expect("gateway should build");
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .header(
+            EXECUTION_RUNTIME_LOOP_GUARD_HEADER,
+            EXECUTION_RUNTIME_LOOP_GUARD_VALUE,
+        )
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"claude-sonnet-4","messages":[]}"#)
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::LOOP_DETECTED);
+    assert_eq!(
+        response
+            .headers()
+            .get(EXECUTION_PATH_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some(EXECUTION_PATH_LOCAL_EXECUTION_LOOP_DETECTED),
+    );
+    let payload: serde_json::Value = response.json().await.expect("body should parse");
+    assert_eq!(payload["type"], "error");
+    assert_eq!(payload["error"]["type"], "api_error");
+    assert_eq!(
+        payload["error"]["message"],
+        "Gateway detected an execution runtime request loop back into the local frontdoor",
+    );
 
     gateway_handle.abort();
 }
@@ -913,6 +992,7 @@ async fn gateway_forwards_public_request_to_remote_tunnel_owner_before_fallback_
         path: String,
         body: String,
         trace_id: String,
+        request_id: String,
         gateway_marker: String,
         authorization: String,
         trusted_user_id: String,
@@ -948,13 +1028,29 @@ async fn gateway_forwards_public_request_to_remote_tunnel_owner_before_fallback_
 
     let seen_owner = Arc::new(Mutex::new(None::<SeenOwnerRequest>));
     let seen_owner_clone = Arc::clone(&seen_owner);
+    let owner_tunnel = AppState::new()
+        .unwrap()
+        .with_tunnel_identity_and_relay_secret_for_tests("gateway-b", None, RELAY_TEST_SECRET)
+        .tunnel;
     let owner = Router::new().route(
         "/v1/chat/completions",
         any(move |request: Request| {
             let seen_owner_inner = Arc::clone(&seen_owner_clone);
+            let owner_tunnel = owner_tunnel.clone();
             async move {
                 let (parts, body) = request.into_parts();
                 let raw_body = to_bytes(body, usize::MAX).await.expect("body should read");
+                let pending = owner_tunnel
+                    .prepare_tunnel_affinity_auth_request(&parts.method, &parts.uri, &parts.headers)
+                    .await
+                    .unwrap()
+                    .expect("owner should authenticate the forward");
+                let request_id = owner_tunnel
+                    .commit_tunnel_affinity_auth_request(pending, &raw_body)
+                    .await
+                    .unwrap()
+                    .request_id
+                    .expect("owner should receive the signed request ID");
                 tokio::time::sleep(Duration::from_millis(40)).await;
                 *seen_owner_inner.lock().expect("mutex should lock") = Some(SeenOwnerRequest {
                     path: parts
@@ -970,6 +1066,7 @@ async fn gateway_forwards_public_request_to_remote_tunnel_owner_before_fallback_
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or_default()
                         .to_string(),
+                    request_id,
                     gateway_marker: parts
                         .headers
                         .get(GATEWAY_HEADER)
@@ -1155,6 +1252,7 @@ async fn gateway_forwards_public_request_to_remote_tunnel_owner_before_fallback_
         .expect("request should succeed");
 
     assert_eq!(response.status(), StatusCode::OK);
+    let request_id = crate::tests::response_request_id(response.headers());
     assert_eq!(
         response
             .headers()
@@ -1193,6 +1291,7 @@ async fn gateway_forwards_public_request_to_remote_tunnel_owner_before_fallback_
         "{\"model\":\"gpt-4.1\",\"messages\":[]}"
     );
     assert_eq!(owner_request.trace_id, "trace-tunnel-affinity-forward-1");
+    assert_eq!(owner_request.request_id, request_id);
     assert_eq!(owner_request.gateway_marker, "rust-phase3b-affinity");
     assert_eq!(owner_request.authorization, "");
     assert_eq!(owner_request.trusted_user_id, "user-affinity-1");

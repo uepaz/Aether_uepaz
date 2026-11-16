@@ -18,6 +18,9 @@ mod tests {
             settlement_billing_status_for_usage_status("cancelled"),
             "settled"
         );
-        assert_eq!(settlement_billing_status_for_usage_status("failed"), "void");
+        assert_eq!(
+            settlement_billing_status_for_usage_status("failed"),
+            "settled"
+        );
     }
 }

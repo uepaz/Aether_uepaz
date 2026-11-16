@@ -183,6 +183,8 @@ SELECT
       OR NULLIF(BTRIM("usage".request_metadata->>'user_agent'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'request_path'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'request_path_and_query'), '') IS NOT NULL
+      OR json_typeof("usage".request_metadata->'end_to_end_time_ms') = 'number'
+      OR json_typeof("usage".request_metadata->'end_to_end_first_byte_time_ms') = 'number'
       OR NULLIF(BTRIM("usage".request_metadata->>'requested_reasoning_effort'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'provider_reasoning_effort'), '') IS NOT NULL
       OR NULLIF(BTRIM("usage".request_metadata->>'provider_service_tier'), '') IS NOT NULL
@@ -216,6 +218,18 @@ SELECT
         NULLIF(BTRIM("usage".request_metadata->>'request_path'), ''),
         'request_path_and_query',
         NULLIF(BTRIM("usage".request_metadata->>'request_path_and_query'), ''),
+        'end_to_end_time_ms',
+        CASE
+          WHEN json_typeof("usage".request_metadata->'end_to_end_time_ms') = 'number'
+            THEN "usage".request_metadata->'end_to_end_time_ms'
+          ELSE NULL
+        END,
+        'end_to_end_first_byte_time_ms',
+        CASE
+          WHEN json_typeof("usage".request_metadata->'end_to_end_first_byte_time_ms') = 'number'
+            THEN "usage".request_metadata->'end_to_end_first_byte_time_ms'
+          ELSE NULL
+        END,
         'requested_reasoning_effort',
         NULLIF(BTRIM("usage".request_metadata->>'requested_reasoning_effort'), ''),
         'provider_reasoning_effort',

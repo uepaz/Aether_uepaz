@@ -1,5 +1,6 @@
 use serde_json::{json, Map, Value};
 
+use crate::formats::openai::usage::OpenAiUsageFormat;
 use crate::formats::shared::model_directives::model_directive_display_model_from_report_context;
 
 pub use aether_ai_formats::protocol::stream::{
@@ -129,64 +130,42 @@ pub fn resolve_identity(
 }
 
 pub fn canonical_usage_from_openai_usage(value: Option<&Value>) -> Option<CanonicalUsage> {
+    canonical_usage_from_openai_usage_with_format(value, OpenAiUsageFormat::Responses)
+}
+
+pub fn canonical_usage_from_openai_chat_usage(value: Option<&Value>) -> Option<CanonicalUsage> {
+    canonical_usage_from_openai_usage_with_format(value, OpenAiUsageFormat::Chat)
+}
+
+fn canonical_usage_from_openai_usage_with_format(
+    value: Option<&Value>,
+    format: OpenAiUsageFormat,
+) -> Option<CanonicalUsage> {
     let usage = value?.as_object()?;
-    let mut input_tokens = usage
-        .get("input_tokens")
-        .or_else(|| usage.get("prompt_tokens"))
+    let input = format.input_tokens(usage);
+    let mut input_tokens = input.and_then(Value::as_u64).unwrap_or(0);
+    let output_tokens = format
+        .output_tokens(usage)
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let output_tokens = usage
-        .get("output_tokens")
-        .or_else(|| usage.get("completion_tokens"))
+    let cache_creation_tokens = format
+        .cache_write_tokens(usage)
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let cache_creation_tokens = usage
-        .get("cache_creation_input_tokens")
+    let cache_read_tokens = format
+        .cache_read_tokens(usage)
         .and_then(Value::as_u64)
-        .or_else(|| {
-            usage
-                .get("input_tokens_details")
-                .or_else(|| usage.get("prompt_tokens_details"))
-                .and_then(Value::as_object)
-                .and_then(|details| {
-                    details
-                        .get("cache_write_tokens")
-                        .or_else(|| details.get("cached_creation_tokens"))
-                        .or_else(|| details.get("cache_creation_tokens"))
-                })
-                .and_then(Value::as_u64)
-        })
         .unwrap_or(0);
-    let cache_read_tokens = usage
-        .get("cache_read_input_tokens")
+    let reasoning_tokens = format
+        .reasoning_tokens(usage)
         .and_then(Value::as_u64)
-        .or_else(|| {
-            usage
-                .get("input_tokens_details")
-                .or_else(|| usage.get("prompt_tokens_details"))
-                .and_then(Value::as_object)
-                .and_then(|details| details.get("cached_tokens"))
-                .and_then(Value::as_u64)
-        })
-        .unwrap_or(0);
-    let reasoning_tokens = usage
-        .get("reasoning_tokens")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            usage
-                .get("output_tokens_details")
-                .or_else(|| usage.get("completion_tokens_details"))
-                .and_then(Value::as_object)
-                .and_then(|details| details.get("reasoning_tokens"))
-                .and_then(Value::as_u64)
-        })
         .unwrap_or(0);
     let total_tokens = usage.get("total_tokens").and_then(Value::as_u64).unwrap_or(
         input_tokens
             .saturating_add(output_tokens)
             .saturating_add(reasoning_tokens),
     );
-    if input_tokens == 0 && total_tokens > output_tokens {
+    if input.is_none() && total_tokens > output_tokens {
         input_tokens = total_tokens.saturating_sub(output_tokens);
     }
     Some(CanonicalUsage {

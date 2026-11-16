@@ -117,6 +117,14 @@ pub(crate) fn build_local_execution_report_context(
         parts.original_request_body_base64,
     );
     let mut extra_fields = parts.extra_fields;
+    // The execution request ID is gateway-owned. Keep the client correlation ID
+    // separately so repeated x-trace-id values never become billing identities.
+    extra_fields.remove("trace_id");
+    if let Some(trace_id) =
+        crate::headers::header_value_str(parts.original_headers, crate::constants::TRACE_ID_HEADER)
+    {
+        extra_fields.insert("trace_id".to_string(), Value::String(trace_id));
+    }
     // Always overwrite caller-supplied extras with the planner's immutable policy snapshot.
     let billing_multiplier = parts
         .routing_policy
@@ -405,7 +413,11 @@ mod tests {
             access_allowed: true,
             api_key_is_standalone: false,
         };
-        let original_headers = http::HeaderMap::new();
+        let mut original_headers = http::HeaderMap::new();
+        original_headers.insert(
+            crate::constants::TRACE_ID_HEADER,
+            "client-correlation-id".parse().unwrap(),
+        );
         let provider_request_headers = BTreeMap::new();
         let client_session_affinity = ClientSessionAffinity::new(
             Some("codex".to_string()),
@@ -436,7 +448,7 @@ mod tests {
         let report_context =
             build_local_execution_report_context(LocalExecutionReportContextParts {
                 auth_context: &auth_context,
-                request_id: "trace-1",
+                request_id: "server-request-1",
                 candidate_id: "candidate-1",
                 attempt_identity: ExecutionAttemptIdentity::new(0, 0),
                 model: "gpt-5",
@@ -487,9 +499,12 @@ mod tests {
                     ("routing_group_billing_multiplier".to_string(), json!(99)),
                     ("routing_group_id".to_string(), json!("forged-group")),
                     ("routing_group_name".to_string(), json!("forged-name")),
+                    ("trace_id".to_string(), json!("incorrect-execution-id")),
                 ]),
             });
 
+        assert_eq!(report_context["request_id"], "server-request-1");
+        assert_eq!(report_context["trace_id"], "client-correlation-id");
         assert_eq!(report_context["routing_group_billing_multiplier"], 0.25);
         assert_eq!(
             report_context["billing_multiplier_snapshot"],

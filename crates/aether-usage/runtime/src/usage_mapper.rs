@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use aether_ai_formats::formats::openai::usage::OpenAiUsageFormat;
+
 use crate::StandardizedUsage;
 
 pub struct UsageMapper;
@@ -15,6 +17,7 @@ impl UsageMapper {
         }
 
         let mut usage = StandardizedUsage::new();
+        apply_openai_usage_fields(raw_usage, api_format, &mut usage);
         let mut mapping = base_mapping(api_format);
         if let Some(extra_mapping) = extra_mapping {
             mapping.extend(extra_mapping.clone());
@@ -26,7 +29,6 @@ impl UsageMapper {
             }
         }
 
-        apply_openai_cache_write_tokens(raw_usage, api_format, &mut usage);
         derive_missing_input_tokens(raw_usage, api_format, &mut usage);
         copy_explicit_total_tokens(raw_usage, api_format, &mut usage);
         usage.normalize_cache_creation_breakdown()
@@ -46,7 +48,14 @@ impl UsageMapper {
     }
 }
 
-fn apply_openai_cache_write_tokens(
+fn openai_usage_format(api_format: &str) -> OpenAiUsageFormat {
+    match api_kind(api_format).as_str() {
+        "" | "chat" | "embedding" => OpenAiUsageFormat::Chat,
+        _ => OpenAiUsageFormat::Responses,
+    }
+}
+
+fn apply_openai_usage_fields(
     raw_usage: &serde_json::Value,
     api_format: &str,
     usage: &mut StandardizedUsage,
@@ -54,13 +63,19 @@ fn apply_openai_cache_write_tokens(
     if api_family(api_format).as_str() != "openai" {
         return;
     }
-    for details_key in ["prompt_tokens_details", "input_tokens_details"] {
-        if let Some(value) = raw_usage
-            .get(details_key)
-            .and_then(|details| details.get("cache_write_tokens"))
-        {
-            usage.set("cache_creation_tokens", value.clone());
-            return;
+    let Some(raw) = raw_usage.as_object() else {
+        return;
+    };
+    let format = openai_usage_format(api_format);
+    for (field, value) in [
+        ("input_tokens", format.input_tokens(raw)),
+        ("output_tokens", format.output_tokens(raw)),
+        ("cache_read_tokens", format.cache_read_tokens(raw)),
+        ("cache_creation_tokens", format.cache_write_tokens(raw)),
+        ("reasoning_tokens", format.reasoning_tokens(raw)),
+    ] {
+        if let Some(value) = value {
+            usage.set(field, value.clone());
         }
     }
 }
@@ -136,14 +151,7 @@ fn base_mapping(api_format: &str) -> BTreeMap<String, String> {
     let mut mapping = BTreeMap::new();
     match api_family(api_format).as_str() {
         "openai" => {
-            mapping.insert("prompt_tokens".to_string(), "input_tokens".to_string());
-            mapping.insert("completion_tokens".to_string(), "output_tokens".to_string());
-            mapping.insert("input_tokens".to_string(), "input_tokens".to_string());
-            mapping.insert("output_tokens".to_string(), "output_tokens".to_string());
-            mapping.insert(
-                "cache_creation_input_tokens".to_string(),
-                "cache_creation_tokens".to_string(),
-            );
+            // 有别名的字段由协议适配器解析，不能依赖 BTreeMap 的字典顺序覆盖。
             mapping.insert(
                 "cache_creation.ephemeral_5m_input_tokens".to_string(),
                 "cache_creation_ephemeral_5m_tokens".to_string(),
@@ -151,42 +159,6 @@ fn base_mapping(api_format: &str) -> BTreeMap<String, String> {
             mapping.insert(
                 "cache_creation.ephemeral_1h_input_tokens".to_string(),
                 "cache_creation_ephemeral_1h_tokens".to_string(),
-            );
-            mapping.insert(
-                "cache_read_input_tokens".to_string(),
-                "cache_read_tokens".to_string(),
-            );
-            mapping.insert(
-                "prompt_tokens_details.cached_tokens".to_string(),
-                "cache_read_tokens".to_string(),
-            );
-            mapping.insert(
-                "input_tokens_details.cached_tokens".to_string(),
-                "cache_read_tokens".to_string(),
-            );
-            mapping.insert(
-                "prompt_tokens_details.cached_creation_tokens".to_string(),
-                "cache_creation_tokens".to_string(),
-            );
-            mapping.insert(
-                "prompt_tokens_details.cache_write_tokens".to_string(),
-                "cache_creation_tokens".to_string(),
-            );
-            mapping.insert(
-                "input_tokens_details.cached_creation_tokens".to_string(),
-                "cache_creation_tokens".to_string(),
-            );
-            mapping.insert(
-                "input_tokens_details.cache_write_tokens".to_string(),
-                "cache_creation_tokens".to_string(),
-            );
-            mapping.insert(
-                "completion_tokens_details.reasoning_tokens".to_string(),
-                "reasoning_tokens".to_string(),
-            );
-            mapping.insert(
-                "output_tokens_details.reasoning_tokens".to_string(),
-                "reasoning_tokens".to_string(),
             );
         }
         "gemini" => {
@@ -256,15 +228,18 @@ fn derive_missing_input_tokens(
     if usage.input_tokens > 0 || api_family(api_format).as_str() != "openai" {
         return;
     }
+    if raw_usage
+        .as_object()
+        .and_then(|raw| openai_usage_format(api_format).input_tokens(raw))
+        .is_some()
+    {
+        return;
+    }
 
     let Some(total_tokens) = numeric_i64(raw_usage.get("total_tokens")) else {
         return;
     };
-    let output_tokens = usage
-        .output_tokens
-        .max(numeric_i64(raw_usage.get("completion_tokens")).unwrap_or_default())
-        .max(numeric_i64(raw_usage.get("output_tokens")).unwrap_or_default());
-    let inferred_input_tokens = total_tokens.saturating_sub(output_tokens);
+    let inferred_input_tokens = total_tokens.saturating_sub(usage.output_tokens);
     if inferred_input_tokens > 0 {
         usage.input_tokens = inferred_input_tokens;
     }
@@ -348,6 +323,123 @@ fn resolve_usage_value<'a>(
 #[cfg(test)]
 mod tests {
     use super::{map_usage, map_usage_from_response};
+
+    #[test]
+    fn openai_usage_prefers_protocol_fields_over_compatibility_fields() {
+        for format in [
+            "openai:chat",
+            "openai:responses",
+            "openai:responses:compact",
+        ] {
+            let chat = format == "openai:chat";
+            for (input, output, cached, reasoning) in [(3197, 1034, 2000, 100), (0, 0, 0, 0)] {
+                let mut raw = serde_json::json!({
+                    "prompt_tokens": 71, "completion_tokens": 29,
+                    "input_tokens": 71, "output_tokens": 29,
+                    "prompt_tokens_details": {"cached_tokens": 17, "cache_write_tokens": 19},
+                    "input_tokens_details": {"cached_tokens": 17, "cache_write_tokens": 19},
+                    "completion_tokens_details": {"reasoning_tokens": 13},
+                    "output_tokens_details": {"reasoning_tokens": 13},
+                    "total_tokens": input + output,
+                });
+                raw[if chat {
+                    "prompt_tokens"
+                } else {
+                    "input_tokens"
+                }] = input.into();
+                raw[if chat {
+                    "completion_tokens"
+                } else {
+                    "output_tokens"
+                }] = output.into();
+                raw[if chat {
+                    "prompt_tokens_details"
+                } else {
+                    "input_tokens_details"
+                }] = serde_json::json!({"cached_tokens": cached, "cache_write_tokens": 0});
+                raw[if chat {
+                    "completion_tokens_details"
+                } else {
+                    "output_tokens_details"
+                }] = serde_json::json!({"reasoning_tokens": reasoning});
+                let usage = map_usage(&raw, format);
+                assert_eq!(
+                    (
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cache_read_tokens,
+                        usage.cache_creation_tokens,
+                        usage.reasoning_tokens
+                    ),
+                    (input, output, cached, 0, reasoning),
+                    "{format}: {raw}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn openai_usage_preserves_explicit_zero_input_instead_of_deriving_it() {
+        for format in ["openai:chat", "openai:responses"] {
+            let raw = if format == "openai:chat" {
+                serde_json::json!({"prompt_tokens": 0, "completion_tokens": 5, "total_tokens": 100})
+            } else {
+                serde_json::json!({"input_tokens": 0, "output_tokens": 5, "total_tokens": 100})
+            };
+            assert_eq!(map_usage(&raw, format).input_tokens, 0, "{format}");
+        }
+    }
+
+    #[test]
+    fn chat_usage_with_zero_compatibility_aliases_keeps_reported_counts() {
+        let usage = map_usage_from_response(
+            &serde_json::json!({"usage": {
+                "prompt_tokens": 3197, "completion_tokens": 1034, "total_tokens": 4231,
+                "input_tokens": 0, "output_tokens": 0,
+            }}),
+            "openai:chat",
+        );
+        assert_eq!((usage.input_tokens, usage.output_tokens), (3197, 1034));
+        assert_eq!(usage.dimensions["total_tokens"], 4231);
+    }
+
+    #[test]
+    fn openai_usage_keeps_compatibility_fallback_for_missing_native_fields() {
+        for format in ["openai:chat", "openai:responses"] {
+            let aliases = if format == "openai:chat" {
+                serde_json::json!({"input_tokens": 3197, "output_tokens": 1034,
+                    "input_tokens_details": {"cached_tokens": 42},
+                    "output_tokens_details": {"reasoning_tokens": 8}})
+            } else {
+                serde_json::json!({"prompt_tokens": 3197, "completion_tokens": 1034,
+                    "prompt_tokens_details": {"cached_tokens": 42},
+                    "completion_tokens_details": {"reasoning_tokens": 8}})
+            };
+            let usage = map_usage(&aliases, format);
+            assert_eq!(
+                (
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_read_tokens,
+                    usage.reasoning_tokens
+                ),
+                (3197, 1034, 42, 8)
+            );
+        }
+    }
+
+    #[test]
+    fn openai_usage_derives_missing_input_from_selected_protocol_output() {
+        for format in ["openai:chat", "openai:responses"] {
+            let raw = if format == "openai:chat" {
+                serde_json::json!({"completion_tokens": 0, "output_tokens": 1034, "total_tokens": 4231})
+            } else {
+                serde_json::json!({"output_tokens": 0, "completion_tokens": 1034, "total_tokens": 4231})
+            };
+            let usage = map_usage(&raw, format);
+            assert_eq!((usage.input_tokens, usage.output_tokens), (4231, 0));
+        }
+    }
 
     #[test]
     fn maps_openai_usage() {

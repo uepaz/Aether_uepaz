@@ -9,4 +9,5 @@ pub mod rerank;
 pub mod responses;
 pub mod search;
 pub mod shared;
+pub mod usage;
 pub mod video;

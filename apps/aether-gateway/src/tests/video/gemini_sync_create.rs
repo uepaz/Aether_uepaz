@@ -427,6 +427,7 @@ async fn gateway_executes_gemini_video_create_via_local_decision_gate_with_local
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await.expect("body should parse");
@@ -480,7 +481,7 @@ async fn gateway_executes_gemini_video_create_via_local_decision_gate_with_local
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-gemini-video-local-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);

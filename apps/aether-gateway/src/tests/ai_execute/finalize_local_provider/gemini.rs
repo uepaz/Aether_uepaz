@@ -453,6 +453,7 @@ async fn gateway_executes_gemini_chat_sync_same_format_via_local_finalize_respon
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
     let elapsed = started_at.elapsed();
 
     assert_eq!(response.status(), StatusCode::OK);
@@ -492,10 +493,7 @@ async fn gateway_executes_gemini_chat_sync_same_format_via_local_finalize_respon
         seen_remote_execution_runtime_request.trace_id,
         "trace-gemini-chat-sync-local-123"
     );
-    assert_eq!(
-        seen_remote_execution_runtime_request.request_id,
-        "trace-gemini-chat-sync-local-123"
-    );
+    assert_eq!(seen_remote_execution_runtime_request.request_id, request_id);
     assert_eq!(
         seen_remote_execution_runtime_request.url,
         "https://generativelanguage.googleapis.com/custom/v1beta/models/gemini-2.5-pro-upstream:generateContent?alt=sse"
@@ -521,7 +519,7 @@ async fn gateway_executes_gemini_chat_sync_same_format_via_local_finalize_respon
     let mut stored_candidates = Vec::new();
     for _ in 0..50 {
         stored_candidates = request_candidate_repository
-            .list_by_request_id("trace-gemini-chat-sync-local-123")
+            .list_by_request_id(&request_id)
             .await
             .expect("request candidate trace should read");
         if stored_candidates.len() == 1
@@ -947,6 +945,7 @@ async fn gateway_executes_gemini_chat_sync_upstream_stream_via_local_finalize_re
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
     let elapsed = started_at.elapsed();
 
     assert_eq!(response.status(), StatusCode::OK);
@@ -987,10 +986,7 @@ async fn gateway_executes_gemini_chat_sync_upstream_stream_via_local_finalize_re
         seen_remote_execution_runtime_request.trace_id,
         "trace-gemini-chat-stream-sync-direct-123"
     );
-    assert_eq!(
-        seen_remote_execution_runtime_request.request_id,
-        "trace-gemini-chat-stream-sync-direct-123"
-    );
+    assert_eq!(seen_remote_execution_runtime_request.request_id, request_id);
     assert_eq!(
         seen_remote_execution_runtime_request.url,
         "https://generativelanguage.googleapis.com/custom/v1beta/models/gemini-2.5-pro-upstream:generateContent?alt=sse"
@@ -1016,7 +1012,7 @@ async fn gateway_executes_gemini_chat_sync_upstream_stream_via_local_finalize_re
     let mut stored_candidates = Vec::new();
     for _ in 0..50 {
         stored_candidates = request_candidate_repository
-            .list_by_request_id("trace-gemini-chat-stream-sync-direct-123")
+            .list_by_request_id(&request_id)
             .await
             .expect("request candidate trace should read");
         if stored_candidates.len() == 1
@@ -1444,6 +1440,7 @@ async fn gateway_executes_gemini_cli_sync_upstream_stream_via_local_finalize_res
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
     let elapsed = started_at.elapsed();
 
     assert_eq!(response.status(), StatusCode::OK);
@@ -1484,10 +1481,7 @@ async fn gateway_executes_gemini_cli_sync_upstream_stream_via_local_finalize_res
         seen_remote_execution_runtime_request.trace_id,
         "trace-gemini-cli-stream-sync-direct-123"
     );
-    assert_eq!(
-        seen_remote_execution_runtime_request.request_id,
-        "trace-gemini-cli-stream-sync-direct-123"
-    );
+    assert_eq!(seen_remote_execution_runtime_request.request_id, request_id);
     assert_eq!(
         seen_remote_execution_runtime_request.url,
         "https://generativelanguage.googleapis.com/custom/v1beta/models/gemini-cli-upstream:generateContent"
@@ -1513,7 +1507,7 @@ async fn gateway_executes_gemini_cli_sync_upstream_stream_via_local_finalize_res
     let mut stored_candidates = Vec::new();
     for _ in 0..50 {
         stored_candidates = request_candidate_repository
-            .list_by_request_id("trace-gemini-cli-stream-sync-direct-123")
+            .list_by_request_id(&request_id)
             .await
             .expect("request candidate trace should read");
         if stored_candidates.len() == 1
@@ -2032,6 +2026,7 @@ async fn gateway_executes_antigravity_gemini_cli_sync_upstream_stream_via_local_
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
     let elapsed = started_at.elapsed();
 
     assert_eq!(response.status(), StatusCode::OK);
@@ -2143,10 +2138,7 @@ async fn gateway_executes_antigravity_gemini_cli_sync_upstream_stream_via_local_
         seen_remote_execution_runtime_request.project,
         "project-antigravity-local-1"
     );
-    assert_eq!(
-        seen_remote_execution_runtime_request.request_id,
-        "trace-antigravity-cli-stream-sync-direct-123"
-    );
+    assert_eq!(seen_remote_execution_runtime_request.request_id, request_id);
     assert_eq!(
         seen_remote_execution_runtime_request.model,
         "claude-sonnet-4-5"
@@ -2163,7 +2155,7 @@ async fn gateway_executes_antigravity_gemini_cli_sync_upstream_stream_via_local_
     let mut stored_candidates = Vec::new();
     for _ in 0..50 {
         stored_candidates = request_candidate_repository
-            .list_by_request_id("trace-antigravity-cli-stream-sync-direct-123")
+            .list_by_request_id(&request_id)
             .await
             .expect("request candidate trace should read");
         if stored_candidates.len() == 1

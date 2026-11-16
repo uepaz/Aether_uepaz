@@ -630,6 +630,7 @@ fn build_users_me_usage_record_payload(
             auth_api_key_reader_available,
         ),
     });
+    payload["response_time_updated_at"] = json!(users_me_usage_response_time_updated_at(item));
     payload["end_to_end_time_ms"] = json!(users_me_usage_metadata_u64(item, "end_to_end_time_ms"));
     payload["routing_group_id"] = json!(item.routing_group_id());
     payload["routing_group_name"] = json!(item.routing_group_name());
@@ -751,8 +752,9 @@ fn build_users_me_usage_active_payload(item: &StoredRequestUsageAudit) -> serde_
 
 fn users_me_usage_response_time_updated_at(item: &StoredRequestUsageAudit) -> Option<String> {
     item.response_time_ms?;
+    // 秒级时间戳相等仍是有效快照，丢弃它会让延迟创建的记录漏算首字节前的等待。
     if matches!(item.status.as_str(), "pending" | "streaming")
-        && item.updated_at_unix_secs <= item.created_at_unix_ms
+        && item.updated_at_unix_secs < item.created_at_unix_ms
     {
         return None;
     }
@@ -1964,6 +1966,25 @@ mod tests {
         for payload in [&record, &active] {
             assert_eq!(payload["target_model"], "provider-mapped-model");
             assert_eq!(payload["response_model"], "gpt-5.1");
+        }
+    }
+
+    #[test]
+    fn user_usage_active_timing_keeps_same_second_anchor() {
+        for status in ["pending", "streaming"] {
+            let item = StoredRequestUsageAudit {
+                created_at_unix_ms: 1_700_000_020,
+                updated_at_unix_secs: 1_700_000_020,
+                response_time_ms: Some(20_000),
+                first_byte_time_ms: Some(20_000),
+                ..sample_usage(status)
+            };
+            let record = build_users_me_usage_record_payload(&item, false, &BTreeMap::new(), false);
+            let active = build_users_me_usage_active_payload(&item);
+            for payload in [&record, &active] {
+                assert_eq!(payload["response_time_ms"], 20_000);
+                assert_eq!(payload["response_time_updated_at"], "2023-11-14T22:13:40Z");
+            }
         }
     }
 

@@ -9,6 +9,8 @@ use super::{
     TRACE_ID_HEADER,
 };
 
+use crate::tests::{execution_request_id, response_request_id};
+
 fn large_request_body(stream: bool) -> String {
     let large_message = "x".repeat(128 * 1024);
     serde_json::to_string(&json!({
@@ -59,9 +61,10 @@ async fn gateway_records_usage_for_execution_runtime_sync_when_runtime_enabled_i
 
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
-        any(|_request: Request| async move {
+        any(|request: Request| async move {
+            let request_id = execution_request_id(request).await;
             Json(json!({
-                "request_id": "req-usage-sync-123",
+                "request_id": request_id,
                 "status_code": 200,
                 "headers": {
                     "content-type": "application/json"
@@ -131,12 +134,13 @@ async fn gateway_records_usage_for_execution_runtime_sync_when_runtime_enabled_i
         .await
         .expect("request should succeed");
 
+    let request_id = response_request_id(response.headers());
     assert_eq!(response.status(), StatusCode::OK);
 
     let mut stored = None;
     for _ in 0..50 {
         stored = usage_repository
-            .find_by_request_id("req-usage-sync-123")
+            .find_by_request_id(&request_id)
             .await
             .expect("usage lookup should succeed");
         if stored
@@ -183,14 +187,15 @@ async fn gateway_records_active_usage_before_execution_runtime_sync_result_arriv
         any({
             let execution_request_started = Arc::clone(&execution_request_started);
             let allow_execution_response = Arc::clone(&allow_execution_response);
-            move |_request: Request| {
+            move |request: Request| {
                 let execution_request_started = Arc::clone(&execution_request_started);
                 let allow_execution_response = Arc::clone(&allow_execution_response);
                 async move {
+                    let request_id = execution_request_id(request).await;
                     execution_request_started.notify_one();
                     allow_execution_response.notified().await;
                     Json(json!({
-                        "request_id": "req-usage-sync-pending-123",
+                        "request_id": request_id,
                         "status_code": 200,
                         "headers": {
                             "content-type": "application/json"
@@ -267,9 +272,10 @@ async fn gateway_records_active_usage_before_execution_runtime_sync_result_arriv
                 .send()
                 .await
                 .expect("request should succeed");
+            let request_id = response_request_id(response.headers());
             let status = response.status();
             let body = response.text().await.expect("body should read");
-            (status, body)
+            (status, body, request_id)
         }
     });
 
@@ -278,9 +284,11 @@ async fn gateway_records_active_usage_before_execution_runtime_sync_result_arriv
     let mut active = None;
     for _ in 0..50 {
         active = usage_repository
-            .find_by_request_id("req-usage-sync-pending-123")
+            .list_recent_usage_audits(Some("user-usage-sync-pending-123"), 1)
             .await
-            .expect("usage lookup should succeed");
+            .expect("usage lookup should succeed")
+            .into_iter()
+            .next();
         if active
             .as_ref()
             .is_some_and(|stored| stored.status == "streaming")
@@ -298,13 +306,14 @@ async fn gateway_records_active_usage_before_execution_runtime_sync_result_arriv
 
     allow_execution_response.notify_one();
 
-    let (status, _body) = request_task.await.expect("request task should join");
+    let (status, _body, request_id) = request_task.await.expect("request task should join");
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(active.request_id, request_id);
 
     let mut stored = None;
     for _ in 0..50 {
         stored = usage_repository
-            .find_by_request_id("req-usage-sync-pending-123")
+            .find_by_request_id(&active.request_id)
             .await
             .expect("usage lookup should succeed");
         if stored.as_ref().is_some_and(|row| row.status == "completed") {
@@ -345,14 +354,15 @@ async fn gateway_keeps_active_sync_usage_lightweight_for_large_request_body_impl
         any({
             let execution_request_started = Arc::clone(&execution_request_started);
             let allow_execution_response = Arc::clone(&allow_execution_response);
-            move |_request: Request| {
+            move |request: Request| {
                 let execution_request_started = Arc::clone(&execution_request_started);
                 let allow_execution_response = Arc::clone(&allow_execution_response);
                 async move {
+                    let request_id = execution_request_id(request).await;
                     execution_request_started.notify_one();
                     allow_execution_response.notified().await;
                     Json(json!({
-                        "request_id": "req-usage-sync-large-pending-123",
+                        "request_id": request_id,
                         "status_code": 200,
                         "headers": {
                             "content-type": "application/json"
@@ -428,9 +438,10 @@ async fn gateway_keeps_active_sync_usage_lightweight_for_large_request_body_impl
                 .send()
                 .await
                 .expect("request should succeed");
+            let request_id = response_request_id(response.headers());
             let status = response.status();
             let body = response.text().await.expect("body should read");
-            (status, body)
+            (status, body, request_id)
         }
     });
 
@@ -439,9 +450,11 @@ async fn gateway_keeps_active_sync_usage_lightweight_for_large_request_body_impl
     let mut active = None;
     for _ in 0..50 {
         active = usage_repository
-            .find_by_request_id("req-usage-sync-large-pending-123")
+            .list_recent_usage_audits(Some("user-usage-sync-large-pending-123"), 1)
             .await
-            .expect("usage lookup should succeed");
+            .expect("usage lookup should succeed")
+            .into_iter()
+            .next();
         if active
             .as_ref()
             .is_some_and(|stored| stored.status == "streaming")
@@ -461,8 +474,9 @@ async fn gateway_keeps_active_sync_usage_lightweight_for_large_request_body_impl
 
     allow_execution_response.notify_one();
 
-    let (status, _body) = request_task.await.expect("request task should join");
+    let (status, _body, request_id) = request_task.await.expect("request task should join");
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(active.request_id, request_id);
 
     gateway_handle.abort();
     execution_runtime_handle.abort();
@@ -565,13 +579,14 @@ async fn gateway_records_usage_for_execution_runtime_stream_when_runtime_enabled
         .await
         .expect("request should succeed");
 
+    let request_id = response_request_id(response.headers());
     assert_eq!(response.status(), StatusCode::OK);
     let _ = response.text().await.expect("stream body should read");
 
     let mut stored = None;
     for _ in 0..50 {
         stored = usage_repository
-            .find_by_request_id("req-usage-stream-123")
+            .find_by_request_id(&request_id)
             .await
             .expect("usage lookup should succeed");
         if stored.is_some() {
@@ -690,13 +705,16 @@ async fn gateway_records_pending_usage_before_execution_runtime_stream_headers_a
                     "Bearer sk-client-openai-stream-pending",
                 )
                 .header(TRACE_ID_HEADER, "req-usage-stream-pending-123")
+                .header("x-aether-client", "My-Agent_2")
+                .header(http::header::USER_AGENT, "OpenAI/Python 2.0")
                 .body("{\"model\":\"gpt-5\",\"messages\":[],\"stream\":true}")
                 .send()
                 .await
                 .expect("request should succeed");
+            let request_id = response_request_id(response.headers());
             let status = response.status();
             let body = response.text().await.expect("stream body should read");
-            (status, body)
+            (status, body, request_id)
         }
     });
 
@@ -705,9 +723,11 @@ async fn gateway_records_pending_usage_before_execution_runtime_stream_headers_a
     let mut pending = None;
     for _ in 0..50 {
         pending = usage_repository
-            .find_by_request_id("req-usage-stream-pending-123")
+            .list_recent_usage_audits(Some("user-usage-stream-pending-123"), 1)
             .await
-            .expect("usage lookup should succeed");
+            .expect("usage lookup should succeed")
+            .into_iter()
+            .next();
         if pending
             .as_ref()
             .is_some_and(|stored| stored.status == "pending")
@@ -719,18 +739,20 @@ async fn gateway_records_pending_usage_before_execution_runtime_stream_headers_a
     let pending = pending.expect("pending usage should be recorded before stream headers arrive");
     assert_eq!(pending.status, "pending");
     assert_eq!(pending.billing_status, "pending");
+    assert_eq!(pending.client_family.as_deref(), Some("my-agent_2"));
     assert_eq!(pending.first_byte_time_ms, None);
     assert_eq!(pending.response_time_ms, None);
 
     allow_execution_response.notify_one();
 
-    let (status, _body) = request_task.await.expect("request task should join");
+    let (status, _body, request_id) = request_task.await.expect("request task should join");
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(pending.request_id, request_id);
 
     let mut stored = None;
     for _ in 0..50 {
         stored = usage_repository
-            .find_by_request_id("req-usage-stream-pending-123")
+            .find_by_request_id(&pending.request_id)
             .await
             .expect("usage lookup should succeed");
         if stored.as_ref().is_some_and(|row| row.status == "completed") {
@@ -740,6 +762,7 @@ async fn gateway_records_pending_usage_before_execution_runtime_stream_headers_a
     }
     let stored = stored.expect("usage should be finalized");
     assert_eq!(stored.status, "completed");
+    assert_eq!(stored.client_family.as_deref(), Some("my-agent_2"));
     assert!(stored.first_byte_time_ms.is_some());
     assert!(stored.response_time_ms >= stored.first_byte_time_ms);
 
@@ -850,9 +873,10 @@ async fn gateway_keeps_pending_stream_usage_lightweight_for_large_request_body_i
                 .send()
                 .await
                 .expect("request should succeed");
+            let request_id = response_request_id(response.headers());
             let status = response.status();
             let body = response.text().await.expect("stream body should read");
-            (status, body)
+            (status, body, request_id)
         }
     });
 
@@ -861,9 +885,11 @@ async fn gateway_keeps_pending_stream_usage_lightweight_for_large_request_body_i
     let mut pending = None;
     for _ in 0..50 {
         pending = usage_repository
-            .find_by_request_id("req-usage-stream-large-pending-123")
+            .list_recent_usage_audits(Some("user-usage-stream-large-pending-123"), 1)
             .await
-            .expect("usage lookup should succeed");
+            .expect("usage lookup should succeed")
+            .into_iter()
+            .next();
         if pending
             .as_ref()
             .is_some_and(|stored| stored.status == "pending")
@@ -883,8 +909,9 @@ async fn gateway_keeps_pending_stream_usage_lightweight_for_large_request_body_i
 
     allow_execution_response.notify_one();
 
-    let (status, _body) = request_task.await.expect("request task should join");
+    let (status, _body, request_id) = request_task.await.expect("request task should join");
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(pending.request_id, request_id);
 
     gateway_handle.abort();
     execution_runtime_handle.abort();

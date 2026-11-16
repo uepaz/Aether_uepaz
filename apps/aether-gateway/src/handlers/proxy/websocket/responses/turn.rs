@@ -45,7 +45,7 @@ use crate::execution_runtime::attach_provider_response_headers_to_report_context
 use crate::execution_runtime::attempt_lifecycle::{
     attempt_billing_is_void, AttemptBodyCapture, AttemptClientDelivery, AttemptLifecycleSeed,
     AttemptProviderOutcome, AttemptStageGuard, AttemptTerminalFacts, AttemptTerminalFactsInput,
-    ExecutionAttemptLifecycle,
+    AttemptUsageFinalization, AttemptUsageTiming, DeferredAttemptUsage, ExecutionAttemptLifecycle,
 };
 use crate::orchestration::{
     apply_local_stream_failure_effects, apply_local_stream_success_effects,
@@ -237,13 +237,29 @@ impl ResponsesWebSocketTurnOutcome {
     }
 }
 
-/// 一次 provider attempt：一条上游执行，也是一条独立的 usage/candidate 记录。
-///
-/// 与 [`super::turn_state::LogicalTurn`] 分工明确：logical turn 是客户端看到的
-/// 一轮请求（可能包含多个 attempt），attempt 只负责这一次上游执行的记账事实。
+/// First free candidate slot after this turn's planning pass.
+#[derive(Clone)]
+pub(super) struct ResponsesWebSocketNextCandidateIndex(pub(super) u32);
+
+#[derive(Clone)]
+pub(super) enum ResponsesWebSocketUsageStart {
+    New(Instant),
+    Retry {
+        request_started_at: Instant,
+        reservation_token: Option<String>,
+    },
+}
+
+/// One upstream execution and its own candidate record. A transparent quota
+/// retry keeps the logical turn's usage record across both attempts.
 pub(super) struct ResponsesProviderAttempt {
     /// 记账三段（pending / started / terminal）由共享的 transport 中立生命周期负责。
     lifecycle: ExecutionAttemptLifecycle,
+    pub(super) next_candidate_index: u32,
+    owns_terminal_usage: bool,
+    request_started_at: Instant,
+    first_client_event_at: Option<Instant>,
+    request_finished_at: Option<Instant>,
     started_at: Instant,
     provider_request_started_at_unix_ms: u64,
     provider_request_order_id: String,
@@ -253,14 +269,12 @@ pub(super) struct ResponsesProviderAttempt {
     client_capture: AttemptBodyCapture,
     upstream_bytes: u64,
     first_event_elapsed_ms: Option<u64>,
-    first_event_timeout: Duration,
+    first_event_timeout: Option<Duration>,
     terminal_timeout: Duration,
     admission: Option<ResponsesWebSocketTurnAdmission>,
-    /// A provider attempt gets its own server-issued cost reservation. The
-    /// trusted token also lives in the lifecycle report context so the normal
-    /// terminal usage path can reconcile actual cost. We retain the control
-    /// snapshot here only for the quota-retry path, which must release the old
-    /// attempt synchronously before reserving the replacement.
+    /// The server-issued cost reservation belongs to the logical turn. Its
+    /// token travels with terminal usage and can be reused to re-estimate the
+    /// amount when a transparent retry switches to a different provider.
     plan_usage_cost_reservation: Option<ResponsesPlanUsageCostReservation>,
     terminal_error_body: Option<String>,
     /// 观察到的 provider 终态事实，与「为什么现在结算」这个信号分开保存。
@@ -525,7 +539,17 @@ pub(super) async fn begin_unowned_responses_websocket_turn(
     decision: AiExecutionDecision,
     client_event: &Value,
     plan_usage_policy_snapshot: Option<PlanUsagePolicySnapshot>,
+    usage_start: ResponsesWebSocketUsageStart,
 ) -> Result<ResponsesProviderAttempt, GatewayError> {
+    let (request_started_at, reservation_token, record_pending_usage) = match usage_start {
+        ResponsesWebSocketUsageStart::New(started_at) => {
+            (started_at, Some(uuid::Uuid::new_v4().to_string()), true)
+        }
+        ResponsesWebSocketUsageStart::Retry {
+            request_started_at,
+            reservation_token,
+        } => (request_started_at, reservation_token, false),
+    };
     let planned_report_context = decision.report_context.clone();
     let attempt = match build_openai_responses_stream_plan_from_decision(
         parts,
@@ -641,17 +665,20 @@ pub(super) async fn begin_unowned_responses_websocket_turn(
         }
     };
 
-    let reservation_token = uuid::Uuid::new_v4().to_string();
-    let cost_reservation = match reserve_responses_plan_usage_cost_owned(
-        state,
-        control_decision,
-        &plan,
-        report_context.as_ref(),
-        plan_usage_policy_snapshot.as_ref(),
-        reservation_token,
-    )
-    .await
-    {
+    let reservation = if let Some(token) = reservation_token {
+        reserve_responses_plan_usage_cost_owned(
+            state,
+            control_decision,
+            &plan,
+            report_context.as_ref(),
+            plan_usage_policy_snapshot.as_ref(),
+            token,
+        )
+        .await
+    } else {
+        Ok(ResponsesPlanUsageCostReservationStart::NotRequired)
+    };
+    let cost_reservation = match reservation {
         Ok(ResponsesPlanUsageCostReservationStart::NotRequired) => None,
         Ok(ResponsesPlanUsageCostReservationStart::Reserved(guard)) => {
             report_context =
@@ -720,6 +747,7 @@ pub(super) async fn begin_unowned_responses_websocket_turn(
             // relay loop 是单任务：一段慢依赖会拖住整条连接的收发，所以每段
             // 记账 I/O 都要有等待上界。
             stage_guard: AttemptStageGuard::Bounded(RESPONSES_WEBSOCKET_LIFECYCLE_STAGE_TIMEOUT),
+            record_pending_usage,
         },
     )
     .await;
@@ -727,6 +755,14 @@ pub(super) async fn begin_unowned_responses_websocket_turn(
 
     Ok(ResponsesProviderAttempt {
         lifecycle,
+        next_candidate_index: parts
+            .extensions
+            .get::<ResponsesWebSocketNextCandidateIndex>()
+            .map_or(1, |index| index.0),
+        owns_terminal_usage: record_pending_usage,
+        request_started_at,
+        first_client_event_at: None,
+        request_finished_at: None,
         started_at: Instant::now(),
         provider_request_started_at_unix_ms: current_unix_ms(),
         provider_request_order_id: uuid::Uuid::now_v7().to_string(),
@@ -862,6 +898,20 @@ fn websocket_auth_rejection_error(rejection: GatewayLocalAuthRejection) -> Gatew
 }
 
 impl ResponsesProviderAttempt {
+    pub(super) fn request_id(&self) -> &str {
+        &self.lifecycle.plan().request_id
+    }
+
+    pub(super) fn quota_retry_usage_start(&self) -> ResponsesWebSocketUsageStart {
+        ResponsesWebSocketUsageStart::Retry {
+            request_started_at: self.request_started_at,
+            reservation_token: self
+                .plan_usage_cost_reservation
+                .as_ref()
+                .map(|reservation| reservation.reservation_token.clone()),
+        }
+    }
+
     pub(super) fn cancel_on_client_disconnect(&self) -> bool {
         crate::orchestration::routing_execution_policy_from_report_context(
             self.lifecycle.report_context(),
@@ -887,43 +937,9 @@ impl ResponsesProviderAttempt {
         }
     }
 
-    /// Releases this attempt's reserved cost before a transparent retry. The
-    /// terminal usage write that follows may reconcile the same token again;
-    /// repository reconciliation is idempotent, so the first Released state
-    /// wins and the replacement attempt can reserve independently.
-    pub(super) async fn release_plan_usage_cost_for_retry(
-        &mut self,
-        state: &AppState,
-    ) -> Result<(), GatewayError> {
-        if self.upstream_request_state.may_have_reached_provider()
-            && self.provider_outcome.is_none()
-        {
-            return Err(GatewayError::Internal(
-                "cannot release an unresolved plan cost reservation after the upstream request may have been sent"
-                    .to_string(),
-            ));
-        }
-        let Some(reservation) = self.plan_usage_cost_reservation.take() else {
-            return Ok(());
-        };
-        let release = release_responses_plan_usage_cost(
-            state,
-            &reservation.control_decision,
-            self.lifecycle.plan(),
-            reservation.reservation_token.as_str(),
-            "transparent_retry",
-        )
-        .await;
-        if release.is_err() {
-            self.plan_usage_cost_reservation = Some(reservation);
-        }
-        release
-    }
-
-    /// A transparent replacement failed before its request reached an
-    /// upstream. No terminal usage event can safely own the still-reserved
-    /// estimate, so release it explicitly before the orphan attempt is
-    /// finalized or dropped.
+    /// Release the reservation when this turn fails before sending upstream.
+    /// A transparent replacement leaves this to the original terminal usage
+    /// until its own request enters the upstream writer.
     pub(super) async fn release_plan_usage_cost_before_upstream_send(
         &mut self,
         state: &AppState,
@@ -974,6 +990,7 @@ impl ResponsesProviderAttempt {
                     UpstreamRequestState::NotStarted
                 );
                 self.upstream_request_state = state;
+                self.owns_terminal_usage = true;
                 self.started_at = Instant::now();
                 self.provider_request_started_at_unix_ms = current_unix_ms();
                 self.provider_request_order_id = uuid::Uuid::now_v7().to_string();
@@ -1000,17 +1017,20 @@ impl ResponsesProviderAttempt {
     }
 
     pub(super) fn deadline(&self) -> ResponsesWebSocketTurnDeadline {
-        let (phase, timeout) = if self.first_event_elapsed_ms.is_some() {
-            (
-                ResponsesWebSocketTurnTimeoutPhase::AwaitingTerminal,
-                self.terminal_timeout,
-            )
-        } else {
-            (
-                ResponsesWebSocketTurnTimeoutPhase::AwaitingFirstEvent,
-                self.first_event_timeout.min(self.terminal_timeout),
-            )
-        };
+        let (phase, timeout) =
+            if self.first_event_elapsed_ms.is_some() || self.first_event_timeout.is_none() {
+                (
+                    ResponsesWebSocketTurnTimeoutPhase::AwaitingTerminal,
+                    self.terminal_timeout,
+                )
+            } else {
+                (
+                    ResponsesWebSocketTurnTimeoutPhase::AwaitingFirstEvent,
+                    self.first_event_timeout
+                        .expect("first event deadline enabled")
+                        .min(self.terminal_timeout),
+                )
+            };
         ResponsesWebSocketTurnDeadline {
             phase,
             deadline: self.started_at + timeout,
@@ -1104,8 +1124,13 @@ impl ResponsesProviderAttempt {
     }
 
     pub(super) fn capture_client_frame(&mut self, event: &Value) {
+        self.first_client_event_at.get_or_insert_with(Instant::now);
         self.client_capture
             .append(&websocket_event_as_sse_line(event));
+    }
+
+    pub(super) fn record_request_finished(&mut self) {
+        self.request_finished_at.get_or_insert_with(Instant::now);
     }
 
     pub(super) async fn mark_stream_started(&mut self, state: &AppState) {
@@ -1123,7 +1148,12 @@ impl ResponsesProviderAttempt {
     /// 之后的四段记账（usage terminal → candidate terminal → provider 效果 →
     /// execution report）由共享的 [`ExecutionAttemptLifecycle::settle`] 负责，
     /// 这里只提供 WS 观察到的终态事实。
-    async fn settle(mut self, state: &AppState, outcome: ResponsesWebSocketTurnOutcome) {
+    async fn settle(
+        mut self,
+        state: &AppState,
+        outcome: ResponsesWebSocketTurnOutcome,
+        usage_finalization: AttemptUsageFinalization,
+    ) -> Option<DeferredAttemptUsage> {
         let facts = attempt_facts_for_outcome(self.provider_outcome, self.client_delivery, outcome);
         if self.upstream_request_state.may_have_reached_provider()
             && !facts.provider.is_terminal()
@@ -1142,6 +1172,11 @@ impl ResponsesProviderAttempt {
         }
         let summary = self.finish_summary(facts);
         let telemetry = self.telemetry();
+        let usage_timing = AttemptUsageTiming {
+            request_started_at: self.request_started_at,
+            first_client_event_at: self.first_client_event_at,
+            finished_at: self.request_finished_at.unwrap_or_else(Instant::now),
+        };
         let terminal_error_body = self.terminal_error_body.take();
 
         // 终态载荷完整了才释放准入：usage/审计写入期间不再占着 gateway/供应商容量。
@@ -1164,14 +1199,16 @@ impl ResponsesProviderAttempt {
                     facts,
                     terminal_summary: summary,
                     telemetry,
+                    usage_timing,
                     provider_headers: std::mem::take(&mut self.provider_headers),
                     provider_body: &self.provider_capture,
                     client_body: &self.client_capture,
                     provider_error_body: terminal_error_body.as_deref(),
                     reason: facts.reason(),
                 },
+                usage_finalization,
             )
-            .await;
+            .await
     }
 
     fn capture_sse_event(&mut self, event: &Value) {
@@ -1213,9 +1250,12 @@ impl ResponsesProviderAttempt {
     }
 
     fn telemetry(&self) -> ExecutionTelemetry {
+        let sampled_at = self.request_finished_at.unwrap_or_else(Instant::now);
         ExecutionTelemetry {
             ttfb_ms: self.first_event_elapsed_ms,
-            elapsed_ms: Some(elapsed_ms(self.started_at)),
+            elapsed_ms: Some(duration_ms(
+                sampled_at.saturating_duration_since(self.started_at),
+            )),
             upstream_bytes: Some(self.upstream_bytes),
         }
     }
@@ -1231,8 +1271,23 @@ impl ResponsesProviderAttempt {
         state: &AppState,
         outcome: ResponsesWebSocketTurnOutcome,
     ) {
+        self.record_request_finished();
         self.release_admission().await;
-        self.settle(state, outcome).await;
+        let usage_finalization = if self.owns_terminal_usage {
+            AttemptUsageFinalization::Record
+        } else {
+            AttemptUsageFinalization::CandidateOnly
+        };
+        self.settle(state, outcome, usage_finalization).await;
+    }
+
+    pub(super) async fn finalize_for_quota_retry(
+        self,
+        state: &AppState,
+        outcome: ResponsesWebSocketTurnOutcome,
+    ) -> Option<DeferredAttemptUsage> {
+        self.settle(state, outcome, AttemptUsageFinalization::DeferQuota)
+            .await
     }
 }
 
@@ -1376,10 +1431,9 @@ fn provider_terminal_outcome(
 
 fn resolve_responses_websocket_turn_timeouts(
     timeouts: Option<&ExecutionTimeouts>,
-) -> (Duration, Duration) {
+) -> (Option<Duration>, Duration) {
     let first_event_timeout_ms = timeouts
         .and_then(|timeouts| timeouts.first_byte_ms)
-        .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_WEBSOCKET_FIRST_EVENT_TIMEOUT_MS)
         .min(MAX_EXECUTION_STREAM_FIRST_BYTE_TIMEOUT_MS);
     let terminal_timeout_ms = timeouts
@@ -1388,7 +1442,7 @@ fn resolve_responses_websocket_turn_timeouts(
         .unwrap_or(MAX_EXECUTION_REQUEST_TIMEOUT_MS)
         .min(MAX_EXECUTION_REQUEST_TIMEOUT_MS);
     (
-        Duration::from_millis(first_event_timeout_ms),
+        (first_event_timeout_ms > 0).then(|| Duration::from_millis(first_event_timeout_ms)),
         Duration::from_millis(terminal_timeout_ms),
     )
 }
@@ -1408,7 +1462,11 @@ fn websocket_event_as_sse_line(event: &Value) -> Vec<u8> {
 }
 
 fn elapsed_ms(started_at: Instant) -> u64 {
-    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    duration_ms(started_at.elapsed())
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]
@@ -1941,8 +1999,24 @@ mod tests {
                 ..ExecutionTimeouts::default()
             }));
 
-        assert_eq!(first_event, Duration::from_millis(12_345));
+        assert_eq!(first_event, Some(Duration::from_millis(12_345)));
         assert_eq!(terminal, Duration::from_millis(67_890));
+    }
+
+    #[test]
+    fn turn_timeouts_disable_only_explicit_zero_first_byte_limit() {
+        let (first_event, terminal) =
+            resolve_responses_websocket_turn_timeouts(Some(&ExecutionTimeouts {
+                first_byte_ms: Some(0),
+                total_ms: Some(67_890),
+                ..ExecutionTimeouts::default()
+            }));
+        assert_eq!(first_event, None);
+        assert_eq!(terminal, Duration::from_millis(67_890));
+        assert_eq!(
+            resolve_responses_websocket_turn_timeouts(None).0,
+            Some(Duration::from_secs(30))
+        );
     }
 
     #[test]

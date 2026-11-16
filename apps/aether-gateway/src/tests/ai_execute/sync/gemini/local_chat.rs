@@ -420,6 +420,7 @@ async fn gateway_executes_gemini_chat_sync_via_local_decision_gate_with_local_sy
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
 
@@ -462,7 +463,7 @@ async fn gateway_executes_gemini_chat_sync_via_local_decision_gate_with_local_sy
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-gemini-chat-local-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -770,6 +771,7 @@ async fn gateway_returns_gemini_chat_error_for_local_sync_failure_impl() {
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
@@ -791,7 +793,7 @@ async fn gateway_returns_gemini_chat_error_for_local_sync_failure_impl() {
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-gemini-chat-local-error-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);

@@ -197,7 +197,7 @@ pub fn incoming_usage_can_recover_terminal_failure(
     incoming_status: &str,
     incoming_billing_status: &str,
 ) -> bool {
-    incoming_billing_status == "pending" && incoming_status == "completed"
+    incoming_billing_status == "pending" && matches!(incoming_status, "completed" | "failed")
 }
 
 pub fn usage_can_recover_terminal_failure(

@@ -8,3 +8,4 @@ description = "Gateway control-plane request context and HTTP-neutral DTO bounda
 
 [dependencies]
 http.workspace = true
+uuid.workspace = true

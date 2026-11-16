@@ -232,8 +232,18 @@ async fn admin_monitoring_trace_request_resolves_usage_request_id_to_metadata_tr
 }
 
 #[tokio::test]
-async fn admin_monitoring_trace_request_falls_back_to_usage_routing_snapshot() {
-    let request_candidates = Arc::new(InMemoryRequestCandidateRepository::default());
+async fn admin_monitoring_trace_request_uses_own_snapshot_when_trace_id_matches_another_request() {
+    let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
+        sample_candidate(
+            "unrelated-candidate",
+            "shared-trace-id",
+            0,
+            RequestCandidateStatus::Success,
+            Some(101),
+            Some(33),
+            Some(200),
+        ),
+    ]));
     let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![sample_provider()],
         vec![sample_endpoint()],
@@ -260,6 +270,7 @@ async fn admin_monitoring_trace_request_falls_back_to_usage_routing_snapshot() {
     usage.error_message = Some("no local stream plans".to_string());
     usage.response_time_ms = Some(45);
     usage.request_metadata = Some(json!({
+        "trace_id": "shared-trace-id",
         "routing_candidate_skip_reason": "provider_request_body_build_failed",
         "routing_failure_diagnostic": {
             "kind": "request_body_build",
@@ -298,6 +309,10 @@ async fn admin_monitoring_trace_request_falls_back_to_usage_routing_snapshot() {
     assert_eq!(payload["total_candidates"], json!(1));
     assert_eq!(payload["final_status"], json!("failed"));
     assert_eq!(payload["candidates"][0]["id"], json!("routing-cand-1"));
+    assert_eq!(
+        payload["candidates"][0]["request_id"],
+        json!("request-usage-snapshot")
+    );
     assert_eq!(payload["candidates"][0]["status"], json!("failed"));
     assert_eq!(
         payload["candidates"][0]["skip_reason"],

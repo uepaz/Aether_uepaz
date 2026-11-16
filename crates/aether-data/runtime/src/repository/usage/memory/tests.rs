@@ -776,6 +776,10 @@ async fn upsert_preserves_routing_group_snapshot_across_terminal_metadata_replac
 async fn upsert_preserves_full_http_captures_across_lifecycle_updates() {
     let repository = InMemoryUsageReadRepository::default();
     let mut pending = sample_upsert_usage_record("req-full-capture");
+    pending.request_metadata = Some(json!({
+        "client_family": "my-agent_2",
+        "client_family_source": "declared"
+    }));
     pending.request_headers =
         Some(json!({"content-type": "application/json", "authorization": "Bearer private"}));
     pending.request_body =
@@ -814,6 +818,11 @@ async fn upsert_preserves_full_http_captures_across_lifecycle_updates() {
     terminal.client_response_body =
         Some(json!({"choices": [{"message": {"content": "client response"}}]}));
     let stored_terminal = repository.upsert(terminal.clone()).await.unwrap();
+    assert_eq!(stored_terminal.client_family.as_deref(), Some("my-agent_2"));
+    assert_eq!(
+        stored_terminal.request_metadata.as_ref().unwrap()["client_family_source"],
+        "declared"
+    );
     assert_eq!(stored_terminal.request_body, pending.request_body);
     assert_eq!(
         stored_terminal.provider_request_body,

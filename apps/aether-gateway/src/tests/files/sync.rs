@@ -248,6 +248,7 @@ async fn gateway_executes_gemini_files_upload_via_local_decision_gate_with_local
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -296,7 +297,7 @@ async fn gateway_executes_gemini_files_upload_via_local_decision_gate_with_local
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-gemini-files-upload-local-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -453,6 +454,7 @@ async fn gateway_executes_gemini_files_list_via_local_decision_gate_with_local_p
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("body should parse");
@@ -464,7 +466,7 @@ async fn gateway_executes_gemini_files_list_via_local_decision_gate_with_local_p
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-gemini-files-list-local-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert!(stored_candidates.is_empty());
@@ -659,6 +661,7 @@ async fn gateway_executes_gemini_files_delete_via_local_decision_gate_with_local
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -685,7 +688,7 @@ async fn gateway_executes_gemini_files_delete_via_local_decision_gate_with_local
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-gemini-files-delete-local-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);

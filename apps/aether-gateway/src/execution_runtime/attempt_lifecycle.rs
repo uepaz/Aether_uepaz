@@ -30,7 +30,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aether_contracts::{ExecutionPlan, ExecutionStreamTerminalSummary, ExecutionTelemetry};
 use aether_data_contracts::repository::candidates::RequestCandidateStatus;
@@ -41,12 +41,14 @@ use aether_usage_runtime::DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES;
 use aether_usage_runtime::{
     build_lifecycle_usage_seed, build_stream_terminal_usage_payload_seed,
     build_terminal_usage_context_seed, stream_report_represents_failure,
+    StreamTerminalUsagePayloadSeed, TerminalUsageContextSeed, UsageProducerGuard, UsageRuntime,
 };
 use base64::Engine as _;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tracing::warn;
 
 use crate::clock::current_unix_ms;
+use crate::data::GatewayDataState;
 use crate::orchestration::{
     apply_local_stream_failure_effects, apply_local_stream_success_effects,
     release_local_pool_key_lease, LocalExecutionEffectContext, LocalStreamFailureEffect,
@@ -475,6 +477,7 @@ pub(crate) struct AttemptLifecycleSeed {
     pub(crate) report_kind: String,
     pub(crate) report_context: Option<Value>,
     pub(crate) stage_guard: AttemptStageGuard,
+    pub(crate) record_pending_usage: bool,
 }
 
 /// 结算一次 attempt 需要的终态事实，由 transport 提供。
@@ -482,6 +485,7 @@ pub(crate) struct AttemptTerminalFactsInput<'a> {
     pub(crate) facts: AttemptTerminalFacts,
     pub(crate) terminal_summary: ExecutionStreamTerminalSummary,
     pub(crate) telemetry: ExecutionTelemetry,
+    pub(crate) usage_timing: AttemptUsageTiming,
     pub(crate) provider_headers: BTreeMap<String, String>,
     pub(crate) provider_body: &'a AttemptBodyCapture,
     pub(crate) client_body: &'a AttemptBodyCapture,
@@ -490,6 +494,99 @@ pub(crate) struct AttemptTerminalFactsInput<'a> {
     pub(crate) provider_error_body: Option<&'a str>,
     /// 人类可读的结算原因，写进 candidate 行。
     pub(crate) reason: &'a str,
+}
+
+pub(crate) struct AttemptUsageTiming {
+    pub(crate) request_started_at: Instant,
+    pub(crate) first_client_event_at: Option<Instant>,
+    pub(crate) finished_at: Instant,
+}
+
+pub(crate) enum AttemptUsageFinalization {
+    Record,
+    DeferQuota,
+    CandidateOnly,
+}
+
+struct TerminalAttemptUsage {
+    runtime: Arc<UsageRuntime>,
+    data: Arc<GatewayDataState>,
+    producer: UsageProducerGuard,
+    context: TerminalUsageContextSeed,
+    payload: StreamTerminalUsagePayloadSeed,
+    billing_void: bool,
+    timing: AttemptUsageTiming,
+}
+
+impl TerminalAttemptUsage {
+    async fn record(mut self) {
+        let metadata = self
+            .context
+            .request_metadata
+            .get_or_insert_with(|| Value::Object(Map::new()));
+        if let Some(metadata) = metadata.as_object_mut() {
+            let elapsed = |at: Instant| {
+                at.saturating_duration_since(self.timing.request_started_at)
+                    .as_millis() as u64
+            };
+            metadata.insert(
+                "end_to_end_time_ms".into(),
+                Value::from(elapsed(self.timing.finished_at)),
+            );
+            if let Some(first) = self.timing.first_client_event_at {
+                metadata.insert(
+                    "end_to_end_first_byte_time_ms".into(),
+                    Value::from(elapsed(first)),
+                );
+            }
+        }
+        let _producer = self.producer;
+        self.runtime
+            .record_stream_terminal(
+                self.data.as_ref(),
+                self.context,
+                self.payload,
+                self.billing_void,
+            )
+            .await;
+    }
+}
+
+/// Holds the original terminal usage write while a transparent retry is planned.
+/// If no replacement takes ownership (including on cancellation), persist it.
+pub(crate) struct DeferredAttemptUsage {
+    write: Option<Box<TerminalAttemptUsage>>,
+    permits_replay: bool,
+}
+
+impl DeferredAttemptUsage {
+    pub(crate) fn permits_replay(&self) -> bool {
+        self.permits_replay
+    }
+
+    pub(crate) fn record_client_event(&mut self) {
+        if let Some(write) = self.write.as_mut() {
+            write
+                .timing
+                .first_client_event_at
+                .get_or_insert_with(Instant::now);
+        }
+    }
+
+    pub(crate) fn hand_off(mut self) {
+        drop(self.write.take());
+    }
+}
+
+impl Drop for DeferredAttemptUsage {
+    fn drop(&mut self) {
+        if let (Some(mut write), Ok(runtime)) =
+            (self.write.take(), tokio::runtime::Handle::try_current())
+        {
+            write.timing.finished_at = Instant::now();
+            runtime.spawn(write.record());
+        }
+    }
 }
 
 /// 一次 provider attempt 的记账生命周期：pending → started → terminal。
@@ -504,7 +601,8 @@ pub(crate) struct ExecutionAttemptLifecycle {
 }
 
 impl ExecutionAttemptLifecycle {
-    /// 写 Pending usage 行 + Pending candidate slot。
+    /// Writes the logical turn's pending usage (on first execution) and the
+    /// current attempt's pending candidate.
     ///
     /// 两个写入都不设上界：此时还没有任何东西可以兜底，行没写成功就等于这次
     /// attempt 不存在。
@@ -514,18 +612,18 @@ impl ExecutionAttemptLifecycle {
             report_kind,
             report_context,
             stage_guard,
+            record_pending_usage,
         } = seed;
 
-        let lifecycle_seed = build_lifecycle_usage_seed(&plan, report_context.as_ref());
-        // Keep every transport on the same lifecycle data path. `AppState` can
-        // dedicate an isolated background database pool to usage writes; using
-        // the foreground state here bypasses that path and leaves the caller
-        // with a different persistence lifecycle.
-        let usage_data = state.usage_lifecycle_data_state().as_ref().clone();
-        state
-            .usage_runtime
-            .record_pending_direct(&usage_data, lifecycle_seed)
-            .await;
+        if record_pending_usage {
+            let lifecycle_seed = build_lifecycle_usage_seed(&plan, report_context.as_ref());
+            // This may be an isolated background database pool for usage writes.
+            let usage_data = state.usage_lifecycle_data_state();
+            state
+                .usage_runtime
+                .record_pending_direct(usage_data.as_ref(), lifecycle_seed)
+                .await;
+        }
 
         let candidate_started_at_unix_ms = current_unix_ms();
         record_local_request_candidate_status(
@@ -544,8 +642,11 @@ impl ExecutionAttemptLifecycle {
         )
         .await;
 
+        let trace_id = super::trace_id_from_report_context(report_context.as_ref(), None)
+            .unwrap_or(plan.request_id.as_str())
+            .to_owned();
         Self {
-            trace_id: plan.request_id.clone(),
+            trace_id,
             plan,
             report_kind,
             report_context,
@@ -622,8 +723,8 @@ impl ExecutionAttemptLifecycle {
 
     /// 终态四段，顺序不可重排：
     ///
-    /// 1. usage terminal —— 这次 attempt 的账单记录。行是以 Pending 建立的，
-    ///    没有别的东西会去对账，所以用 detachable 保证不丢。
+    /// 1. usage terminal —— 普通终态用 detachable 保证不丢。透明重试时保留
+    ///    Pending，由替代 attempt 结算；若无法启动替代，则补写原终态。
     /// 2. candidate terminal —— 调度侧的终态，慢依赖不能让它停在 Streaming。
     /// 3. provider 效果 —— health / adaptive / pool 反馈，次于前两段；超时后
     ///    仍然兜底释放 pool key lease，否则要等 lease TTL 过期才放出这把 key。
@@ -633,11 +734,13 @@ impl ExecutionAttemptLifecycle {
         mut self,
         state: &AppState,
         input: AttemptTerminalFactsInput<'_>,
-    ) -> AttemptSettlement {
+        usage_finalization: AttemptUsageFinalization,
+    ) -> Option<DeferredAttemptUsage> {
         let AttemptTerminalFactsInput {
             facts,
             terminal_summary,
             telemetry,
+            usage_timing,
             provider_headers,
             provider_body,
             client_body,
@@ -668,40 +771,55 @@ impl ExecutionAttemptLifecycle {
         });
 
         // 1. usage terminal
-        let analytics_context = if facts.provider.cancelled_by_provider() {
-            crate::usage::reporting::failure::with_analytics_failure(
-                payload.report_context.as_ref(),
-                "upstream",
-                "stream_read",
-                "provider_cancelled",
-            )
-        } else {
-            crate::usage::reporting::failure::stream_analytics_context(
-                payload.report_context.as_ref(),
-                &payload,
-                facts.delivery.is_aborted() && !facts.provider.is_terminal(),
-            )
-        };
-        let context_seed =
-            build_terminal_usage_context_seed(&self.plan, analytics_context.as_ref());
-        let payload_seed = build_stream_terminal_usage_payload_seed(&payload);
-        let billing_void = settlement.billing.is_void();
-        let usage_runtime = Arc::clone(&state.usage_runtime);
-        let usage_data = Arc::clone(state.usage_lifecycle_data_state());
-        let usage_producer = usage_runtime.track_producer();
-        self.stage_guard
-            .await_detachable_stage(self.trace_id.as_str(), "usage_terminal", async move {
-                let _usage_producer = usage_producer;
-                usage_runtime
-                    .record_stream_terminal(
-                        usage_data.as_ref(),
-                        context_seed,
-                        payload_seed,
-                        billing_void,
+        let deferred_usage =
+            if matches!(usage_finalization, AttemptUsageFinalization::CandidateOnly) {
+                None
+            } else {
+                let analytics_context = if facts.provider.cancelled_by_provider() {
+                    crate::usage::reporting::failure::with_analytics_failure(
+                        payload.report_context.as_ref(),
+                        "upstream",
+                        "stream_read",
+                        "provider_cancelled",
                     )
-                    .await;
-            })
-            .await;
+                } else {
+                    crate::usage::reporting::failure::stream_analytics_context(
+                        payload.report_context.as_ref(),
+                        &payload,
+                        facts.delivery.is_aborted() && !facts.provider.is_terminal(),
+                    )
+                };
+                let write = TerminalAttemptUsage {
+                    runtime: Arc::clone(&state.usage_runtime),
+                    data: Arc::clone(state.usage_lifecycle_data_state()),
+                    producer: state.usage_runtime.track_producer(),
+                    context: build_terminal_usage_context_seed(
+                        &self.plan,
+                        analytics_context.as_ref(),
+                    ),
+                    payload: build_stream_terminal_usage_payload_seed(&payload),
+                    billing_void: settlement.billing.is_void(),
+                    timing: usage_timing,
+                };
+                if matches!(usage_finalization, AttemptUsageFinalization::DeferQuota) {
+                    let permits_replay = !write
+                        .payload
+                        .has_reported_consumption(&write.context.provider_contract);
+                    Some(DeferredAttemptUsage {
+                        write: Some(Box::new(write)),
+                        permits_replay,
+                    })
+                } else {
+                    self.stage_guard
+                        .await_detachable_stage(
+                            self.trace_id.as_str(),
+                            "usage_terminal",
+                            write.record(),
+                        )
+                        .await;
+                    None
+                }
+            };
 
         // 2. candidate terminal
         let (error_type, error_message) = candidate_error_fields(
@@ -821,7 +939,7 @@ impl ExecutionAttemptLifecycle {
             }
         }
 
-        settlement
+        deferred_usage
     }
 }
 

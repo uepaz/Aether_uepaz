@@ -3,9 +3,10 @@ use std::collections::BTreeMap;
 use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_contracts::{ExecutionPlan, ExecutionTelemetry};
 use aether_data_contracts::repository::usage::{
-    UpsertUsageRecord, UsageBodyCaptureState, BILLING_MULTIPLIER_SNAPSHOT_METADATA_KEY,
-    LIVE_SESSION_METADATA_KEY, ROUTING_GROUP_BILLING_MULTIPLIER_METADATA_KEY,
-    ROUTING_GROUP_ID_METADATA_KEY, ROUTING_GROUP_NAME_METADATA_KEY, USAGE_AVAILABLE_METADATA_KEY,
+    project_usage_client_family, UpsertUsageRecord, UsageBodyCaptureState,
+    BILLING_MULTIPLIER_SNAPSHOT_METADATA_KEY, LIVE_SESSION_METADATA_KEY,
+    ROUTING_GROUP_BILLING_MULTIPLIER_METADATA_KEY, ROUTING_GROUP_ID_METADATA_KEY,
+    ROUTING_GROUP_NAME_METADATA_KEY, USAGE_AVAILABLE_METADATA_KEY,
     USAGE_PRICING_AVAILABLE_METADATA_KEY, WEBSOCKET_MODE_METADATA_KEY,
     WEBSOCKET_TRANSPORT_METADATA_KEY,
 };
@@ -190,6 +191,36 @@ pub struct StreamTerminalUsagePayloadSeed {
     pub observed_stream_finish: Option<bool>,
     pub terminal_error_message: Option<String>,
     pub capture_metadata: Option<Value>,
+}
+
+impl StreamTerminalUsagePayloadSeed {
+    fn captured_usage(&self, provider_contract: &str) -> Option<StandardizedUsage> {
+        self.provider_response_full
+            .as_ref()
+            .map(|response| map_usage_from_response(response, provider_contract))
+    }
+
+    /// Settlement can obtain usage from either the stream summary or the
+    /// captured body. Consider both before discarding a rejected attempt.
+    pub fn has_reported_consumption(&self, provider_contract: &str) -> bool {
+        let has_consumption = |usage: &StandardizedUsage| {
+            usage_source_is_reported(usage, "reported")
+                && (reported_usage_snapshot(Some(usage), "reported").is_some()
+                    || usage.reasoning_tokens > 0
+                    || usage.cache_storage_token_hours > 0.0
+                    || usage
+                        .dimensions
+                        .values()
+                        .any(|value| value.as_f64().is_none_or(|amount| amount > 0.0)))
+        };
+        self.standardized_usage
+            .as_ref()
+            .is_some_and(has_consumption)
+            || self
+                .captured_usage(provider_contract)
+                .as_ref()
+                .is_some_and(has_consumption)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -714,6 +745,27 @@ fn build_terminal_usage_event_from_seed_impl(
         .filter(|response_body| response_body.is_object())
         .map(|response_body| map_usage_from_response(response_body, provider_contract.as_str()))
         .filter(StandardizedUsage::has_token_signal);
+    let reported_primary = standardized_usage
+        .as_ref()
+        .filter(|usage| usage_source_is_reported(usage, token_measurement_source));
+    let reported_candidate = derived_standardized_usage.as_ref().filter(|usage| {
+        usage_source_is_reported(
+            usage,
+            if token_measurement_source == "estimated" {
+                "estimated"
+            } else {
+                "reported"
+            },
+        )
+    });
+    let reported_source = match (reported_primary, reported_candidate) {
+        (Some(primary), Some(candidate)) if candidate.is_more_complete_than(primary) => {
+            Some(candidate)
+        }
+        (Some(primary), _) => Some(primary),
+        (None, candidate) => candidate,
+    };
+    let reported_usage = reported_usage_snapshot(reported_source, "reported");
     let standardized_usage =
         StandardizedUsage::choose_more_complete(standardized_usage, derived_standardized_usage);
     let request_metadata = if trusted_request_metadata {
@@ -799,16 +851,30 @@ fn build_terminal_usage_event_from_seed_impl(
         ..UsageEventData::default()
     };
 
+    // Rebuild financial evidence from upstream data. Neither report_context nor audit metadata
+    // may inject it, even when their ordinary capture fields are trusted by the caller.
+    let mut metadata = data
+        .request_metadata
+        .take()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    metadata.remove(aether_data_contracts::repository::usage::REPORTED_USAGE_METADATA_KEY);
+    if let Some(usage) = reported_usage {
+        metadata.insert(
+            aether_data_contracts::repository::usage::REPORTED_USAGE_METADATA_KEY.into(),
+            serde_json::to_value(usage).expect("reported usage serializes"),
+        );
+    }
+    data.request_metadata = (!metadata.is_empty()).then_some(Value::Object(metadata));
+
     if let Some(usage) = standardized_usage.as_ref() {
         apply_standardized_usage_seed(usage, &mut data, token_measurement_source);
     }
 
     if data.total_tokens.is_none() {
-        if let Some(tokens) = data
-            .response_body
-            .as_ref()
-            .and_then(extract_token_counts_from_value)
-        {
+        if let Some(tokens) = data.response_body.as_ref().and_then(|body| {
+            extract_token_counts_from_value(body, data.endpoint_api_format.as_deref())
+        }) {
             data.input_tokens = Some(tokens.0);
             mark_analytics_measurement(&mut data, token_measurement_source);
             data.output_tokens = Some(tokens.1);
@@ -1164,9 +1230,13 @@ fn merge_standardized_usage_with_context_cache(
 
 pub fn build_stream_terminal_usage_seed(
     context_seed: TerminalUsageContextSeed,
-    payload_seed: StreamTerminalUsagePayloadSeed,
+    mut payload_seed: StreamTerminalUsagePayloadSeed,
     cancelled: bool,
 ) -> TerminalUsageSeed {
+    if payload_seed.standardized_usage.is_none() {
+        payload_seed.standardized_usage =
+            payload_seed.captured_usage(&context_seed.provider_contract);
+    }
     let StreamTerminalUsagePayloadSeed {
         report_kind,
         status_code,
@@ -1184,11 +1254,6 @@ pub fn build_stream_terminal_usage_seed(
         terminal_error_message,
         capture_metadata,
     } = payload_seed;
-    let standardized_usage = standardized_usage.or_else(|| {
-        provider_response_full.as_ref().map(|response| {
-            map_usage_from_response(response, context_seed.provider_contract.as_str())
-        })
-    });
     let captured_terminal_state = captured_stream_terminal_state(
         report_kind.as_str(),
         context_seed.client_contract.as_str(),
@@ -2244,8 +2309,8 @@ fn build_runtime_request_metadata_seed_from_parts(
     if let Some(client_ip) = context_string(context, "client_ip") {
         metadata.insert("client_ip".to_string(), Value::String(client_ip));
     }
-    if let Some(user_agent) = context_string(context, "user_agent") {
-        metadata.insert("user_agent".to_string(), Value::String(user_agent));
+    if let Some(context) = context {
+        project_usage_client_family(context, &mut metadata);
     }
     if let Some(client_requested_stream) = context_bool(context, "client_requested_stream") {
         metadata.insert(
@@ -2767,6 +2832,33 @@ fn apply_standardized_usage_seed(
     apply_standardized_usage_dimensions_seed(usage, data);
 }
 
+fn reported_usage_snapshot(
+    usage: Option<&StandardizedUsage>,
+    fallback_source: &str,
+) -> Option<aether_data_contracts::repository::usage::ReportedUsage> {
+    let usage = usage?;
+    if !usage_source_is_reported(usage, fallback_source) {
+        return None;
+    }
+    let tokens = aether_data_contracts::repository::usage::ReportedUsage {
+        input_tokens: usage.input_tokens.max(0) as u64,
+        output_tokens: usage.output_tokens.max(0) as u64,
+        cache_creation_tokens: usage.cache_creation_tokens.max(0) as u64,
+        cache_creation_ephemeral_5m_tokens: usage.cache_creation_ephemeral_5m_tokens.max(0) as u64,
+        cache_creation_ephemeral_1h_tokens: usage.cache_creation_ephemeral_1h_tokens.max(0) as u64,
+        cache_read_tokens: usage.cache_read_tokens.max(0) as u64,
+    };
+    tokens.has_tokens().then_some(tokens)
+}
+
+fn usage_source_is_reported(usage: &StandardizedUsage, fallback_source: &str) -> bool {
+    usage
+        .token_source
+        .map(|source| source.as_str())
+        .unwrap_or(fallback_source)
+        == "reported"
+}
+
 fn apply_standardized_usage_dimensions_seed(usage: &StandardizedUsage, data: &mut UsageEventData) {
     if usage.dimensions.is_empty() && usage.request_count <= 0 {
         return;
@@ -3199,14 +3291,17 @@ fn parse_sse_body_for_storage(text: &str) -> Option<Value> {
     }))
 }
 
-fn extract_token_counts_from_sse_text(text: &str) -> Option<(u64, u64, u64)> {
+fn extract_token_counts_from_sse_text(
+    text: &str,
+    api_format: Option<&str>,
+) -> Option<(u64, u64, u64)> {
     let mut last_seen = None;
     for_each_sse_payload(text, |payload| {
         if payload == "[DONE]" {
             return;
         }
         if let Ok(json_body) = serde_json::from_str::<Value>(payload) {
-            if let Some(tokens) = extract_token_counts_from_json(&json_body) {
+            if let Some(tokens) = extract_token_counts_from_json(&json_body, api_format) {
                 last_seen = Some(tokens);
             }
         }
@@ -3214,10 +3309,13 @@ fn extract_token_counts_from_sse_text(text: &str) -> Option<(u64, u64, u64)> {
     last_seen
 }
 
-fn extract_token_counts_from_value(value: &Value) -> Option<(u64, u64, u64)> {
+fn extract_token_counts_from_value(
+    value: &Value,
+    api_format: Option<&str>,
+) -> Option<(u64, u64, u64)> {
     match value {
-        Value::String(text) => extract_token_counts_from_sse_text(text),
-        _ => extract_token_counts_from_json(value),
+        Value::String(text) => extract_token_counts_from_sse_text(text, api_format),
+        _ => extract_token_counts_from_json(value, api_format),
     }
 }
 
@@ -3229,7 +3327,7 @@ fn apply_completed_image_usage_estimate(data: &mut UsageEventData) {
     if data
         .response_body
         .as_ref()
-        .and_then(extract_token_counts_from_value)
+        .and_then(|body| extract_token_counts_from_value(body, data.endpoint_api_format.as_deref()))
         .is_some()
     {
         return;
@@ -3572,16 +3670,25 @@ fn estimate_text_tokens(text: &str) -> u64 {
     }
 }
 
-fn extract_token_counts_from_json(value: &Value) -> Option<(u64, u64, u64)> {
+fn extract_token_counts_from_json(
+    value: &Value,
+    api_format: Option<&str>,
+) -> Option<(u64, u64, u64)> {
     if let Some(usage) = value.get("usage").and_then(Value::as_object) {
-        let input = usage
-            .get("input_tokens")
-            .or_else(|| usage.get("prompt_tokens"))
+        use aether_ai_formats::formats::openai::usage::OpenAiUsageFormat;
+        let format = if api_format.and_then(aether_ai_formats::FormatId::parse)
+            == Some(aether_ai_formats::FormatId::OpenAiChat)
+        {
+            OpenAiUsageFormat::Chat
+        } else {
+            OpenAiUsageFormat::Responses
+        };
+        let input = format
+            .input_tokens(usage)
             .and_then(Value::as_u64)
             .unwrap_or_default();
-        let output = usage
-            .get("output_tokens")
-            .or_else(|| usage.get("completion_tokens"))
+        let output = format
+            .output_tokens(usage)
             .and_then(Value::as_u64)
             .unwrap_or_default();
         let reasoning = usage
@@ -3620,13 +3727,17 @@ fn extract_token_counts_from_json(value: &Value) -> Option<(u64, u64, u64)> {
     }
 
     if let Some(chunks) = value.get("chunks").and_then(Value::as_array) {
-        if let Some(tokens) = chunks.iter().rev().find_map(extract_token_counts_from_json) {
+        if let Some(tokens) = chunks
+            .iter()
+            .rev()
+            .find_map(|chunk| extract_token_counts_from_json(chunk, api_format))
+        {
             return Some(tokens);
         }
     }
 
     if let Some(response) = value.get("response") {
-        return extract_token_counts_from_json(response);
+        return extract_token_counts_from_json(response, api_format);
     }
 
     None
@@ -3666,13 +3777,16 @@ mod tests {
 
     #[test]
     fn extracts_openai_usage_tokens() {
-        let tokens = extract_token_counts_from_json(&json!({
-            "usage": {
-                "input_tokens": 3,
-                "output_tokens": 5,
-                "total_tokens": 8
-            }
-        }))
+        let tokens = extract_token_counts_from_json(
+            &json!({
+                "usage": {
+                    "input_tokens": 3,
+                    "output_tokens": 5,
+                    "total_tokens": 8
+                }
+            }),
+            Some("openai:responses"),
+        )
         .expect("tokens should exist");
 
         assert_eq!(tokens, (3, 5, 8));
@@ -3680,17 +3794,20 @@ mod tests {
 
     #[test]
     fn extracts_openai_usage_tokens_with_cache_components() {
-        let tokens = extract_token_counts_from_json(&json!({
-            "usage": {
-                "input_tokens": 3,
-                "output_tokens": 5,
-                "total_tokens": 8,
-                "input_tokens_details": {
-                    "cached_tokens": 2,
-                    "cached_creation_tokens": 1
+        let tokens = extract_token_counts_from_json(
+            &json!({
+                "usage": {
+                    "input_tokens": 3,
+                    "output_tokens": 5,
+                    "total_tokens": 8,
+                    "input_tokens_details": {
+                        "cached_tokens": 2,
+                        "cached_creation_tokens": 1
+                    }
                 }
-            }
-        }))
+            }),
+            Some("openai:responses"),
+        )
         .expect("tokens should exist");
 
         assert_eq!(tokens, (3, 5, 8));
@@ -3698,17 +3815,20 @@ mod tests {
 
     #[test]
     fn extracts_openai_usage_tokens_with_prompt_token_details() {
-        let tokens = extract_token_counts_from_json(&json!({
-            "usage": {
-                "prompt_tokens": 3,
-                "completion_tokens": 5,
-                "total_tokens": 8,
-                "prompt_tokens_details": {
-                    "cached_tokens": 2,
-                    "cached_creation_tokens": 1
+        let tokens = extract_token_counts_from_json(
+            &json!({
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 5,
+                    "total_tokens": 8,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 2,
+                        "cached_creation_tokens": 1
+                    }
                 }
-            }
-        }))
+            }),
+            Some("openai:chat"),
+        )
         .expect("tokens should exist");
 
         assert_eq!(tokens, (3, 5, 8));
@@ -3716,14 +3836,17 @@ mod tests {
 
     #[test]
     fn extracts_claude_usage_tokens_with_cache_components() {
-        let tokens = extract_token_counts_from_json(&json!({
-            "usage": {
-                "input_tokens": 6,
-                "output_tokens": 20,
-                "cache_creation_input_tokens": 41857,
-                "cache_read_input_tokens": 0
-            }
-        }))
+        let tokens = extract_token_counts_from_json(
+            &json!({
+                "usage": {
+                    "input_tokens": 6,
+                    "output_tokens": 20,
+                    "cache_creation_input_tokens": 41857,
+                    "cache_read_input_tokens": 0
+                }
+            }),
+            Some("claude:messages"),
+        )
         .expect("tokens should exist");
 
         assert_eq!(tokens, (6, 20, 26));
@@ -3731,14 +3854,17 @@ mod tests {
 
     #[test]
     fn extracts_gemini_usage_tokens_without_adding_cached_content_twice() {
-        let tokens = extract_token_counts_from_json(&json!({
-            "usageMetadata": {
-                "promptTokenCount": 14,
-                "candidatesTokenCount": 6,
-                "cachedContentTokenCount": 2,
-                "totalTokenCount": 20
-            }
-        }))
+        let tokens = extract_token_counts_from_json(
+            &json!({
+                "usageMetadata": {
+                    "promptTokenCount": 14,
+                    "candidatesTokenCount": 6,
+                    "cachedContentTokenCount": 2,
+                    "totalTokenCount": 20
+                }
+            }),
+            Some("gemini:generate_content"),
+        )
         .expect("tokens should exist");
 
         assert_eq!(tokens, (14, 6, 20));
@@ -3746,35 +3872,60 @@ mod tests {
 
     #[test]
     fn extracts_usage_tokens_from_last_matching_chunk() {
-        let tokens = extract_token_counts_from_json(&json!({
-            "chunks": [
-                {
-                    "response": {
-                        "usage": {
-                            "input_tokens": 1,
-                            "output_tokens": 2,
-                            "total_tokens": 3
+        let tokens = extract_token_counts_from_json(
+            &json!({
+                "chunks": [
+                    {
+                        "response": {
+                            "usage": {
+                                "input_tokens": 1,
+                                "output_tokens": 2,
+                                "total_tokens": 3
+                            }
                         }
-                    }
-                },
-                {
-                    "response": {
-                        "usage": {
-                            "input_tokens": 9,
-                            "output_tokens": 4,
-                            "total_tokens": 13,
-                            "input_tokens_details": {
-                                "cached_tokens": 5,
-                                "cached_creation_tokens": 2
+                    },
+                    {
+                        "response": {
+                            "usage": {
+                                "input_tokens": 9,
+                                "output_tokens": 4,
+                                "total_tokens": 13,
+                                "input_tokens_details": {
+                                    "cached_tokens": 5,
+                                    "cached_creation_tokens": 2
+                                }
                             }
                         }
                     }
-                }
-            ]
-        }))
+                ]
+            }),
+            Some("openai:responses"),
+        )
         .expect("tokens should exist");
 
         assert_eq!(tokens, (9, 4, 13));
+    }
+
+    #[test]
+    fn captured_chat_usage_ignores_zero_responses_aliases() {
+        let raw = json!({"usage": {
+            "prompt_tokens": 3197, "completion_tokens": 1034, "total_tokens": 4231,
+            "input_tokens": 0, "output_tokens": 0,
+        }});
+        for capture in [
+            raw.clone(),
+            json!({"chunks": [raw.clone()]}),
+            Value::String(format!("data: {raw}\n\ndata: [DONE]\n\n")),
+        ] {
+            assert_eq!(
+                extract_token_counts_from_value(&capture, Some("openai:chat")),
+                Some((3197, 1034, 4231))
+            );
+            assert_eq!(
+                extract_token_counts_from_value(&capture, Some("openai:responses")),
+                Some((0, 0, 4231))
+            );
+        }
     }
 
     #[test]
@@ -4815,6 +4966,174 @@ mod tests {
         assert_eq!(event.data.total_tokens, Some(34));
         assert_eq!(event.data.cache_creation_input_tokens, Some(2));
         assert_eq!(event.data.cache_read_input_tokens, Some(3));
+    }
+
+    #[test]
+    fn failed_stream_billing_uses_upstream_summary_not_forged_metadata_or_estimates() {
+        let plan = ExecutionPlan {
+            request_id: "failed-reported-usage".into(),
+            candidate_id: None,
+            provider_name: Some("Claude".into()),
+            provider_id: "provider-1".into(),
+            endpoint_id: "endpoint-1".into(),
+            key_id: "key-1".into(),
+            method: "POST".into(),
+            url: "https://example.com/v1/messages".into(),
+            headers: BTreeMap::new(),
+            content_type: None,
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"model":"model", "stream":true})),
+            stream: true,
+            client_api_format: "openai:responses".into(),
+            provider_api_format: "claude:messages".into(),
+            model_name: Some("model".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        for source in [
+            None,
+            Some(aether_contracts::UsageTokenSource::Estimated),
+            Some(aether_contracts::UsageTokenSource::Mixed),
+        ] {
+            let usage = StandardizedUsage {
+                token_source: source,
+                cache_read_tokens: 1000,
+                ..StandardizedUsage::new()
+            };
+            let payload = GatewayStreamReportRequest {
+                trace_id: "failed-reported".into(),
+                report_kind: "claude_cli_stream_failed".into(),
+                report_context: Some(
+                    json!({"reported_usage":{"input_tokens":999999}, "analytics_measurement":{"source":"reported"}}),
+                ),
+                status_code: 502,
+                headers: BTreeMap::new(),
+                provider_body_base64: None,
+                provider_body_state: Some(UsageBodyCaptureState::Disabled),
+                client_body_base64: None,
+                client_body_state: Some(UsageBodyCaptureState::None),
+                terminal_summary: Some(ExecutionStreamTerminalSummary {
+                    standardized_usage: Some(usage),
+                    observed_finish: false,
+                    ..ExecutionStreamTerminalSummary::default()
+                }),
+                telemetry: None,
+            };
+            let event =
+                build_stream_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
+                    .unwrap();
+            assert_eq!(event.event_type, UsageEventType::Failed);
+            let measured = aether_data_contracts::repository::usage::reported_usage(
+                event.data.request_metadata.as_ref(),
+            );
+            let record = build_upsert_usage_record_from_event(&event).unwrap();
+            if source.is_none() {
+                let measured = measured.expect(
+                    "upstream cache-only usage is billable even with body capture disabled",
+                );
+                assert_eq!(measured.cache_read_tokens, 1000);
+                assert_eq!(measured.input_tokens, 0);
+                assert_eq!(record.billing_status, "pending");
+            } else {
+                assert_eq!(measured, None);
+                assert_eq!(record.billing_status, "void");
+            }
+        }
+    }
+
+    #[test]
+    fn chat_protocol_usage_reaches_records_and_billing_despite_zero_aliases() {
+        use aether_ai_formats::formats::shared::stream_core::StreamingStandardTerminalObserver;
+
+        let plan = ExecutionPlan {
+            request_id: "chat-usage-priority".into(),
+            candidate_id: None,
+            provider_name: Some("custom".into()),
+            provider_id: "provider-1".into(),
+            endpoint_id: "endpoint-1".into(),
+            key_id: "key-1".into(),
+            method: "POST".into(),
+            url: "https://example.com/v1/chat/completions".into(),
+            headers: BTreeMap::new(),
+            content_type: None,
+            content_encoding: None,
+            body: RequestBody::from_json(json!({"model":"gemini-test", "stream":true})),
+            stream: true,
+            client_api_format: "claude:messages".into(),
+            provider_api_format: "openai:chat".into(),
+            model_name: Some("gemini-test".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let context =
+            json!({"provider_api_format":"openai:chat", "client_api_format":"claude:messages"});
+        let events = [
+            json!({"id":"chatcmpl_usage", "model":"gemini-test", "choices":[
+                {"index":0, "delta":{"content":"ok"}, "finish_reason":"stop"}]}),
+            json!({"id":"chatcmpl_usage", "model":"gemini-test", "choices":[], "usage":{
+                "prompt_tokens":3197, "completion_tokens":1034, "total_tokens":4231,
+                "input_tokens":0, "output_tokens":0,
+            }}),
+        ];
+        let mut observer = StreamingStandardTerminalObserver::default();
+        let mut body = String::new();
+        for event in events {
+            let line = format!("data: {event}\n");
+            observer
+                .push_line(&context, line.as_bytes().to_vec())
+                .unwrap();
+            body.push_str(&line);
+            body.push('\n');
+        }
+        body.push_str("data: [DONE]\n\n");
+        let summary = observer.finish(&context).unwrap().unwrap();
+        for capture in [true, false] {
+            for status_code in [200, 502] {
+                let payload = GatewayStreamReportRequest {
+                    trace_id: "chat-usage-priority".into(),
+                    report_kind: if status_code == 200 {
+                        "openai_chat_stream_success"
+                    } else {
+                        "openai_chat_stream_failed"
+                    }
+                    .into(),
+                    report_context: Some(context.clone()),
+                    status_code,
+                    headers: BTreeMap::new(),
+                    provider_body_base64: capture
+                        .then(|| base64::engine::general_purpose::STANDARD.encode(&body)),
+                    provider_body_state: Some(if capture {
+                        UsageBodyCaptureState::Inline
+                    } else {
+                        UsageBodyCaptureState::Disabled
+                    }),
+                    client_body_base64: None,
+                    client_body_state: Some(UsageBodyCaptureState::None),
+                    terminal_summary: Some(summary.clone()),
+                    telemetry: None,
+                };
+                let event =
+                    build_stream_terminal_usage_event(&plan, Some(&context), &payload).unwrap();
+                assert_eq!(
+                    (
+                        event.data.input_tokens,
+                        event.data.output_tokens,
+                        event.data.total_tokens
+                    ),
+                    (Some(3197), Some(1034), Some(4231))
+                );
+                let evidence = aether_data_contracts::repository::usage::reported_usage(
+                    event.data.request_metadata.as_ref(),
+                )
+                .expect("reported usage should be retained for settlement");
+                assert_eq!(
+                    (evidence.input_tokens, evidence.output_tokens),
+                    (3197, 1034)
+                );
+            }
+        }
     }
 
     #[test]
@@ -6820,6 +7139,14 @@ mod tests {
                 .unwrap();
         assert_eq!(mixed.data.output_tokens, Some(17));
         assert_eq!(mixed.data.cache_read_input_tokens, Some(300));
+        let measured = aether_data_contracts::repository::usage::reported_usage(
+            mixed.data.request_metadata.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(measured.output_tokens, 17);
+        assert_eq!(measured.input_tokens, 0);
+        assert_eq!(measured.cache_creation_tokens, 0);
+        assert_eq!(measured.cache_read_tokens, 0);
         assert_eq!(
             mixed.data.request_metadata.as_ref().unwrap()["analytics_measurement"]["source"],
             "mixed"
@@ -6830,6 +7157,12 @@ mod tests {
             build_sync_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
                 .unwrap();
         assert_eq!(native.data.output_tokens, Some(17));
+        assert_eq!(
+            aether_data_contracts::repository::usage::reported_usage(
+                native.data.request_metadata.as_ref()
+            ),
+            None
+        );
         assert_eq!(
             native.data.request_metadata.as_ref().unwrap()["analytics_measurement"]["source"],
             "estimated"
@@ -7454,7 +7787,10 @@ mod tests {
         );
 
         assert_eq!(
-            extract_token_counts_from_value(&Value::String(sse_body.to_string())),
+            extract_token_counts_from_value(
+                &Value::String(sse_body.to_string()),
+                Some("openai:responses")
+            ),
             Some((3, 5, 8)),
         );
     }

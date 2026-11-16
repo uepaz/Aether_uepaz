@@ -117,7 +117,14 @@ impl StreamCommitPolicy {
         match self {
             Self::FirstAnthropicSemanticEvent { max_wait, .. }
             | Self::FirstGeminiSemanticEvent { max_wait, .. }
-            | Self::FirstSseSemanticEvent { max_wait, .. } => Some(max_wait),
+            | Self::FirstSseSemanticEvent { max_wait, .. } => {
+                // 0 与提供商首字预算的含义一致：继续等待语义事件，不启动计时器。
+                if max_wait.is_zero() {
+                    None
+                } else {
+                    Some(max_wait)
+                }
+            }
             Self::ResponseHeaders | Self::FirstClassifiedBody => None,
         }
     }
@@ -327,23 +334,28 @@ fn classify_generic_sse_record(record: &[u8]) -> SemanticSseObservation {
     }
     if matches!(
         payload_type,
-        Some("ping" | "response.created" | "response.in_progress" | "response.queued")
+        Some(
+            "ping"
+                | "heartbeat"
+                | "keepalive"
+                | "response.created"
+                | "response.in_progress"
+                | "response.queued"
+        )
     ) {
+        return SemanticSseObservation::Pending;
+    }
+    if payload_type.is_some_and(|kind| kind.starts_with("response.") && kind.ends_with(".delta"))
+        && !super::first_content::payload_has_content(&body_json, event_type)
+    {
         return SemanticSseObservation::Pending;
     }
     if payload_type == Some("response.output_item.added")
         && matches!(
             body_json.pointer("/item/type").and_then(Value::as_str),
-            Some("message" | "reasoning")
+            Some("message" | "reasoning" | "function_call" | "custom_tool_call")
         )
-        && body_json
-            .pointer("/item/content")
-            .and_then(Value::as_array)
-            .is_none_or(Vec::is_empty)
-        && body_json
-            .pointer("/item/summary")
-            .and_then(Value::as_array)
-            .is_none_or(Vec::is_empty)
+        && !super::first_content::payload_has_content(&body_json, event_type)
     {
         return SemanticSseObservation::Pending;
     }
@@ -363,21 +375,12 @@ fn classify_generic_sse_record(record: &[u8]) -> SemanticSseObservation {
         return SemanticSseObservation::Pending;
     }
     if let Some(choices) = body_json.get("choices").and_then(Value::as_array) {
-        let semantic = choices.iter().any(|choice| {
-            choice
-                .get("finish_reason")
-                .is_some_and(|value| !value.is_null())
-                || choice.get("text").is_some_and(value_has_semantic_content)
-                || choice
-                    .get("delta")
-                    .or_else(|| choice.get("message"))
-                    .and_then(Value::as_object)
-                    .is_some_and(|delta| {
-                        delta.iter().any(|(name, value)| {
-                            name != "role" && value_has_semantic_content(value)
-                        })
-                    })
-        });
+        let semantic = super::first_content::payload_has_content(&body_json, event_type)
+            || choices.iter().any(|choice| {
+                choice
+                    .get("finish_reason")
+                    .is_some_and(|value| !value.is_null())
+            });
         return if semantic {
             SemanticSseObservation::SemanticEvent
         } else {
@@ -536,23 +539,13 @@ fn classify_anthropic_sse_record(record: &[u8]) -> SemanticSseObservation {
         _ => None,
     };
     let setup_only = match semantic_type {
-        Some("message_start") => body_json
-            .pointer("/message/content")
-            .and_then(Value::as_array)
-            .is_none_or(Vec::is_empty),
-        Some("content_block_start") => {
-            let block_type = body_json
-                .pointer("/content_block/type")
-                .and_then(Value::as_str);
-            matches!(block_type, Some("text" | "thinking"))
-                && !body_json
-                    .pointer("/content_block/text")
-                    .is_some_and(value_has_semantic_content)
-                && !body_json
-                    .pointer("/content_block/thinking")
-                    .is_some_and(value_has_semantic_content)
+        Some("message_start" | "content_block_start") => {
+            !super::first_content::payload_has_content(&body_json, event_type)
         }
         Some("content_block_stop") => true,
+        Some("content_block_delta") => {
+            !super::first_content::payload_has_content(&body_json, event_type)
+        }
         Some("message_delta") => body_json
             .pointer("/delta/stop_reason")
             .is_none_or(Value::is_null),
@@ -728,6 +721,20 @@ mod tests {
     }
 
     #[test]
+    fn generic_sse_heartbeat_payloads_and_empty_deltas_do_not_commit() {
+        for chunk in [
+            "data: {\"type\":\"heartbeat\"}\n\n",
+            "data: {\"type\":\"keepalive\"}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"\"}\n\n",
+        ] {
+            let mut gate = super::StreamCommitGate::new(super::StreamCommitPolicy::FirstSseSemanticEvent {
+                max_bytes: 4096, max_wait: std::time::Duration::from_secs(1),
+            });
+            assert_eq!(gate.observe_provider_bytes(chunk.as_bytes()), super::StreamPrecommitObservation::Pending);
+        }
+    }
+
+    #[test]
     fn generic_sse_waits_through_setup_and_classifies_fragmented_errors() {
         let setup = b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n";
         let failure = b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"message\":\"capacity exhausted\"}}}\n\n";
@@ -763,7 +770,7 @@ mod tests {
     fn generic_sse_commits_on_content_or_tool_call_but_not_role() {
         for output in [
             "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call-1\"}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call-1\",\"function\":{\"name\":\"search\"}}]}}]}\n\n",
         ] {
             let mut gate =
                 super::StreamCommitGate::new(super::StreamCommitPolicy::FirstSseSemanticEvent {
@@ -771,6 +778,7 @@ mod tests {
                     max_wait: std::time::Duration::from_secs(1),
                 });
             assert_eq!(gate.observe_provider_bytes(b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n"), super::StreamPrecommitObservation::Pending);
+            assert_eq!(gate.observe_provider_bytes(b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call-1\"}]}}]}\n\n"), super::StreamPrecommitObservation::Pending);
             assert_eq!(
                 gate.observe_provider_bytes(output.as_bytes()),
                 super::StreamPrecommitObservation::Commit

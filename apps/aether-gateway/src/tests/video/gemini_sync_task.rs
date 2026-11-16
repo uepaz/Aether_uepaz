@@ -317,6 +317,7 @@ async fn gateway_executes_gemini_video_cancel_via_data_backed_local_follow_up_wi
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     let response: serde_json::Value = response.json().await.expect("body should parse");
@@ -338,7 +339,7 @@ async fn gateway_executes_gemini_video_cancel_via_data_backed_local_follow_up_wi
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("request-gemini-video-cancel-local-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -582,6 +583,7 @@ async fn gateway_executes_gemini_video_cancel_via_reconstructed_data_backed_loca
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     let response: serde_json::Value = response.json().await.expect("body should parse");
@@ -603,7 +605,7 @@ async fn gateway_executes_gemini_video_cancel_via_reconstructed_data_backed_loca
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("request-gemini-video-cancel-op-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);

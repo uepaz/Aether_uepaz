@@ -10,6 +10,7 @@ use super::{
     StoredProviderCatalogProvider, StoredProviderModelMapping, UsageReadRepository,
     UsageRuntimeConfig, DEVELOPMENT_ENCRYPTION_KEY, TRACE_ID_HEADER,
 };
+use crate::tests::{execution_request_id, response_request_id};
 use aether_data::repository::billing::InMemoryBillingReadRepository;
 use aether_data::repository::wallet::{InMemoryWalletRepository, StoredWalletSnapshot};
 use aether_data_contracts::repository::billing::StoredBillingModelContext;
@@ -813,7 +814,6 @@ async fn gateway_records_openai_sync_usage_and_pricing_with_cache_tokens_impl() 
         cache_read_tokens: 20,
     };
     let payload = json!({
-        "request_id": "trace-openai-usage-pricing-sync-123",
         "status_code": 200,
         "headers": {
             "content-type": "application/json"
@@ -838,9 +838,12 @@ async fn gateway_records_openai_sync_usage_and_pricing_with_cache_tokens_impl() 
     });
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
-        any(move |_request: Request| {
-            let payload = payload.clone();
-            async move { Json(payload) }
+        any(move |request: Request| {
+            let mut payload = payload.clone();
+            async move {
+                payload["request_id"] = json!(execution_request_id(request).await);
+                Json(payload)
+            }
         }),
     );
     let gateway = start_local_billing_gateway(
@@ -865,25 +868,18 @@ async fn gateway_records_openai_sync_usage_and_pricing_with_cache_tokens_impl() 
         .await
         .expect("request should succeed");
 
+    let request_id = response_request_id(response.headers());
     let response_status = response.status();
     let response_text = response.text().await.expect("body should read");
     assert_eq!(response_status, StatusCode::OK, "{response_text}");
     let response_json: Value = serde_json::from_str(&response_text).expect("body should parse");
     assert_eq!(response_json["model"], OPENAI_SPEC.provider_model_name);
 
-    let stored_usage = wait_for_usage_status(
-        gateway.usage_repository.as_ref(),
-        "trace-openai-usage-pricing-sync-123",
-        "completed",
-    )
-    .await;
+    let stored_usage =
+        wait_for_usage_status(gateway.usage_repository.as_ref(), &request_id, "completed").await;
     assert!(!stored_usage.is_stream);
     assert_usage_and_pricing(&stored_usage, expected, 25, None);
-    assert_candidate_success(
-        gateway.request_candidate_repository.as_ref(),
-        "trace-openai-usage-pricing-sync-123",
-    )
-    .await;
+    assert_candidate_success(gateway.request_candidate_repository.as_ref(), &request_id).await;
 
     gateway.shutdown();
 }
@@ -957,25 +953,19 @@ async fn gateway_records_openai_stream_usage_and_pricing_with_cache_tokens_impl(
         .await
         .expect("request should succeed");
 
+    let request_id = response_request_id(response.headers());
+
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         strip_sse_keepalive_comments(&response.text().await.expect("stream body should read")),
         stream_body.concat()
     );
 
-    let stored_usage = wait_for_usage_status(
-        gateway.usage_repository.as_ref(),
-        "trace-openai-usage-pricing-stream-123",
-        "completed",
-    )
-    .await;
+    let stored_usage =
+        wait_for_usage_status(gateway.usage_repository.as_ref(), &request_id, "completed").await;
     assert!(stored_usage.is_stream);
     assert_usage_and_pricing(&stored_usage, expected, 31, Some(11));
-    assert_candidate_success(
-        gateway.request_candidate_repository.as_ref(),
-        "trace-openai-usage-pricing-stream-123",
-    )
-    .await;
+    assert_candidate_success(gateway.request_candidate_repository.as_ref(), &request_id).await;
 
     gateway.shutdown();
 }
@@ -999,7 +989,6 @@ async fn gateway_records_claude_sync_usage_and_pricing_with_cache_breakdown_impl
         cache_read_tokens: 10,
     };
     let payload = json!({
-        "request_id": "trace-claude-usage-pricing-sync-123",
         "status_code": 200,
         "headers": {
             "content-type": "application/json"
@@ -1029,9 +1018,12 @@ async fn gateway_records_claude_sync_usage_and_pricing_with_cache_breakdown_impl
     });
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
-        any(move |_request: Request| {
-            let payload = payload.clone();
-            async move { Json(payload) }
+        any(move |request: Request| {
+            let mut payload = payload.clone();
+            async move {
+                payload["request_id"] = json!(execution_request_id(request).await);
+                Json(payload)
+            }
         }),
     );
     let gateway = start_local_billing_gateway(
@@ -1058,23 +1050,17 @@ async fn gateway_records_claude_sync_usage_and_pricing_with_cache_breakdown_impl
         .await
         .expect("request should succeed");
 
+    let request_id = response_request_id(response.headers());
+
     assert_eq!(response.status(), StatusCode::OK);
     let response_json: Value = response.json().await.expect("body should parse");
     assert_eq!(response_json["model"], CLAUDE_SPEC.provider_model_name);
 
-    let stored_usage = wait_for_usage_status(
-        gateway.usage_repository.as_ref(),
-        "trace-claude-usage-pricing-sync-123",
-        "completed",
-    )
-    .await;
+    let stored_usage =
+        wait_for_usage_status(gateway.usage_repository.as_ref(), &request_id, "completed").await;
     assert!(!stored_usage.is_stream);
     assert_usage_and_pricing(&stored_usage, expected, 29, None);
-    assert_candidate_success(
-        gateway.request_candidate_repository.as_ref(),
-        "trace-claude-usage-pricing-sync-123",
-    )
-    .await;
+    assert_candidate_success(gateway.request_candidate_repository.as_ref(), &request_id).await;
 
     gateway.shutdown();
 }
@@ -1150,25 +1136,19 @@ async fn gateway_records_claude_stream_usage_and_pricing_with_cache_breakdown_im
         .await
         .expect("request should succeed");
 
+    let request_id = response_request_id(response.headers());
+
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         strip_sse_keepalive_comments(&response.text().await.expect("stream body should read")),
         stream_body.concat()
     );
 
-    let stored_usage = wait_for_usage_status(
-        gateway.usage_repository.as_ref(),
-        "trace-claude-usage-pricing-stream-123",
-        "completed",
-    )
-    .await;
+    let stored_usage =
+        wait_for_usage_status(gateway.usage_repository.as_ref(), &request_id, "completed").await;
     assert!(stored_usage.is_stream);
     assert_usage_and_pricing(&stored_usage, expected, 37, Some(13));
-    assert_candidate_success(
-        gateway.request_candidate_repository.as_ref(),
-        "trace-claude-usage-pricing-stream-123",
-    )
-    .await;
+    assert_candidate_success(gateway.request_candidate_repository.as_ref(), &request_id).await;
 
     gateway.shutdown();
 }
@@ -1192,7 +1172,6 @@ async fn gateway_records_gemini_sync_usage_and_pricing_with_cache_read_tokens_im
         cache_read_tokens: 10,
     };
     let payload = json!({
-        "request_id": "trace-gemini-usage-pricing-sync-123",
         "status_code": 200,
         "headers": {
             "content-type": "application/json"
@@ -1219,9 +1198,12 @@ async fn gateway_records_gemini_sync_usage_and_pricing_with_cache_read_tokens_im
     });
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
-        any(move |_request: Request| {
-            let payload = payload.clone();
-            async move { Json(payload) }
+        any(move |request: Request| {
+            let mut payload = payload.clone();
+            async move {
+                payload["request_id"] = json!(execution_request_id(request).await);
+                Json(payload)
+            }
         }),
     );
     let gateway = start_local_billing_gateway(
@@ -1245,6 +1227,8 @@ async fn gateway_records_gemini_sync_usage_and_pricing_with_cache_read_tokens_im
         .await
         .expect("request should succeed");
 
+    let request_id = response_request_id(response.headers());
+
     assert_eq!(response.status(), StatusCode::OK);
     let response_json: Value = response.json().await.expect("body should parse");
     assert_eq!(
@@ -1252,19 +1236,11 @@ async fn gateway_records_gemini_sync_usage_and_pricing_with_cache_read_tokens_im
         expected.cache_read_tokens
     );
 
-    let stored_usage = wait_for_usage_status(
-        gateway.usage_repository.as_ref(),
-        "trace-gemini-usage-pricing-sync-123",
-        "completed",
-    )
-    .await;
+    let stored_usage =
+        wait_for_usage_status(gateway.usage_repository.as_ref(), &request_id, "completed").await;
     assert!(!stored_usage.is_stream);
     assert_usage_and_pricing(&stored_usage, expected, 27, None);
-    assert_candidate_success(
-        gateway.request_candidate_repository.as_ref(),
-        "trace-gemini-usage-pricing-sync-123",
-    )
-    .await;
+    assert_candidate_success(gateway.request_candidate_repository.as_ref(), &request_id).await;
 
     gateway.shutdown();
 }
@@ -1335,25 +1311,19 @@ async fn gateway_records_gemini_stream_usage_and_pricing_with_cache_read_tokens_
         .await
         .expect("request should succeed");
 
+    let request_id = response_request_id(response.headers());
+
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         strip_sse_keepalive_comments(&response.text().await.expect("stream body should read")),
         stream_body.concat()
     );
 
-    let stored_usage = wait_for_usage_status(
-        gateway.usage_repository.as_ref(),
-        "trace-gemini-usage-pricing-stream-123",
-        "completed",
-    )
-    .await;
+    let stored_usage =
+        wait_for_usage_status(gateway.usage_repository.as_ref(), &request_id, "completed").await;
     assert!(stored_usage.is_stream);
     assert_usage_and_pricing(&stored_usage, expected, 33, Some(17));
-    assert_candidate_success(
-        gateway.request_candidate_repository.as_ref(),
-        "trace-gemini-usage-pricing-stream-123",
-    )
-    .await;
+    assert_candidate_success(gateway.request_candidate_repository.as_ref(), &request_id).await;
 
     gateway.shutdown();
 }

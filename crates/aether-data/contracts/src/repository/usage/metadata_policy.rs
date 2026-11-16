@@ -117,6 +117,16 @@ pub fn preserve_usage_routing_group_snapshot(
 
 pub fn sanitize_usage_request_metadata_object(source: &Map<String, Value>) -> Option<Value> {
     let mut target = Map::new();
+    if let Some(usage) = source
+        .get(super::REPORTED_USAGE_METADATA_KEY)
+        .and_then(|value| serde_json::from_value::<super::ReportedUsage>(value.clone()).ok())
+        .filter(super::ReportedUsage::is_valid)
+    {
+        target.insert(
+            super::REPORTED_USAGE_METADATA_KEY.into(),
+            serde_json::to_value(usage).expect("reported usage serializes"),
+        );
+    }
     if let Some(snapshot) = source.get(BILLING_MULTIPLIER_SNAPSHOT_METADATA_KEY) {
         let metadata = serde_json::json!({BILLING_MULTIPLIER_SNAPSHOT_METADATA_KEY: snapshot});
         let snapshot = match billing_multiplier_snapshot(Some(&metadata)) {
@@ -170,7 +180,7 @@ pub fn sanitize_usage_request_metadata_object(source: &Map<String, Value>) -> Op
     insert_token(source, &mut target, ROUTING_GROUP_ID_METADATA_KEY, 128);
     insert_bounded_text(source, &mut target, ROUTING_GROUP_NAME_METADATA_KEY, 256);
     insert_ip_address(source, &mut target, "client_ip");
-    insert_client_family(source, &mut target);
+    project_usage_client_family(source, &mut target);
     for key in [
         "client_requested_stream",
         UPSTREAM_IS_STREAM_KEY,
@@ -354,25 +364,160 @@ fn insert_request_paths(source: &Map<String, Value>, target: &mut Map<String, Va
     insert_owned_string(target, "request_path_and_query", combined);
 }
 
-fn insert_client_family(source: &Map<String, Value>, target: &mut Map<String, Value>) {
-    let value = source
-        .get("client_family")
+pub const USAGE_CLIENT_FAMILY_SOURCE_METADATA_KEY: &str = "client_family_source";
+
+/// Project the inbound client label independently of scheduler session affinity.
+pub fn project_usage_client_family(source: &Map<String, Value>, target: &mut Map<String, Value>) {
+    if let Some(headers) = source.get("original_headers").and_then(Value::as_object) {
+        let user_agent = source.get("user_agent").and_then(Value::as_str);
+        insert_usage_client_family_from_captured_headers(headers, user_agent, target);
+        return;
+    }
+
+    let top_level_family = source.get("client_family").and_then(Value::as_str);
+    if source
+        .get(USAGE_CLIENT_FAMILY_SOURCE_METADATA_KEY)
         .and_then(Value::as_str)
+        == Some("declared")
+    {
+        if let Some(family) = top_level_family.and_then(normalize_declared_client_family) {
+            insert_declared_client_family(target, family);
+            return;
+        }
+    }
+
+    let value = top_level_family
+        .and_then(sanitize_client_family)
         .or_else(|| {
             source
                 .get("client_session_affinity")
                 .and_then(Value::as_object)
                 .and_then(|affinity| affinity.get("client_family"))
                 .and_then(Value::as_str)
+                .and_then(sanitize_client_family)
         })
-        .and_then(sanitize_client_family)
         .or_else(|| {
             source
                 .get("user_agent")
                 .and_then(Value::as_str)
                 .and_then(infer_client_family_from_user_agent)
+                .map(str::to_owned)
         });
     insert_owned_string(target, "client_family", value);
+}
+
+pub fn insert_usage_client_family_from_captured_headers(
+    headers: &Map<String, Value>,
+    user_agent: Option<&str>,
+    target: &mut Map<String, Value>,
+) {
+    insert_usage_client_family_from_headers(
+        target,
+        |name| {
+            headers
+                .get(name)
+                .or_else(|| {
+                    headers
+                        .iter()
+                        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                        .map(|(_, value)| value)
+                })
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    if name == "user-agent" {
+                        user_agent
+                    } else {
+                        None
+                    }
+                })
+        },
+        headers
+            .keys()
+            .any(|name| name.to_ascii_lowercase().starts_with("x-stainless-")),
+    );
+}
+
+pub fn insert_usage_client_family_from_headers<'a>(
+    target: &mut Map<String, Value>,
+    header: impl Fn(&str) -> Option<&'a str>,
+    has_stainless_headers: bool,
+) {
+    if let Some(family) = header("x-aether-client").and_then(normalize_declared_client_family) {
+        insert_declared_client_family(target, family);
+        return;
+    }
+
+    let header = |name| {
+        header(name)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let is_workbuddy = |value: &str| {
+        ["workbuddy", "workbuddy-ai", "workbuddy ai"]
+            .iter()
+            .any(|name| value.eq_ignore_ascii_case(name))
+    };
+    let application = if ["x-ide-name", "x-ide-type", "x-client-name"]
+        .into_iter()
+        .any(|name| header(name).is_some_and(is_workbuddy))
+    {
+        Some("workbuddy")
+    } else if header("x-claude-code-session-id").is_some() {
+        Some("claude_code")
+    } else if header("x-opencode-session-id").is_some() {
+        Some("opencode")
+    } else if header("x-kilo-directory").is_some() || header("x-kilo-workspace").is_some() {
+        Some("kilocode")
+    } else if header("x-dashscope-useragent").and_then(infer_client_family_from_user_agent)
+        == Some("qwen_code")
+    {
+        Some("qwen_code")
+    } else {
+        header("originator").and_then(|value| {
+            match value.split('/').next()?.to_ascii_lowercase().as_str() {
+                "codex" | "codex-cli" | "codex_cli_rs" | "codex_exec" | "codex_work_desktop" => {
+                    Some("codex")
+                }
+                "codex_vscode" => Some("codex_vscode"),
+                "roo-code" | "roocode" => Some("roo_code"),
+                _ => None,
+            }
+        })
+    };
+
+    let user_agent_family = header("user-agent").and_then(infer_client_family_from_user_agent);
+    let family = match (application, user_agent_family) {
+        (Some("codex"), Some("codex_vscode")) => Some("codex_vscode"),
+        (application, user_agent_family) => application.or(user_agent_family),
+    }
+    .or(has_stainless_headers.then_some("sdk"));
+    if let Some(family) = family {
+        target.insert(
+            "client_family".to_string(),
+            Value::String(family.to_string()),
+        );
+    }
+}
+
+fn insert_declared_client_family(target: &mut Map<String, Value>, family: String) {
+    target.insert("client_family".to_string(), Value::String(family));
+    target.insert(
+        USAGE_CLIENT_FAMILY_SOURCE_METADATA_KEY.to_string(),
+        Value::String("declared".to_string()),
+    );
+}
+
+fn normalize_declared_client_family(value: &str) -> Option<String> {
+    let value = value.trim();
+    (value.len() <= 64
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
+    .then(|| value.to_ascii_lowercase())
 }
 
 fn sanitize_client_family(value: &str) -> Option<String> {
@@ -389,8 +534,10 @@ fn sanitize_client_family(value: &str) -> Option<String> {
             "codex_vscode",
             "continue",
             "cursor",
+            "deepseek_harness",
             "gemini_cli",
             "generic",
+            "hermes_agent",
             "kilocode",
             "langchain",
             "llamaindex",
@@ -403,64 +550,79 @@ fn sanitize_client_family(value: &str) -> Option<String> {
             "sdk",
             "unknown",
             "windsurf",
+            "workbuddy",
         ],
     )
 }
 
-fn infer_client_family_from_user_agent(value: &str) -> Option<String> {
+fn infer_client_family_from_user_agent(value: &str) -> Option<&'static str> {
     let normalized = value.trim().to_ascii_lowercase();
-    let family = if normalized.starts_with("codex_vscode") {
-        "codex_vscode"
-    } else if normalized.starts_with("codex") {
-        "codex"
-    } else if normalized.contains("claude-code") || normalized.contains("claude_code") {
-        "claude_code"
-    } else if normalized.contains("opencode") {
-        "opencode"
-    } else if normalized.contains("geminicli") || normalized.contains("gemini-cli") {
-        "gemini_cli"
-    } else if normalized.contains("qwencode") {
-        "qwen_code"
-    } else if normalized.contains("roo-code") || normalized.contains("roocode") {
-        "roo_code"
-    } else if normalized.contains("kilo-code") || normalized.contains("kilocode") {
-        "kilocode"
-    } else if normalized.contains("cherrystudio") || normalized.contains("cherry-studio") {
-        "cherrystudio"
-    } else if normalized.contains("openui-agent-manager") || normalized.contains("openui") {
-        "openui"
-    } else if normalized.contains("cursor") {
-        "cursor"
-    } else if normalized.contains("windsurf") {
-        "windsurf"
-    } else if normalized.contains("continue") {
-        "continue"
-    } else if normalized.contains("cline") {
-        "cline"
-    } else if normalized.contains("aider") {
-        "aider"
-    } else if normalized.contains("langchain") {
-        "langchain"
-    } else if normalized.contains("llamaindex") || normalized.contains("llama-index") {
-        "llamaindex"
-    } else if normalized.starts_with("openai/js") {
-        "openai_js_sdk"
-    } else if normalized.starts_with("openai/python") {
-        "openai_python_sdk"
-    } else if normalized.starts_with("anthropic/js")
-        || normalized.contains("anthropic-sdk-typescript")
-    {
-        "anthropic_js_sdk"
-    } else if normalized.starts_with("anthropic/python")
-        || normalized.contains("anthropic-sdk-python")
-    {
-        "anthropic_python_sdk"
-    } else if normalized.contains("/js ") || normalized.contains("/python ") {
-        "sdk"
-    } else {
-        return None;
-    };
-    Some(family.to_string())
+    if normalized.starts_with("claude code/") {
+        return Some("claude_code");
+    }
+    if normalized.starts_with("cherry studio/") {
+        return Some("cherrystudio");
+    }
+
+    let mut comment_depth = 0usize;
+    let mut escaped_in_comment = false;
+    let products = normalized.split(|character: char| {
+        if escaped_in_comment {
+            escaped_in_comment = false;
+            return true;
+        }
+        match character {
+            '(' => comment_depth += 1,
+            ')' => comment_depth = comment_depth.saturating_sub(1),
+            '\\' if comment_depth != 0 => escaped_in_comment = true,
+            _ => return comment_depth != 0 || character.is_ascii_whitespace(),
+        }
+        true
+    });
+    let mut sdk = None;
+    for product in products.filter(|product| !product.is_empty()) {
+        let (name, version) = product.split_once('/').unwrap_or((product, ""));
+        let application = match name {
+            "codex_vscode" | "codex-vscode" => Some("codex_vscode"),
+            "codex" | "codex-cli" | "codex_cli_rs" | "codex-tui" | "codex_exec"
+            | "codex_work_desktop" => Some("codex"),
+            "workbuddy" | "workbuddy-ai" => Some("workbuddy"),
+            "deepseek-harness" => Some("deepseek_harness"),
+            "hermes-agent" => Some("hermes_agent"),
+            "claude-code" | "claude_code" | "claude-cli" => Some("claude_code"),
+            "opencode" => Some("opencode"),
+            "geminicli" | "gemini-cli" => Some("gemini_cli"),
+            "qwencode" | "qwen-code" => Some("qwen_code"),
+            "roo-code" | "roocode" => Some("roo_code"),
+            "kilo-code" | "kilocode" => Some("kilocode"),
+            "cherrystudio" | "cherry-studio" => Some("cherrystudio"),
+            "openui-agent-manager" | "openui" => Some("openui"),
+            "cursor" => Some("cursor"),
+            "windsurf" => Some("windsurf"),
+            "continue" => Some("continue"),
+            "cline" => Some("cline"),
+            "aider" => Some("aider"),
+            "langchain" => Some("langchain"),
+            "llamaindex" | "llama-index" => Some("llamaindex"),
+            _ => None,
+        };
+        if application.is_some() {
+            return application;
+        }
+
+        let language = version.split('/').next().unwrap_or_default();
+        sdk = match (name, language) {
+            ("openai", "js") => Some("openai_js_sdk"),
+            ("openai" | "asyncopenai", "python") => Some("openai_python_sdk"),
+            ("anthropic", "js") | ("anthropic-sdk-typescript", _) => Some("anthropic_js_sdk"),
+            ("anthropic" | "asyncanthropic", "python") | ("anthropic-sdk-python", _) => {
+                Some("anthropic_python_sdk")
+            }
+            (_, "js" | "python") => sdk.or(Some("sdk")),
+            _ => sdk,
+        };
+    }
+    sdk
 }
 
 fn sanitize_websocket_transport(value: &str) -> Option<String> {
@@ -1777,6 +1939,97 @@ mod tests {
             "user_agent": "private-client/1.0 account-secret"
         })))
         .is_none());
+    }
+
+    #[test]
+    fn original_client_headers_identify_the_application_without_a_session() {
+        let metadata = sanitize_usage_request_metadata(Some(json!({
+            "original_headers": {
+                "user-agent": "deepseek-harness/0.2.0 (+https://github.com/deepseek-ai/deepseek-harness) dsh-profile/desktop",
+                "x-stainless-lang": "js"
+            }
+        })));
+
+        assert_eq!(metadata, Some(json!({"client_family": "deepseek_harness"})));
+    }
+
+    #[test]
+    fn protects_the_label_from_generic_and_unrelated_signals() {
+        for (headers, expected) in [
+            (
+                json!({"X-IDE-Name": "WorkBuddy", "user-agent": "OpenAI/JS 6.0.0"}),
+                Some("workbuddy"),
+            ),
+            (
+                json!({"originator": "codex_cli_rs", "user-agent": "codex_vscode/0.144.1"}),
+                Some("codex_vscode"),
+            ),
+            (
+                json!({"user-agent": "OpenAI/Python 2.0", "chatgpt-account-id": "test-account"}),
+                Some("openai_python_sdk"),
+            ),
+            (
+                json!({"user-agent": "AsyncOpenAI/Python 2.0"}),
+                Some("openai_python_sdk"),
+            ),
+            (
+                json!({"user-agent": "Hermes-Agent/1.0", "x-stainless-lang": "python"}),
+                Some("hermes_agent"),
+            ),
+            (json!({"x-stainless-lang": "js"}), Some("sdk")),
+            (
+                json!({"user-agent": "Mozilla/5.0 (Windows; comment WorkBuddy/1.0) Chrome/140.0"}),
+                None,
+            ),
+            (json!({"user-agent": "not-workbuddy/1.0"}), None),
+            (json!({"chatgpt-account-id": "test-account"}), None),
+        ] {
+            let metadata = sanitize_usage_request_metadata(Some(json!({
+                "original_headers": headers,
+                "client_session_affinity": {"client_family": "sdk"}
+            })));
+            assert_eq!(
+                metadata,
+                expected.map(|family| json!({"client_family": family}))
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_a_bounded_client_declaration_without_registration() {
+        let metadata = sanitize_usage_request_metadata(Some(json!({
+            "original_headers": {
+                "X-Aether-Client": " My-Agent_2 ",
+                "user-agent": "OpenAI/Python 2.0",
+                "authorization": "Bearer token"
+            }
+        })));
+        assert_eq!(
+            metadata,
+            Some(json!({"client_family": "my-agent_2", "client_family_source": "declared"}))
+        );
+        assert_eq!(sanitize_usage_request_metadata(metadata.clone()), metadata);
+        assert!(sanitize_usage_request_metadata(Some(json!({
+            "client_family": "my-agent_2"
+        })))
+        .is_none());
+
+        for invalid in [
+            "my agent".to_string(),
+            "app/token".to_string(),
+            "a".repeat(65),
+        ] {
+            let metadata = sanitize_usage_request_metadata(Some(json!({
+                "original_headers": {
+                    "x-aether-client": invalid,
+                    "user-agent": "OpenAI/Python 2.0"
+                }
+            })));
+            assert_eq!(
+                metadata,
+                Some(json!({"client_family": "openai_python_sdk"}))
+            );
+        }
     }
 
     #[test]

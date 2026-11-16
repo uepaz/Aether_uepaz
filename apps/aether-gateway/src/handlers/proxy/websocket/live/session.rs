@@ -387,7 +387,7 @@ async fn prepare_direct_live_websocket(
     let started_at = Instant::now();
     let candidate = match plan_live_candidate(
         state,
-        context.trace_id.as_str(),
+        context.request_id.as_str(),
         &context.decision,
         &context.headers,
         &context.remote_addr,
@@ -643,7 +643,7 @@ async fn prepare_sideband_live_websocket(
         &sideband_lease,
         plan_live_candidate(
             state,
-            context.trace_id.as_str(),
+            context.request_id.as_str(),
             &context.decision,
             &context.headers,
             &context.remote_addr,

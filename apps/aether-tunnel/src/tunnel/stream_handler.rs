@@ -267,7 +267,7 @@ impl Drop for ActiveStreamGuard {
 
 #[derive(Debug, Clone, Copy)]
 struct RequestTimeouts {
-    first_byte_timeout: Duration,
+    first_byte_timeout: Option<Duration>,
     response_body_timeout: Option<Duration>,
 }
 
@@ -530,7 +530,10 @@ impl PreparedRequestBody {
     /// replay is enabled. A replay body advertises an exact size to Hyper, so
     /// HTTP/1 requests get a correct `Content-Length` instead of implicit
     /// chunked framing. Requests that exceed the replay budget remain streamed.
-    async fn resolve_initial_replay_body(&mut self, deadline: Instant) -> Result<(), String> {
+    async fn resolve_initial_replay_body(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<(), String> {
         let ReplayableRequestBody::Pending(state) = &self.replay_body else {
             return Ok(());
         };
@@ -553,7 +556,7 @@ impl PreparedRequestBody {
 async fn prepare_redirect_request_body(
     replay_body: ReplayableRequestBody,
     body_mode: RedirectBodyMode,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<Option<upstream_client::UpstreamRequestBody>, String> {
     match body_mode {
         RedirectBodyMode::Empty => Ok(Some(empty_request_body())),
@@ -738,7 +741,10 @@ impl RequestBodyReplayState {
         self.ready.notify_waiters();
     }
 
-    async fn wait_for_resolution(&self, deadline: Instant) -> Result<ReplayBodyResolution, String> {
+    async fn wait_for_resolution(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<ReplayBodyResolution, String> {
         loop {
             let notified = self.ready.notified();
             tokio::pin!(notified);
@@ -765,12 +771,7 @@ impl RequestBodyReplayState {
                 return resolution;
             }
 
-            let Some(remaining) = remaining_timeout(deadline) else {
-                return Err("upstream timeout".to_string());
-            };
-            tokio::time::timeout(remaining, &mut notified)
-                .await
-                .map_err(|_| "upstream timeout".to_string())?;
+            await_request_deadline(deadline, &mut notified).await?;
         }
     }
 }
@@ -982,7 +983,7 @@ fn prepare_request_body(
     stream_id: u32,
     body_rx: mpsc::Receiver<TunnelFrame>,
     body_size: Arc<AtomicUsize>,
-    deadline: Instant,
+    deadline: Option<Instant>,
     capture_for_redirects: bool,
     frame_tx: FrameSender,
 ) -> PreparedRequestBody {
@@ -1032,14 +1033,25 @@ fn prepare_bodyless_request_body(
 
 async fn recv_body_frame_with_deadline(
     body_rx: &mut mpsc::Receiver<TunnelFrame>,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<Option<TunnelFrame>, String> {
-    let Some(remaining) = remaining_timeout(deadline) else {
-        return Err("upstream timeout".to_string());
-    };
-    tokio::time::timeout(remaining, body_rx.recv())
-        .await
-        .map_err(|_| "upstream timeout".to_string())
+    await_request_deadline(deadline, body_rx.recv()).await
+}
+
+async fn await_request_deadline<T>(
+    deadline: Option<Instant>,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    match deadline {
+        Some(deadline) => {
+            let remaining =
+                remaining_timeout(deadline).ok_or_else(|| "upstream timeout".to_string())?;
+            tokio::time::timeout(remaining, future)
+                .await
+                .map_err(|_| "upstream timeout".to_string())
+        }
+        None => Ok(future.await),
+    }
 }
 
 fn remaining_timeout(deadline: Instant) -> Option<Duration> {
@@ -1050,7 +1062,8 @@ fn resolve_request_timeouts(meta: &RequestMeta) -> RequestTimeouts {
     let resolved = aether_contracts::tunnel::resolve_tunnel_request_timeouts(meta);
 
     RequestTimeouts {
-        first_byte_timeout: Duration::from_millis(resolved.first_byte_ms),
+        first_byte_timeout: (resolved.first_byte_ms > 0)
+            .then(|| Duration::from_millis(resolved.first_byte_ms)),
         response_body_timeout: resolved.response_body_ms.map(Duration::from_millis),
     }
 }
@@ -1061,7 +1074,7 @@ async fn spool_request_body(
     mut spool_tx: mpsc::Sender<SpoolBodyEvent>,
     replay_state: Option<Arc<RequestBodyReplayState>>,
     body_size: Arc<AtomicUsize>,
-    deadline: Instant,
+    deadline: Option<Instant>,
     frame_tx: FrameSender,
 ) {
     loop {
@@ -1319,7 +1332,7 @@ async fn execute_upstream_request(
     method: hyper::Method,
     headers: &[(String, String)],
     request_body: upstream_client::UpstreamRequestBody,
-    timeout: Duration,
+    deadline: Option<Instant>,
     http1_only: bool,
 ) -> Result<UpstreamResponseContext, String> {
     let dns_start = Instant::now();
@@ -1372,7 +1385,7 @@ async fn execute_upstream_request(
             .map(|_| connection_start.elapsed().as_millis() as u64)
     });
 
-    let response = match tokio::time::timeout(timeout, client.request(request)).await {
+    let response = match await_request_deadline(deadline, client.request(request)).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
             connection_capture.abort();
@@ -1931,7 +1944,9 @@ async fn handle_stream_inner(
 
     let overall_start = Instant::now();
     let request_timeouts = resolve_request_timeouts(&meta);
-    let first_byte_deadline = overall_start + request_timeouts.first_byte_timeout;
+    let first_byte_deadline = request_timeouts
+        .first_byte_timeout
+        .map(|timeout| overall_start + timeout);
     let response_body_deadline = request_timeouts
         .response_body_timeout
         .map(|timeout| overall_start + timeout);
@@ -1946,7 +1961,6 @@ async fn handle_stream_inner(
             ));
         }
     }
-    let first_byte_timeout = request_timeouts.first_byte_timeout;
     let request_body_size = Arc::new(AtomicUsize::new(0));
     let request_body_mode = if request_has_body {
         "streaming"
@@ -1996,7 +2010,7 @@ async fn handle_stream_inner(
     }
 
     loop {
-        let Some(remaining) = remaining_timeout(first_byte_deadline) else {
+        if first_byte_deadline.is_some_and(|deadline| remaining_timeout(deadline).is_none()) {
             if let ReplayableRequestBody::Pending(state) = &prepared_body.replay_body {
                 state.discard();
             }
@@ -2014,7 +2028,7 @@ async fn handle_stream_inner(
             );
             send_error(frame_tx, stream_id, "upstream timeout").await;
             return None;
-        };
+        }
         let request_body = next_request_body
             .take()
             .unwrap_or_else(|| prepared_body.take_first_request_body());
@@ -2027,7 +2041,7 @@ async fn handle_stream_inner(
             current_method.clone(),
             &current_headers,
             request_body,
-            remaining.min(first_byte_timeout),
+            first_byte_deadline,
             meta.http1_only,
         )
         .await
@@ -2490,7 +2504,7 @@ mod tests {
             7,
             body_rx,
             Arc::new(AtomicUsize::new(0)),
-            Instant::now() + Duration::from_secs(10),
+            Some(Instant::now() + Duration::from_secs(10)),
             false,
             sender,
         );
@@ -2524,7 +2538,7 @@ mod tests {
             7,
             body_rx,
             Arc::new(AtomicUsize::new(0)),
-            Instant::now() + Duration::from_secs(3600),
+            Some(Instant::now() + Duration::from_secs(3600)),
             false,
             sender,
         );
@@ -2668,7 +2682,7 @@ mod tests {
             1,
             rx,
             Arc::clone(&body_size),
-            Instant::now() + Duration::from_secs(1),
+            Some(Instant::now() + Duration::from_secs(1)),
             true,
             frame_tx.clone(),
         );
@@ -2718,7 +2732,7 @@ mod tests {
         let replay = prepare_redirect_request_body(
             prepared.replay_body.clone(),
             RedirectBodyMode::Replay,
-            Instant::now() + Duration::from_secs(1),
+            Some(Instant::now() + Duration::from_secs(1)),
         )
         .await
         .expect("redirect replay should resolve")
@@ -2756,7 +2770,7 @@ mod tests {
         assert_eq!(state.reserved_bytes.load(Ordering::Acquire), 0);
         assert_eq!(
             state
-                .wait_for_resolution(Instant::now() + Duration::from_secs(1))
+                .wait_for_resolution(Some(Instant::now() + Duration::from_secs(1)))
                 .await
                 .expect("over-budget replay should resolve without failing the request"),
             ReplayBodyResolution::NonReplayable
@@ -2892,8 +2906,49 @@ mod tests {
 
         let timeouts = resolve_request_timeouts(&meta);
 
-        assert_eq!(timeouts.first_byte_timeout, Duration::from_millis(12_345));
+        assert_eq!(
+            timeouts.first_byte_timeout,
+            Some(Duration::from_millis(12_345))
+        );
         assert!(timeouts.response_body_timeout.is_none());
+    }
+
+    #[test]
+    fn stream_request_timeouts_disable_explicit_zero_first_byte_limit() {
+        let mut meta = sample_request_meta();
+        meta.stream = true;
+        meta.stream_first_byte_timeout_ms = Some(0);
+        let timeouts = resolve_request_timeouts(&meta);
+        assert_eq!(timeouts.first_byte_timeout, None);
+        assert_eq!(timeouts.response_body_timeout, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_request_deadline_allows_delayed_body_and_response() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(301)).await;
+            tx.send(TunnelFrame::new(
+                1,
+                MsgType::RequestBody,
+                flags::END_STREAM,
+                Bytes::from_static(b"late body"),
+            ))
+            .await
+            .unwrap();
+        });
+        let frame = recv_body_frame_with_deadline(&mut rx, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.payload, Bytes::from_static(b"late body"));
+        let response = await_request_deadline(None, async {
+            tokio::time::sleep(Duration::from_secs(301)).await;
+            "late response"
+        })
+        .await
+        .unwrap();
+        assert_eq!(response, "late response");
     }
 
     #[test]
@@ -2906,7 +2961,7 @@ mod tests {
 
         let timeouts = resolve_request_timeouts(&meta);
 
-        assert_eq!(timeouts.first_byte_timeout, Duration::from_secs(7));
+        assert_eq!(timeouts.first_byte_timeout, Some(Duration::from_secs(7)));
         assert!(timeouts.response_body_timeout.is_none());
     }
 
@@ -2918,7 +2973,10 @@ mod tests {
 
         let timeouts = resolve_request_timeouts(&meta);
 
-        assert_eq!(timeouts.first_byte_timeout, Duration::from_millis(90_000));
+        assert_eq!(
+            timeouts.first_byte_timeout,
+            Some(Duration::from_millis(90_000))
+        );
         assert_eq!(
             timeouts.response_body_timeout,
             Some(Duration::from_millis(90_000))
@@ -2933,7 +2991,7 @@ mod tests {
         let timeouts = resolve_request_timeouts(&meta);
 
         let expected = Duration::from_millis(aether_contracts::MAX_EXECUTION_REQUEST_TIMEOUT_MS);
-        assert_eq!(timeouts.first_byte_timeout, expected);
+        assert_eq!(timeouts.first_byte_timeout, Some(expected));
         assert_eq!(timeouts.response_body_timeout, Some(expected));
     }
 

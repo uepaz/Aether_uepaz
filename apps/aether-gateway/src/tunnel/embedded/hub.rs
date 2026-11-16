@@ -696,8 +696,11 @@ impl LocalStream {
         Err("proxy flow-control update failed".to_string())
     }
 
-    pub async fn wait_headers(&self, timeout: Duration) -> Result<LocalResponseHead, String> {
-        tokio::time::timeout(timeout, async {
+    pub async fn wait_headers(
+        &self,
+        timeout: Option<Duration>,
+    ) -> Result<LocalResponseHead, String> {
+        let wait = async {
             loop {
                 let notified = self.headers_notify.notified();
                 tokio::pin!(notified);
@@ -714,9 +717,13 @@ impl LocalStream {
                 }
                 notified.await;
             }
-        })
-        .await
-        .map_err(|_| "timed out waiting for response headers".to_string())?
+        };
+        match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, wait)
+                .await
+                .map_err(|_| "timed out waiting for response headers".to_string())?,
+            None => wait.await,
+        }
     }
 
     pub fn take_body_receiver(self: &Arc<Self>) -> Option<LocalBodyReceiver> {
@@ -3004,7 +3011,7 @@ mod tests {
         hub.handle_proxy_frame(400, &mut resp2_headers).await;
 
         let response = stream2
-            .wait_headers(std::time::Duration::from_secs(1))
+            .wait_headers(Some(std::time::Duration::from_secs(1)))
             .await
             .expect("second stream should receive headers");
         assert_eq!(response.status, 200);

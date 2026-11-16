@@ -416,6 +416,7 @@ pub struct RequestMeta {
     pub stream: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_timeout_ms: Option<u64>,
+    /// Some(0) 关闭流式首字限制；缺省时兼容旧版 timeout 字段。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_first_byte_timeout_ms: Option<u64>,
     #[serde(default = "default_timeout", deserialize_with = "deserialize_timeout")]
@@ -454,6 +455,7 @@ impl fmt::Debug for RequestMeta {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedTunnelRequestTimeouts {
+    /// 仅流式请求允许 0，表示不限制首字等待时间。
     pub first_byte_ms: u64,
     pub response_body_ms: Option<u64>,
 }
@@ -506,7 +508,7 @@ fn clamp_upstream_request_timeout_ms(timeout_ms: u64) -> u64 {
 }
 
 fn clamp_stream_first_byte_timeout_ms(timeout_ms: u64) -> u64 {
-    timeout_ms.clamp(1, crate::MAX_EXECUTION_STREAM_FIRST_BYTE_TIMEOUT_MS)
+    timeout_ms.min(crate::MAX_EXECUTION_STREAM_FIRST_BYTE_TIMEOUT_MS)
 }
 
 fn default_timeout() -> u64 {
@@ -929,6 +931,24 @@ mod tests {
 
         assert_eq!(resolved.first_byte_ms, 12_000);
         assert_eq!(resolved.response_body_ms, None);
+    }
+
+    #[test]
+    fn tunnel_request_timeouts_preserve_explicitly_disabled_first_byte_limit() {
+        let mut meta = request_meta(true);
+        meta.stream_first_byte_timeout_ms = Some(0);
+        meta.request_timeout_ms = Some(90_000);
+        let encoded = serde_json::to_vec(&meta).unwrap();
+        let decoded: RequestMeta = serde_json::from_slice(&encoded).unwrap();
+        let resolved = resolve_tunnel_request_timeouts(&decoded);
+        assert_eq!(decoded.stream_first_byte_timeout_ms, Some(0));
+        assert_eq!(resolved.first_byte_ms, 0);
+        assert_eq!(resolved.response_body_ms, None);
+
+        meta.stream = false;
+        let non_stream = resolve_tunnel_request_timeouts(&meta);
+        assert_eq!(non_stream.first_byte_ms, 90_000);
+        assert_eq!(non_stream.response_body_ms, Some(90_000));
     }
 
     #[test]

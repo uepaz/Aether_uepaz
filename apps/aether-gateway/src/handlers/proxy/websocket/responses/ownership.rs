@@ -12,6 +12,7 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 
 use super::lifecycle::{begin_responses_websocket_turn, ActiveProviderAttempt};
+use super::turn::{ResponsesWebSocketNextCandidateIndex, ResponsesWebSocketUsageStart};
 use crate::ai_serving::{
     maybe_build_responses_websocket_decision, AiExecutionDecision, GatewayAuthApiKeySnapshot,
     ResponsesWebSocketDecision, ResponsesWebSocketPinnedCandidate,
@@ -41,7 +42,7 @@ pub(super) struct OwnedResponsesWebSocketDecision {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_owned_responses_websocket_plan(
     state: AppState,
-    parts: http::request::Parts,
+    mut parts: http::request::Parts,
     trace_id: String,
     control_decision: GatewayControlDecision,
     auth_snapshot: Option<GatewayAuthApiKeySnapshot>,
@@ -49,6 +50,7 @@ pub(super) fn spawn_owned_responses_websocket_plan(
     excluded_key_ids: Option<BTreeSet<String>>,
     excluded_codex_account_ids: Option<BTreeSet<String>>,
     pinned_candidate: Option<ResponsesWebSocketPinnedCandidate>,
+    starting_candidate_index: u32,
 ) -> JoinHandle<Result<Option<OwnedResponsesWebSocketDecision>, GatewayError>> {
     let owner_timeout = state
         .frontdoor_runtime_guards
@@ -65,6 +67,7 @@ pub(super) fn spawn_owned_responses_websocket_plan(
                 excluded_key_ids.as_ref(),
                 excluded_codex_account_ids.as_ref(),
                 pinned_candidate.as_ref(),
+                starting_candidate_index,
             ),
             owner_timeout,
         )
@@ -76,6 +79,11 @@ pub(super) fn spawn_owned_responses_websocket_plan(
         })??;
 
         Ok(planned.map(|planned| {
+            parts
+                .extensions
+                .insert(ResponsesWebSocketNextCandidateIndex(
+                    planned.next_candidate_index,
+                ));
             let planned_lease =
                 PlannedPoolKeyLeaseGuard::new(&state, planned.execution.report_context.as_ref());
             OwnedResponsesWebSocketDecision {
@@ -152,6 +160,7 @@ pub(super) async fn begin_responses_websocket_turn_with_planned_lease(
     client_event: &Value,
     plan_usage_policy_snapshot: Option<PlanUsagePolicySnapshot>,
     mut planned_lease: PlannedPoolKeyLeaseGuard,
+    usage_start: ResponsesWebSocketUsageStart,
 ) -> Result<ActiveProviderAttempt, GatewayError> {
     let state = state.clone();
     let trace_id = trace_id.to_string();
@@ -166,6 +175,7 @@ pub(super) async fn begin_responses_websocket_turn_with_planned_lease(
             decision,
             &client_event,
             plan_usage_policy_snapshot,
+            usage_start,
         )
         .await?;
         // ActiveProviderAttempt now owns the report context containing the

@@ -21,6 +21,7 @@ const TRANSPORT_ERROR_CLIENT_MESSAGE: &str =
 
 #[derive(Debug, Default)]
 pub(crate) struct StreamCandidateWatchdogProgress {
+    first_content_observed: AtomicBool,
     terminal_started: AtomicBool,
     abandoned: AtomicBool,
 }
@@ -36,6 +37,14 @@ impl StreamCandidateWatchdogProgress {
 
     pub(crate) fn terminal_started(&self) -> bool {
         self.terminal_started.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn first_content_observed(&self) -> bool {
+        self.first_content_observed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_first_content_observed(&self) {
+        self.first_content_observed.store(true, Ordering::Release);
     }
 
     /// The watchdog gave up waiting and settles this attempt itself.

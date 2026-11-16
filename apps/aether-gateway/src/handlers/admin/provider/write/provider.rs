@@ -18,9 +18,9 @@ fn normalize_provider_request_timeout(value: Option<f64>) -> Result<Option<f64>,
 fn normalize_provider_stream_first_byte_timeout(value: Option<f64>) -> Result<Option<f64>, String> {
     let max = aether_contracts::MAX_EXECUTION_STREAM_FIRST_BYTE_TIMEOUT_SECS as f64;
     match value {
-        Some(value) if (1.0..=max).contains(&value) => Ok(Some(value)),
+        Some(value) if value == 0.0 || (1.0..=max).contains(&value) => Ok(Some(value)),
         Some(_) => Err(format!(
-            "stream_first_byte_timeout 必须是 1 到 {} 之间的数字",
+            "stream_first_byte_timeout 必须是 0（不限制）或 1 到 {} 之间的数字",
             aether_contracts::MAX_EXECUTION_STREAM_FIRST_BYTE_TIMEOUT_SECS
         )),
         None => Ok(None),
@@ -61,6 +61,14 @@ mod tests {
 
     #[test]
     fn provider_stream_first_byte_timeout_keeps_its_protocol_range() {
+        assert_eq!(normalize_provider_stream_first_byte_timeout(None), Ok(None));
+        assert_eq!(
+            normalize_provider_stream_first_byte_timeout(Some(0.0)),
+            Ok(Some(0.0))
+        );
+        for invalid in [-1.0, 0.5, f64::NAN, f64::INFINITY] {
+            assert!(normalize_provider_stream_first_byte_timeout(Some(invalid)).is_err());
+        }
         assert_eq!(
             normalize_provider_stream_first_byte_timeout(Some(1.0)),
             Ok(Some(1.0))

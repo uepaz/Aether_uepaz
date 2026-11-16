@@ -1415,7 +1415,10 @@ pub(crate) async fn execute_sync_plan_with_report_context(
             return execute_sync_plan_via_remote_execution_runtime(
                 state,
                 remote_execution_runtime_base_url,
-                trace_id,
+                crate::execution_runtime::trace_id_from_report_context(
+                    report_context,
+                    trace_id,
+                ),
                 plan,
             )
             .await;
@@ -3414,10 +3417,7 @@ fn resolve_relay_timeout_seconds(plan: &ExecutionPlan) -> u64 {
 }
 
 fn resolve_tunnel_first_byte_timeout(plan: &ExecutionPlan) -> Option<Duration> {
-    plan.stream.then(|| {
-        resolve_stream_first_byte_timeout(plan)
-            .unwrap_or_else(|| Duration::from_millis(DEFAULT_TUNNEL_TIMEOUT_MS))
-    })
+    resolve_stream_first_byte_timeout(plan)
 }
 
 pub(crate) fn resolve_non_stream_total_timeout_for_request(
@@ -3458,7 +3458,7 @@ pub(crate) fn resolve_stream_first_byte_timeout_for_request(
     let timeout_ms = timeouts
         .and_then(|timeouts| timeouts.first_byte_ms)
         .unwrap_or(DEFAULT_STREAM_FIRST_BYTE_TIMEOUT_MS);
-    Some(Duration::from_millis(timeout_ms.max(1)))
+    (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms))
 }
 
 pub(crate) fn resolve_stream_first_byte_timeout(plan: &ExecutionPlan) -> Option<Duration> {
@@ -3560,15 +3560,22 @@ fn resolve_tunnel_timeout_metadata(plan: &ExecutionPlan) -> TunnelTimeoutMetadat
             .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))
     };
     let stream_first_byte_timeout_ms = if plan.stream {
-        resolve_stream_first_byte_timeout(plan)
-            .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))
+        // 保留显式的 0，避免隧道节点将“不限制”重新解释为默认超时。
+        Some(
+            plan.timeouts
+                .as_ref()
+                .and_then(|timeouts| timeouts.first_byte_ms)
+                .unwrap_or(DEFAULT_STREAM_FIRST_BYTE_TIMEOUT_MS),
+        )
     } else {
         plan.timeouts
             .as_ref()
             .and_then(|timeouts| timeouts.first_byte_ms)
     };
     let legacy_timeout_ms = if plan.stream {
-        stream_first_byte_timeout_ms.unwrap_or(DEFAULT_TUNNEL_TIMEOUT_MS)
+        stream_first_byte_timeout_ms
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_TUNNEL_TIMEOUT_MS)
     } else {
         request_timeout_ms.unwrap_or(DEFAULT_NON_STREAM_TOTAL_TIMEOUT_MS)
     };
@@ -7274,6 +7281,24 @@ mod tests {
     }
 
     #[test]
+    fn stream_first_byte_timeout_zero_disables_direct_and_tunnel_deadlines() {
+        let mut plan = tunnel_timeout_plan(true);
+        plan.timeouts.as_mut().unwrap().first_byte_ms = Some(0);
+        assert_eq!(resolve_stream_first_byte_timeout(&plan), None);
+        assert_eq!(super::resolve_tunnel_first_byte_timeout(&plan), None);
+        let meta = build_direct_tunnel_request_meta(
+            &plan,
+            &reqwest::header::HeaderMap::new(),
+            ExecutionTransportControls::default(),
+        );
+        assert_eq!(meta.stream_first_byte_timeout_ms, Some(0));
+        assert_eq!(
+            aether_contracts::tunnel::resolve_tunnel_request_timeouts(&meta).first_byte_ms,
+            0
+        );
+    }
+
+    #[test]
     fn stream_first_byte_timeout_uses_default_when_unconfigured() {
         let mut plan = tunnel_timeout_plan(true);
         plan.timeouts = None;
@@ -7996,6 +8021,46 @@ mod tests {
             "header observation must not be derived from body-byte ttfb"
         );
         assert!(!observation.request_order_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_stream_execution_runtime_zero_waits_for_delayed_headers_and_body() {
+        let listener = crate::test_support::bind_loopback_listener().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/chat",
+            post(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let body = async_stream::stream! {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    yield Ok::<_, std::io::Error>(Bytes::from_static(b"data: hello\n\n"));
+                };
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(body))
+                    .unwrap()
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let plan = direct_timeout_plan(
+            format!("http://{addr}/chat"),
+            true,
+            ExecutionTimeouts {
+                first_byte_ms: Some(0),
+                total_ms: Some(1),
+                ..ExecutionTimeouts::default()
+            },
+        );
+        let result = DirectSyncExecutionRuntime::new().execute_sync(&plan).await;
+        server.abort();
+        assert!(
+            result.is_ok(),
+            "disabled first-byte limit must allow delayed HTTP response: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]

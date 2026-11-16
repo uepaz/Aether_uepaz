@@ -192,7 +192,7 @@ async fn slow_stream_does_not_block_another_stream_on_the_same_connection() {
         hub.handle_proxy_frame(99, &mut overflowing).await;
         headers(&hub, &fast).await;
         assert_eq!(
-            fast.wait_headers(Duration::from_secs(1))
+            fast.wait_headers(Some(Duration::from_secs(1)))
                 .await
                 .unwrap()
                 .status,
@@ -236,7 +236,10 @@ async fn concurrent_headers_and_credit_updates_do_not_lose_notifications() {
             let stream = Arc::clone(&stream);
             let window = Arc::clone(&window);
             async move {
-                stream.wait_headers(Duration::from_secs(1)).await.unwrap();
+                stream
+                    .wait_headers(Some(Duration::from_secs(1)))
+                    .await
+                    .unwrap();
                 window.acquire(1, Duration::from_secs(1)).await.unwrap();
             }
         });

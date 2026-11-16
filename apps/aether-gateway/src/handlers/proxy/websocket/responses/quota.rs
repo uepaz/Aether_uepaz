@@ -1,14 +1,13 @@
 //! Quota exhaustion, replay safety, and upstream replacement policy.
 
 use serde_json::Value;
-use uuid::Uuid;
 use wreq::ws::message::Message as WreqWsMessage;
 
 use super::adapter::{
     resolve_responses_websocket_adapter, ResponsesWebSocketDrainDirective,
     ResponsesWebSocketRebindSafety,
 };
-use super::lifecycle::{queue_turn_finalization, PreviousAttemptSettled};
+use super::lifecycle::{queue_turn_finalization, QuotaRetry};
 use super::ownership::{
     await_owned_responses_websocket_plan, begin_responses_websocket_turn_with_planned_lease,
     spawn_owned_responses_websocket_plan, OwnedResponsesWebSocketDecision,
@@ -17,7 +16,9 @@ use super::request::{
     build_planning_parts, planned_response_create_event, ResponsesLiteStaticConfig,
 };
 use super::state::BoundResponsesConnection;
-use super::turn::{prepare_responses_websocket_turn_decision, ResponsesWebSocketTurnOutcome};
+use super::turn::{
+    prepare_responses_websocket_turn_decision, ResponsesWebSocketTurnOutcome, UpstreamRequestState,
+};
 use super::upstream::{
     bind_responses_upstream, close_bound_upstream, ResponsesWebSocketUpstreamBindError,
 };
@@ -94,17 +95,14 @@ pub(super) fn record_exhausted_bound_key(
     Some((key_id, exclusion_until))
 }
 
-/// 为同一个 logical turn 规划并绑定下一个 attempt。
-///
-/// `_previous_settled` 不被使用，它只是把「上一个 attempt 已经结算完毕」这个
-/// 前置条件写进签名：规划要读 health / adaptive / pool 状态，而这些是上一个
-/// attempt 结算时才投射的；它的 pool key lease 也要先释放，否则替代 key 的挑选
-/// 会看到一把仍被占用的 key。
+/// Plan and bind another provider attempt for the same logical request.
+/// Until a replacement request enters the upstream writer, the caller keeps
+/// the original quota error as the logical turn's terminal usage.
 pub(super) async fn retry_active_turn_after_quota_exhaustion(
     bound: &mut BoundResponsesConnection,
     state: &AppState,
     context: &WebSocketRequestContext,
-    _previous_settled: PreviousAttemptSettled,
+    retry: &mut QuotaRetry,
 ) -> Result<bool, ()> {
     // `LogicalTurn::client_event` is intentionally redacted before it is
     // retained for replay.  The binding, however, keeps the hash of the raw
@@ -175,7 +173,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
             codex_fingerprint_context,
         );
     }
-    let turn_request_id = Uuid::new_v4().to_string();
+    let turn_request_id = retry.request_id.clone();
     let now_unix_secs = current_unix_secs();
     let excluded_key_ids = bound.exhausted_exclusions.key_ids(now_unix_secs);
     let excluded_codex_account_ids = bound.exhausted_exclusions.codex_account_ids(now_unix_secs);
@@ -192,6 +190,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
         excluded_key_ids,
         excluded_codex_account_ids,
         None,
+        retry.starting_candidate_index,
     ))
     .await
     {
@@ -287,6 +286,7 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
         &client_event,
         plan_usage_policy_snapshot,
         planned_lease,
+        retry.usage_start.clone(),
     )
     .await
     {
@@ -310,17 +310,17 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
         &client_event,
         adapter,
         plan_usage_permit.as_ref(),
-        |state| turn.record_upstream_request_state(state),
+        |send_state| {
+            turn.record_upstream_request_state(send_state);
+            if send_state == UpstreamRequestState::PossiblySent {
+                retry.hand_off_usage();
+            }
+        },
     )
     .await
     {
         Ok(connection) => connection,
         Err(ResponsesWebSocketUpstreamBindError::PlanUsagePermitLost) => {
-            turn.release_plan_usage_cost_before_upstream_send(
-                state,
-                "transparent_retry_plan_usage_permit_lost",
-            )
-            .await;
             queue_turn_finalization(
                 bound,
                 state,
@@ -339,11 +339,6 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
             return Err(());
         }
         Err(ResponsesWebSocketUpstreamBindError::Transport(code)) => {
-            turn.release_plan_usage_cost_before_upstream_send(
-                state,
-                "transparent_retry_rebind_failed",
-            )
-            .await;
             queue_turn_finalization(
                 bound,
                 state,
@@ -387,17 +382,9 @@ pub(super) async fn retry_active_turn_after_quota_exhaustion(
         replacement.responses_lite_static_config,
     );
     bound.binding_identity = replacement.binding_identity;
-    // 同一个 logical turn 的下一个 attempt 就位。状态不符时把 attempt 交回
-    // drop guard 结算并让调用方走「透明重试失败」分支，不静默丢弃一条已经写了
-    // pending usage 行、占着 candidate 和 pool key lease 的 attempt。
+    // The request has been sent. A failed state handoff still drops an armed
+    // attempt that can finalize usage and release the candidate's lease.
     if let Err(orphan) = bound.turn_state.resume(turn) {
-        let mut orphan = orphan;
-        orphan
-            .release_plan_usage_cost_before_upstream_send(
-                state,
-                "transparent_retry_state_handoff_failed",
-            )
-            .await;
         drop(orphan);
         return Ok(false);
     }

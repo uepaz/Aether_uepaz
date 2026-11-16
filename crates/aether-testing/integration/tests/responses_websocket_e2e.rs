@@ -19,6 +19,9 @@ use aether_data::repository::wallet::WalletLookupKey;
 use aether_data::{
     DataBackends, DataLayerConfig, DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig,
 };
+use aether_data_contracts::repository::candidates::{
+    RequestCandidateStatus, StoredRequestCandidate,
+};
 use aether_data_contracts::repository::global_models::{
     CreateAdminGlobalModelRecord, UpsertAdminProviderModelRecord,
 };
@@ -68,6 +71,7 @@ const FAR_FUTURE_UNIX_SECS: u64 = 4_102_444_800;
 
 const INPUT_TOKENS: u64 = 4;
 const OUTPUT_TOKENS: u64 = 2;
+const QUOTA_DELAY_MS: u64 = 600;
 
 /// Generous enough to absorb a loaded CI runner, short enough that a genuinely
 /// lost row fails the test instead of hanging the job.
@@ -84,7 +88,16 @@ const RECEIVE_TIMEOUT: Duration = Duration::from_secs(15);
 async fn continuation_reuses_one_upstream_connection_and_bills_both_turns() -> Result<(), BoxError>
 {
     let harness = Harness::start(UpstreamBehavior::CompleteEveryTurn).await?;
-    let mut client = harness.connect().await?;
+    let mut request = harness.websocket_url.clone().into_client_request()?;
+    request.headers_mut().insert(
+        "authorization",
+        http::HeaderValue::from_str(&format!("Bearer {CLIENT_API_KEY}"))?,
+    );
+    request.headers_mut().insert(
+        "x-aether-client",
+        http::HeaderValue::from_static("my-agent_2"),
+    );
+    let mut client = harness.connect_request(request).await?;
 
     client
         .send(response_create(json!({"input": "first turn"})))
@@ -151,6 +164,7 @@ async fn continuation_reuses_one_upstream_connection_and_bills_both_turns() -> R
             audit.request_metadata
         );
         assert_eq!(audit.model, PUBLIC_MODEL);
+        assert_eq!(audit.client_family.as_deref(), Some("my-agent_2"));
         assert_eq!(audit.input_tokens, INPUT_TOKENS);
         assert_eq!(audit.output_tokens, OUTPUT_TOKENS);
         assert_eq!(audit.total_tokens, INPUT_TOKENS + OUTPUT_TOKENS);
@@ -646,31 +660,42 @@ async fn upstream_drop_mid_turn_reports_an_error_and_settles_the_usage_row() -> 
     Ok(())
 }
 
-/// 供应商配额耗尽后的透明重试：客户端不该看到 429，两个 attempt 都要结算。
-///
-/// 第一个 attempt 拿到 Codex 的 `usage_limit_reached`，网关换到第二把 key 重开一条
-/// 上游连接重放同一个 `response.create`。C6 之前，重试的规划发生在旧 attempt 结算
-/// 之前：规划读到的是旧 attempt 还没投射的 health / adaptive / pool 状态，而且旧
-/// attempt 的 pool key lease 还被它自己占着。
-///
-/// 顺序本身在这里无法确定性断言（结算与规划都在同一个任务里、DB 里看不到先后），
-/// 由 lifecycle 的单测确定性覆盖；这个用例保证整条路径真的能跑通，并且两个
-/// attempt 都留下了终态记账行。
+/// 配额耗尽后换 Key 重放同一条 `response.create`，整轮共用一条用量记录。
 #[tokio::test]
 async fn provider_quota_exhaustion_transparently_retries_onto_another_key() -> Result<(), BoxError>
 {
-    let harness = Harness::start_with_fixture(
+    const REQUEST_FEE: f64 = 0.02;
+    let harness = Harness::start_configured(
         UpstreamBehavior::QuotaExhaustedThenComplete,
         ProviderFixture::CodexKeyPair,
+        PiiRedaction::Disabled,
+        false,
+        Some(REQUEST_FEE),
     )
     .await?;
-    let mut client = harness.connect().await?;
+    let (mut client, request_id) = harness.connect_with_request_id().await?;
 
     client
         .send(response_create(json!({"input": "retry after quota"})))
         .await?;
 
+    receive_event(&mut client, "response.created").await?;
+    let pending = harness
+        .usage_audits_where(1, "the original usage row during retry", |audit| {
+            audit.billing_status == "pending"
+        })
+        .await?;
+    assert_eq!(
+        pending.len(),
+        1,
+        "the first rejection must not be settled separately"
+    );
+    assert_eq!(pending[0].request_id, request_id);
+    let rejected = harness.terminal_candidate_attempts(&request_id, 1).await?;
+    assert_eq!(rejected[0].status_code, Some(429));
+
     // 客户端只应该看到重试之后那次成功的响应，看不到 429。
+    harness.upstream.release_completion.notify_one();
     let completed = receive_event(&mut client, "response.completed").await?;
     assert_eq!(
         completed
@@ -700,46 +725,274 @@ async fn provider_quota_exhaustion_transparently_retries_onto_another_key() -> R
         "the retry must not reuse the exhausted key: {authorizations:?}"
     );
 
-    // 两个 attempt 各自留下一条终态行：配额失败的那条 + 成功计费的那条。
     let audits = harness
-        .usage_audits_where(2, "settled attempts", |audit| !is_pending(audit))
+        .usage_audits_where(1, "the settled logical turn", |audit| {
+            is_billed(audit) && audit.billing_status == "settled"
+        })
         .await?;
-    let settled = audits
-        .iter()
-        .filter(|audit| !is_pending(audit))
-        .collect::<Vec<_>>();
     assert_eq!(
-        settled.len(),
-        2,
-        "both attempts must reach a terminal accounting row: {:?}",
-        audits
-            .iter()
-            .map(|audit| (audit.status.clone(), audit.status_code, audit.total_tokens))
-            .collect::<Vec<_>>()
+        audits.len(),
+        1,
+        "the replay must share the original usage row"
     );
-    assert!(
-        settled.iter().any(|audit| audit.status_code == Some(429)),
-        "the exhausted attempt keeps its own 429 row: {:?}",
-        settled
-            .iter()
-            .map(|audit| (audit.status.clone(), audit.status_code))
-            .collect::<Vec<_>>()
-    );
-
-    let billed = harness
-        .usage_audits_where(1, "the billed retry attempt", is_billed)
-        .await?;
-    let retry = billed
-        .iter()
-        .find(|audit| is_billed(audit))
-        .ok_or("the successful retry attempt must be billed")?;
+    let retry = &audits[0];
+    assert_eq!(retry.request_id, request_id);
+    assert_eq!(retry.status_code, Some(200));
     assert_eq!(
         retry.total_tokens,
         INPUT_TOKENS + OUTPUT_TOKENS,
         "the retry attempt is billed for what it actually consumed"
     );
+    assert_eq!(retry.actual_total_cost_usd, REQUEST_FEE);
+
+    let attempts = harness.terminal_candidate_attempts(&request_id, 2).await?;
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].id, rejected[0].id);
+    assert_eq!(attempts[0].status_code, Some(429));
+    assert_eq!(attempts[1].status_code, Some(200));
+    assert_ne!(attempts[0].key_id, attempts[1].key_id);
+    assert_eq!(retry.provider_api_key_id, attempts[1].key_id);
+
+    let backends = DataBackends::from_config(DataLayerConfig::from_database(
+        harness.database.config.clone(),
+    ))?;
+    let wallet = backends
+        .read()
+        .wallets()
+        .ok_or("wallet reader unavailable")?
+        .find(WalletLookupKey::ApiKeyId(API_KEY_ID))
+        .await?
+        .ok_or("wallet unavailable")?;
+    assert_eq!(wallet.total_consumed, REQUEST_FEE);
 
     client.close(None).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn quota_exhaustion_without_alternate_key_finalizes_original_failure() -> Result<(), BoxError>
+{
+    let harness = Harness::start_with_fixture(
+        UpstreamBehavior::QuotaExhaustedThenComplete,
+        ProviderFixture::SingleCodexKey,
+    )
+    .await?;
+    let mut client = harness.connect().await?;
+    client
+        .send(response_create(json!({"input": "no alternate"})))
+        .await?;
+    let error = receive_error_or_close(&mut client)
+        .await?
+        .ok_or("the gateway did not relay the original quota error")?;
+    assert_eq!(
+        error.pointer("/error/type"),
+        Some(&json!("usage_limit_reached"))
+    );
+
+    let audits = harness
+        .usage_audits_where(1, "the final quota rejection", |audit| {
+            audit.billing_status != "pending"
+        })
+        .await?;
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].status_code, Some(429));
+    assert_eq!(audits[0].total_tokens, 0);
+    assert_eq!(audits[0].actual_total_cost_usd, 0.0);
+    let attempts = harness
+        .terminal_candidate_attempts(&audits[0].request_id, 1)
+        .await?;
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status_code, Some(429));
+    assert_eq!(harness.upstream.connections(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn quota_retry_settles_the_subscription_cost_once_under_the_original_request_id(
+) -> Result<(), BoxError> {
+    const REQUEST_FEE: f64 = 0.02;
+    let mut harness = Harness::start_configured(
+        UpstreamBehavior::QuotaExhaustedThenComplete,
+        ProviderFixture::CodexKeyPair,
+        PiiRedaction::Disabled,
+        false,
+        Some(REQUEST_FEE),
+    )
+    .await?;
+    harness
+        .enable_plan_usage_policy(json!([{
+            "metric": "actual_cost_usd",
+            "window": {"kind": "calendar_week"},
+            "limit": 0.03
+        }]))
+        .await?;
+    let (mut client, request_id) = harness.connect_with_request_id().await?;
+    client
+        .send(response_create(json!({"input": "retry on a subscription"})))
+        .await?;
+    receive_event(&mut client, "response.created").await?;
+    harness.upstream.release_completion.notify_one();
+    receive_event(&mut client, "response.completed").await?;
+    let audits = harness
+        .usage_audits_where(1, "settled subscription usage", |audit| {
+            is_billed(audit) && audit.billing_status == "settled"
+        })
+        .await?;
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].request_id, request_id);
+    assert_eq!(audits[0].actual_total_cost_usd, REQUEST_FEE);
+    let attempts = harness.terminal_candidate_attempts(&request_id, 2).await?;
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].status_code, Some(429));
+    assert_eq!(attempts[1].status_code, Some(200));
+    assert_ne!(attempts[0].key_id, attempts[1].key_id);
+
+    let (finalized, cost_units, active) = harness.plan_cost_totals(&request_id).await?;
+    assert_eq!(finalized, 1, "only one reservation may consume plan quota");
+    assert_eq!(cost_units, 2_000_000, "one $0.02 charge in plan cost units");
+    assert_eq!(active, 0, "settlement must leave no active reservation");
+    Ok(())
+}
+
+#[tokio::test]
+async fn quota_error_with_top_level_reported_usage_is_billed_without_replay() -> Result<(), BoxError>
+{
+    let harness = Harness::start_with_fixture(
+        UpstreamBehavior::QuotaExhaustedWithUsage,
+        ProviderFixture::CodexKeyPair,
+    )
+    .await?;
+    let (mut client, request_id) = harness.connect_with_request_id().await?;
+    client
+        .send(response_create(
+            json!({"input": "quota error with real usage"}),
+        ))
+        .await?;
+    let error = receive_event(&mut client, "error").await?;
+    assert_eq!(error["status_code"], 429);
+    assert_eq!(error["error"]["type"], "usage_limit_reached");
+    let audits = harness
+        .usage_audits_where(1, "settled reported error usage", |audit| {
+            audit.billing_status == "settled" && is_billed(audit)
+        })
+        .await?;
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].request_id, request_id);
+    assert_eq!(audits[0].status_code, Some(429));
+    assert_eq!(audits[0].total_tokens, 12);
+    assert_eq!(harness.upstream.connections(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn quota_retry_that_cannot_connect_keeps_the_client_quota_status_and_releases_plan_cost(
+) -> Result<(), BoxError> {
+    let mut harness = Harness::start_configured(
+        UpstreamBehavior::QuotaThenRejectReplacementUpgrade,
+        ProviderFixture::CodexKeyPair,
+        PiiRedaction::Disabled,
+        false,
+        Some(0.02),
+    )
+    .await?;
+    harness
+        .enable_plan_usage_policy(json!([{
+            "metric": "actual_cost_usd",
+            "window": {"kind": "calendar_week"},
+            "limit": 0.03
+        }]))
+        .await?;
+    let (mut client, request_id) = harness.connect_with_request_id().await?;
+    client
+        .send(response_create(
+            json!({"input": "replacement cannot connect"}),
+        ))
+        .await?;
+    let error = receive_error_or_close(&mut client)
+        .await?
+        .ok_or("missing original quota error")?;
+    assert_eq!(error["status_code"], 429);
+    let audits = harness
+        .usage_audits_where(1, "the settled quota error", |audit| {
+            audit.billing_status != "pending"
+        })
+        .await?;
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].request_id, request_id);
+    assert_eq!(audits[0].status_code, Some(429));
+    assert_eq!(audits[0].actual_total_cost_usd, 0.0);
+    let attempts = harness.terminal_candidate_attempts(&request_id, 2).await?;
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].status_code, Some(429));
+    assert_eq!(attempts[1].status_code, Some(502));
+    assert_ne!(attempts[0].key_id, attempts[1].key_id);
+    assert_eq!(audits[0].provider_api_key_id, attempts[0].key_id);
+    assert_eq!(harness.plan_cost_totals(&request_id).await?, (0, 0, 0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn quota_retry_includes_the_first_attempt_in_end_to_end_timing() -> Result<(), BoxError> {
+    let harness = Harness::start_with_fixture(
+        UpstreamBehavior::DelayedQuotaExhaustion,
+        ProviderFixture::CodexKeyPair,
+    )
+    .await?;
+    let (mut client, request_id) = harness.connect_with_request_id().await?;
+    client
+        .send(response_create(json!({"input": "measure the whole retry"})))
+        .await?;
+    receive_event(&mut client, "response.created").await?;
+    harness.upstream.release_completion.notify_one();
+    receive_event(&mut client, "response.completed").await?;
+    let audits = harness
+        .usage_audits_where(1, "settled retry timing", |audit| {
+            is_billed(audit) && audit.billing_status == "settled"
+        })
+        .await?;
+    assert_eq!(audits.len(), 1);
+    let audit = &audits[0];
+    assert_eq!(audit.request_id, request_id);
+    let metadata = audit
+        .request_metadata
+        .as_ref()
+        .ok_or("usage metadata unavailable")?;
+    let first_byte = metadata["end_to_end_first_byte_time_ms"]
+        .as_u64()
+        .ok_or("missing logical turn first byte timing")?;
+    let total = metadata["end_to_end_time_ms"]
+        .as_u64()
+        .ok_or("missing logical turn total timing")?;
+    assert!(
+        first_byte >= QUOTA_DELAY_MS,
+        "first byte was {first_byte}ms"
+    );
+    assert!(total >= first_byte, "total was {total}ms");
+    let candidate_time = audit.response_time_ms.ok_or("missing candidate latency")?;
+    assert!(
+        total.saturating_sub(candidate_time) >= QUOTA_DELAY_MS,
+        "candidate latency {candidate_time}ms and total {total}ms must remain distinct"
+    );
+    let backends = DataBackends::from_config(DataLayerConfig::from_database(
+        harness.database.config.clone(),
+    ))?;
+    let recent = backends
+        .read()
+        .usage()
+        .ok_or("usage reader unavailable")?
+        .list_recent_usage_audits(None, 1)
+        .await?;
+    let recent = recent.first().ok_or("missing recent retry audit")?;
+    assert_eq!(recent.request_id, request_id);
+    let recent_metadata = recent
+        .request_metadata
+        .as_ref()
+        .ok_or("missing recent retry metadata")?;
+    assert_eq!(
+        recent_metadata["end_to_end_first_byte_time_ms"].as_u64(),
+        Some(first_byte)
+    );
+    assert_eq!(recent_metadata["end_to_end_time_ms"].as_u64(), Some(total));
     Ok(())
 }
 
@@ -841,6 +1094,7 @@ struct Harness {
 enum ProviderFixture {
     /// 单个 openai 类型供应商、单把 key。
     SingleOpenAiKey,
+    SingleCodexKey,
     /// codex 类型供应商 + 两把 key：第一把配额耗尽后重试落到第二把。
     CodexKeyPair,
 }
@@ -849,7 +1103,7 @@ impl ProviderFixture {
     const fn provider_type(self) -> &'static str {
         match self {
             Self::SingleOpenAiKey => "openai",
-            Self::CodexKeyPair => "codex",
+            Self::SingleCodexKey | Self::CodexKeyPair => "codex",
         }
     }
 
@@ -902,10 +1156,21 @@ impl Harness {
 
     async fn start_with_weekly_request_limit(limit: u64) -> Result<Self, BoxError> {
         let mut harness = Self::start(UpstreamBehavior::CompleteEveryTurn).await?;
-        seed_weekly_request_limit(&harness.database.config, limit).await?;
+        harness
+            .enable_plan_usage_policy(json!([{
+                "metric": "request_count",
+                "window": {"kind": "calendar_week"},
+                "limit": limit
+            }]))
+            .await?;
+        Ok(harness)
+    }
+
+    async fn enable_plan_usage_policy(&mut self, rules: Value) -> Result<(), BoxError> {
+        seed_weekly_plan_usage_policy(&self.database.config, rules).await?;
         // The gateway may have cached the pre-entitlement auth context during
         // startup, so restart it after seeding the user-owned key and plan.
-        let data_config = GatewayDataConfig::from_database_config(harness.database.config.clone())
+        let data_config = GatewayDataConfig::from_database_config(self.database.config.clone())
             .with_encryption_key(DEVELOPMENT_ENCRYPTION_KEY);
         let state = AppState::new()?
             .with_data_config_and_background_isolation(data_config, false)?
@@ -914,12 +1179,12 @@ impl Harness {
                 ..UsageRuntimeConfig::default()
             })?;
         let gateway_server = SpawnedServer::start(build_router_with_state(state)).await?;
-        harness.websocket_url = format!(
+        self.websocket_url = format!(
             "{}/v1/responses",
             gateway_server.base_url().replacen("http://", "ws://", 1)
         );
-        harness._gateway_server = gateway_server;
-        Ok(harness)
+        self._gateway_server = gateway_server;
+        Ok(())
     }
 
     async fn start_with(
@@ -1015,15 +1280,30 @@ impl Harness {
     }
 
     async fn connect(&self) -> Result<ClientSocket, BoxError> {
+        self.connect_with_request_id()
+            .await
+            .map(|(socket, _)| socket)
+    }
+
+    async fn connect_with_request_id(&self) -> Result<(ClientSocket, String), BoxError> {
         let mut request = self.websocket_url.clone().into_client_request()?;
         request.headers_mut().insert(
             "authorization",
             http::HeaderValue::from_str(&format!("Bearer {CLIENT_API_KEY}"))?,
         );
-        self.connect_request(request).await
+        self.connect_request_with_id(request).await
     }
 
     async fn connect_request(&self, request: http::Request<()>) -> Result<ClientSocket, BoxError> {
+        self.connect_request_with_id(request)
+            .await
+            .map(|(socket, _)| socket)
+    }
+
+    async fn connect_request_with_id(
+        &self,
+        request: http::Request<()>,
+    ) -> Result<(ClientSocket, String), BoxError> {
         let (socket, response) =
             tokio::time::timeout(RECEIVE_TIMEOUT, tokio_tungstenite::connect_async(request))
                 .await
@@ -1033,7 +1313,13 @@ impl Harness {
                 format!("unexpected gateway handshake status: {}", response.status()).into(),
             );
         }
-        Ok(socket)
+        let request_id = response
+            .headers()
+            .get("x-aether-control-request-id")
+            .ok_or("missing gateway handshake request ID")?
+            .to_str()?
+            .to_owned();
+        Ok((socket, request_id))
     }
 
     /// Waits until `expected` usage rows satisfy `settled`.
@@ -1102,6 +1388,60 @@ impl Harness {
         Ok(audits)
     }
 
+    async fn plan_cost_totals(&self, request_id: &str) -> Result<(i64, i64, i64), BoxError> {
+        let pool = sqlx::PgPool::connect(&self.database.config.url).await?;
+        let totals = sqlx::query_as(
+            "SELECT COUNT(*) FILTER (WHERE state = 'finalized'),
+                    COALESCE(SUM(actual_cost_units) FILTER (WHERE state = 'finalized'), 0)::bigint,
+                    COUNT(*) FILTER (WHERE state = 'reserved')
+             FROM usage_cost_reservations WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await?;
+        pool.close().await;
+        Ok(totals)
+    }
+
+    async fn terminal_candidate_attempts(
+        &self,
+        request_id: &str,
+        expected: usize,
+    ) -> Result<Vec<StoredRequestCandidate>, BoxError> {
+        let backends = DataBackends::from_config(DataLayerConfig::from_database(
+            self.database.config.clone(),
+        ))?;
+        let reader = backends
+            .read()
+            .request_candidates()
+            .ok_or("request candidate reader unavailable")?;
+        let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+        loop {
+            let candidates = reader.list_attempted_by_request_id(request_id).await?;
+            let terminal = candidates
+                .iter()
+                .filter(|attempt| {
+                    matches!(
+                        attempt.status,
+                        RequestCandidateStatus::Success
+                            | RequestCandidateStatus::Failed
+                            | RequestCandidateStatus::Cancelled
+                    )
+                })
+                .count();
+            if terminal >= expected {
+                return Ok(candidates);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "expected {expected} terminal candidates for {request_id}, found {terminal}"
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     async fn set_client_api_key_active(&self, is_active: bool) -> Result<(), BoxError> {
         let backends = DataBackends::from_config(DataLayerConfig::from_database(
             self.database.config.clone(),
@@ -1155,10 +1495,10 @@ where
                 Message::Text(text) => {
                     let event: Value = serde_json::from_str(text.as_ref())?;
                     match event.get("type").and_then(Value::as_str) {
+                        Some(event_type) if event_type == expected_type => return Ok(event),
                         Some("error") => {
                             return Err(format!("gateway returned an error event: {event}").into())
                         }
-                        Some(event_type) if event_type == expected_type => return Ok(event),
                         _ => {}
                     }
                 }
@@ -1225,6 +1565,9 @@ enum UpstreamBehavior {
     /// 第一轮刻意不发 `response.created`：任何标准 `response.*` 事件都会让
     /// codex adapter 把这一轮判成 replay-unsafe，透明重试就不会发生。
     QuotaExhaustedThenComplete,
+    QuotaExhaustedWithUsage,
+    QuotaThenRejectReplacementUpgrade,
+    DelayedQuotaExhaustion,
     /// 把收到的 `input` 原样回显成一个 delta，再正常完成。
     ///
     /// 上游看到的是脱敏后的 body，所以回显出来的就是占位符——正是响应侧还原要处理
@@ -1291,6 +1634,11 @@ async fn mock_responses_websocket(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if state.behavior == UpstreamBehavior::QuotaThenRejectReplacementUpgrade
+        && state.connections() > 0
+    {
+        return axum::response::IntoResponse::into_response(http::StatusCode::SERVICE_UNAVAILABLE);
+    }
     let authorization = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -1358,13 +1706,35 @@ async fn run_mock_upstream(
                         let _ = send_mock_created(&mut socket, &response_id).await;
                         break;
                     }
-                    UpstreamBehavior::QuotaExhaustedThenComplete => {
+                    UpstreamBehavior::QuotaExhaustedThenComplete
+                    | UpstreamBehavior::QuotaExhaustedWithUsage
+                    | UpstreamBehavior::QuotaThenRejectReplacementUpgrade
+                    | UpstreamBehavior::DelayedQuotaExhaustion => {
                         if turn == 1 {
-                            let _ =
-                                send_mock_event(&mut socket, codex_quota_exhausted_error()).await;
+                            if state.behavior == UpstreamBehavior::DelayedQuotaExhaustion {
+                                tokio::time::sleep(Duration::from_millis(QUOTA_DELAY_MS)).await;
+                            }
+                            let mut error = codex_quota_exhausted_error();
+                            if state.behavior == UpstreamBehavior::QuotaExhaustedWithUsage {
+                                error["usage"] = json!({
+                                    "input_tokens": 10, "output_tokens": 2, "total_tokens": 12
+                                });
+                            }
+                            let _ = send_mock_event(&mut socket, error).await;
                             break;
                         }
-                        if send_mock_turn(&mut socket, &response_id).await.is_err() {
+                        if state.behavior == UpstreamBehavior::QuotaExhaustedWithUsage {
+                            let _ = send_mock_turn(&mut socket, &response_id).await;
+                            break;
+                        }
+                        if send_mock_created(&mut socket, &response_id).await.is_err() {
+                            break;
+                        }
+                        state.release_completion.notified().await;
+                        if send_mock_turn_after_created(&mut socket, &response_id, "hello")
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -1456,6 +1826,14 @@ async fn send_mock_turn_with_delta(
     delta: &str,
 ) -> Result<(), axum::Error> {
     send_mock_created(socket, response_id).await?;
+    send_mock_turn_after_created(socket, response_id, delta).await
+}
+
+async fn send_mock_turn_after_created(
+    socket: &mut WebSocket,
+    response_id: &str,
+    delta: &str,
+) -> Result<(), axum::Error> {
     send_mock_event(
         socket,
         json!({
@@ -1641,7 +2019,7 @@ fn catalog_key(
     secret: &str,
     fixture: ProviderFixture,
 ) -> Result<StoredProviderCatalogKey, BoxError> {
-    let oauth = fixture.has_alternate_key();
+    let oauth = fixture.provider_type() == "codex";
     let auth_type = if oauth { "oauth" } else { "api_key" };
     let auth_config = if oauth {
         Some(encrypt_python_fernet_plaintext(
@@ -1797,9 +2175,9 @@ async fn seed_client_api_key(backends: &DataBackends, user_id: &str) -> Result<(
     Ok(())
 }
 
-async fn seed_weekly_request_limit(
+async fn seed_weekly_plan_usage_policy(
     database: &SqlDatabaseConfig,
-    limit: u64,
+    rules: Value,
 ) -> Result<(), BoxError> {
     let backends = DataBackends::from_config(DataLayerConfig::from_database(database.clone()))?;
     let user_id = backends
@@ -1875,11 +2253,7 @@ INSERT INTO billing_plans (
     .bind(
         json!([{
             "type": "usage_policy",
-            "rules": [{
-                "metric": "request_count",
-                "window": {"kind": "calendar_week"},
-                "limit": limit
-            }]
+            "rules": &rules
         }])
         .to_string(),
     )
@@ -1926,11 +2300,7 @@ INSERT INTO user_plan_entitlements (
     .bind(
         json!([{
             "type": "usage_policy",
-            "rules": [{
-                "metric": "request_count",
-                "window": {"kind": "calendar_week"},
-                "limit": limit
-            }]
+            "rules": rules
         }])
         .to_string(),
     )

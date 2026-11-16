@@ -3,6 +3,9 @@ export function formatClientFamily(value: string | null | undefined): string {
   if (!normalized) return 'unknown'
   if (normalized === 'codex') return 'Codex'
   if (normalized === 'codex_vscode') return 'Codex VS Code'
+  if (normalized === 'workbuddy') return 'WorkBuddy'
+  if (normalized === 'deepseek_harness') return 'DeepSeek Harness'
+  if (normalized === 'hermes_agent') return 'Hermes Agent'
   if (normalized === 'claude_code') return 'Claude Code'
   if (normalized === 'opencode') return 'OpenCode'
   if (normalized === 'gemini_cli') return 'Gemini CLI'
@@ -25,5 +28,5 @@ export function formatClientFamily(value: string | null | undefined): string {
   if (normalized === 'sdk') return 'SDK'
   if (normalized === 'generic') return 'generic'
   if (normalized === 'unknown') return 'unknown'
-  return 'unknown'
+  return /^[a-z0-9][a-z0-9._-]{0,63}$/.test(normalized) ? normalized : 'unknown'
 }

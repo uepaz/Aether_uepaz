@@ -40,13 +40,17 @@ pub fn resolve_transport_execution_timeouts(
             .request_timeout_secs
             .filter(|value| value.is_finite() && *value > 0.0)
             .map(timeout_secs_to_ms),
-        first_byte_ms: Some(timeout_secs_to_ms(
-            transport
+        first_byte_ms: Some(
+            match transport
                 .provider
                 .stream_first_byte_timeout_secs
-                .filter(|value| value.is_finite() && *value > 0.0)
-                .unwrap_or(DEFAULT_PROVIDER_STREAM_FIRST_BYTE_TIMEOUT_SECS),
-        )),
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .unwrap_or(DEFAULT_PROVIDER_STREAM_FIRST_BYTE_TIMEOUT_SECS)
+            {
+                0.0 => 0,
+                secs => timeout_secs_to_ms(secs),
+            },
+        ),
         ..ExecutionTimeouts::default()
     })
 }
@@ -553,6 +557,18 @@ mod tests {
 
         assert_eq!(timeouts.total_ms, None);
         assert_eq!(timeouts.first_byte_ms, Some(7_500));
+    }
+
+    #[test]
+    fn transport_execution_timeouts_preserve_disabled_first_byte_value() {
+        let mut transport = sample_transport();
+        transport.provider.stream_first_byte_timeout_secs = Some(0.0);
+        transport.provider.request_timeout_secs = Some(90.0);
+        let timeouts = resolve_transport_execution_timeouts(&transport).unwrap();
+        assert_eq!(timeouts.first_byte_ms, Some(0));
+        assert_eq!(timeouts.total_ms, Some(90_000));
+        let encoded = serde_json::to_value(&timeouts).unwrap();
+        assert_eq!(encoded["first_byte_ms"], json!(0));
     }
 
     #[test]

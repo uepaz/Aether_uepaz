@@ -1,8 +1,9 @@
 use aether_data_contracts::repository::billing::StoredBillingModelContext;
 use aether_data_contracts::repository::usage::{
-    extract_provider_cache_ttl_minutes_from_metadata, resolve_provider_cache_ttl_minutes,
-    resolve_provider_service_tier_from_request_capture, CANCELLED_REQUEST_FEE_METADATA_KEY,
-    USAGE_AVAILABLE_METADATA_KEY, USAGE_PRICING_AVAILABLE_METADATA_KEY,
+    extract_provider_cache_ttl_minutes_from_metadata, failed_usage_is_billable, reported_usage,
+    resolve_provider_cache_ttl_minutes, resolve_provider_service_tier_from_request_capture,
+    CANCELLED_REQUEST_FEE_METADATA_KEY, USAGE_AVAILABLE_METADATA_KEY,
+    USAGE_PRICING_AVAILABLE_METADATA_KEY,
 };
 use aether_data_contracts::DataLayerError;
 use aether_usage_runtime::{UsageEvent, UsageEventType};
@@ -80,7 +81,9 @@ pub async fn enrich_usage_event_with_billing(
     if !matches!(
         event.event_type,
         UsageEventType::Completed | UsageEventType::Cancelled
-    ) {
+    ) && !(event.event_type == UsageEventType::Failed
+        && failed_usage_is_billable(event.data.request_metadata.as_ref()))
+    {
         event.data.total_cost_usd = Some(0.0);
         event.data.actual_total_cost_usd = Some(0.0);
         return Ok(());
@@ -254,6 +257,19 @@ fn calculate_billing_computation(
         cache_ttl_minutes: usage_event_provider_cache_ttl_minutes(&event.data)
             .or(pricing.provider_api_key_cache_ttl_minutes),
     };
+
+    if event.event_type == UsageEventType::Failed {
+        if let Some(usage) = reported_usage(event.data.request_metadata.as_ref()) {
+            input.input_tokens = usage.input_tokens as i64;
+            input.output_tokens = usage.output_tokens as i64;
+            input.cache_creation_tokens = usage.cache_creation_tokens as i64;
+            input.cache_creation_ephemeral_5m_tokens =
+                usage.cache_creation_ephemeral_5m_tokens as i64;
+            input.cache_creation_ephemeral_1h_tokens =
+                usage.cache_creation_ephemeral_1h_tokens as i64;
+            input.cache_read_tokens = usage.cache_read_tokens as i64;
+        }
+    }
 
     if cancelled {
         input.input_tokens = 0;
@@ -1950,6 +1966,70 @@ mod tests {
             } else {
                 assert!(metadata.get("billing_snapshot").is_none());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_conversion_charges_only_reported_usage_and_keeps_failure() {
+        let lookup = wire_billing_lookup(
+            Some(
+                json!({"tiers":[{"up_to":null,"input_price_per_1m":3.0,"output_price_per_1m":15.0,"cache_read_price_per_1m":0.30}]}),
+            ),
+            None,
+        );
+        let mut event = wire_billing_event("failed-conversion-reported");
+        event.event_type = UsageEventType::Failed;
+        event.data.status_code = Some(502);
+        event.data.error_message = Some("response conversion failed".into());
+        // Display totals include local estimates; only the server-captured upstream snapshot
+        // may contribute to a failed request's charge.
+        event.data.input_tokens = Some(9_000_000);
+        event.data.output_tokens = Some(9_000_000);
+        event.data.request_metadata.as_mut().unwrap()["reported_usage"] = json!({
+            "input_tokens": 1000, "output_tokens": 100, "cache_read_tokens": 1000
+        });
+        enrich_usage_event_with_billing(&lookup, &mut event)
+            .await
+            .unwrap();
+        // OpenAI input includes the cached 1000 tokens: $0.0003 cache + $0.0015 output.
+        assert!((event.data.total_cost_usd.unwrap() - 0.0018).abs() < 1e-10);
+        assert_eq!(event.event_type, UsageEventType::Failed);
+        assert_eq!(event.data.input_tokens, Some(9_000_000));
+        let record = aether_usage_runtime::build_upsert_usage_record_from_event(&event).unwrap();
+        assert_eq!(record.status, "failed");
+        assert_eq!(record.billing_status, "pending");
+    }
+
+    #[tokio::test]
+    async fn failed_cache_only_usage_bills_cache_write_and_read_without_request_fee() {
+        let lookup = wire_billing_lookup(
+            Some(
+                json!({"tiers":[{"up_to":null,"input_price_per_1m":3.0,"output_price_per_1m":15.0,"cache_creation_price_per_1m":3.75,"cache_read_price_per_1m":0.30}]}),
+            ),
+            Some(1.0),
+        );
+        let mut event = wire_billing_event("failed-cache-only");
+        event.event_type = UsageEventType::Failed;
+        event.data.status_code = Some(502);
+        event.data.endpoint_api_format = Some("claude:messages".into());
+        event.data.request_metadata.as_mut().unwrap()["reported_usage"] = json!({
+            "cache_creation_tokens": 1000, "cache_read_tokens": 1000
+        });
+        enrich_usage_event_with_billing(&lookup, &mut event)
+            .await
+            .unwrap();
+        assert!((event.data.total_cost_usd.unwrap() - 0.00405).abs() < 1e-10);
+
+        for source in ["estimated", "mixed", "unknown"] {
+            let mut event = wire_billing_event(source);
+            event.event_type = UsageEventType::Failed;
+            event.data.request_metadata.as_mut().unwrap()["analytics_measurement"] =
+                json!({"source":source});
+            enrich_usage_event_with_billing(&lookup, &mut event)
+                .await
+                .unwrap();
+            assert_eq!(event.data.total_cost_usd, Some(0.0));
+            assert_eq!(event.data.actual_total_cost_usd, Some(0.0));
         }
     }
 

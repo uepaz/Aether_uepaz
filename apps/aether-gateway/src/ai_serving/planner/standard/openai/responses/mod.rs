@@ -64,6 +64,7 @@ mod plans;
 
 use self::decision::{
     build_local_openai_responses_candidate_attempt_source,
+    build_local_openai_responses_candidate_attempt_source_from,
     maybe_build_local_openai_responses_decision_payload_for_candidate,
     maybe_build_local_openai_responses_decision_payload_for_candidate_with_websocket_mode,
     resolve_local_openai_responses_decision_input,
@@ -234,6 +235,7 @@ pub(crate) struct ResponsesWebSocketDecision {
     pub(crate) execution: AiExecutionDecision,
     pub(crate) adapter: ResponsesWebSocketAdapter,
     pub(crate) normalization: ResponsesWebSocketBodyNormalization,
+    pub(crate) next_candidate_index: u32,
     /// Effective key auth after applying the endpoint API-format override.
     /// Protocol companions such as Codex Live must not infer this from a URL
     /// or from the presence of one particular generated header.
@@ -743,6 +745,7 @@ pub(crate) async fn maybe_build_responses_websocket_decision(
     excluded_key_ids: Option<&BTreeSet<String>>,
     excluded_codex_account_ids: Option<&BTreeSet<String>>,
     pinned_candidate: Option<&ResponsesWebSocketPinnedCandidate>,
+    starting_candidate_index: u32,
 ) -> Result<Option<ResponsesWebSocketDecision>, GatewayError> {
     let Some(spec) = resolve_stream_spec(crate::ai_serving::OPENAI_RESPONSES_STREAM_PLAN_KIND)
     else {
@@ -770,8 +773,13 @@ pub(crate) async fn maybe_build_responses_websocket_decision(
         .and_then(serde_json::Value::as_str)
         .is_some_and(|value| !value.trim().is_empty());
     let body_json = input.effective_body_json(body_json);
-    let (mut source, _) = build_local_openai_responses_candidate_attempt_source(
-        state, trace_id, &input, body_json, spec,
+    let (mut source, _) = build_local_openai_responses_candidate_attempt_source_from(
+        state,
+        trace_id,
+        &input,
+        body_json,
+        spec,
+        starting_candidate_index,
     )
     .await?;
 
@@ -912,6 +920,7 @@ pub(crate) async fn maybe_build_responses_websocket_decision(
                 execution: payload,
                 adapter,
                 normalization,
+                next_candidate_index: source.next_candidate_index(),
                 effective_auth_type,
             };
             // The decision report context now carries the lease identity. The

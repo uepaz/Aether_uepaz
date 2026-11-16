@@ -1484,7 +1484,7 @@ pub(crate) fn maybe_execute_sync_request<'a>(
     state: &'a AppState,
     parts: &'a http::request::Parts,
     body_bytes: &'a axum::body::Bytes,
-    trace_id: &'a str,
+    request_id: &'a str,
     decision: Option<&'a GatewayControlDecision>,
 ) -> Pin<Box<dyn Future<Output = Result<LocalExecutionRequestOutcome, GatewayError>> + Send + 'a>> {
     Box::pin(async move {
@@ -1496,7 +1496,7 @@ pub(crate) fn maybe_execute_sync_request<'a>(
             if parts.method != http::Method::POST && !supports_local_video_get(parts, decision) {
                 return Ok(LocalExecutionRequestOutcome::NoPath);
             }
-            return maybe_execute_sync_local_path(state, parts, body_bytes, trace_id, decision)
+            return maybe_execute_sync_local_path(state, parts, body_bytes, request_id, decision)
                 .await;
         }
         #[cfg(test)]
@@ -1510,7 +1510,7 @@ pub(crate) fn maybe_execute_sync_request<'a>(
             {
                 return Ok(LocalExecutionRequestOutcome::NoPath);
             }
-            maybe_execute_sync_local_path(state, parts, body_bytes, trace_id, decision).await
+            maybe_execute_sync_local_path(state, parts, body_bytes, request_id, decision).await
         }
     })
 }
@@ -1519,7 +1519,7 @@ pub(crate) fn maybe_execute_stream_request<'a>(
     state: &'a AppState,
     parts: &'a http::request::Parts,
     body_bytes: &'a axum::body::Bytes,
-    trace_id: &'a str,
+    request_id: &'a str,
     decision: Option<&'a GatewayControlDecision>,
 ) -> Pin<Box<dyn Future<Output = Result<LocalExecutionRequestOutcome, GatewayError>> + Send + 'a>> {
     Box::pin(async move {
@@ -1531,7 +1531,7 @@ pub(crate) fn maybe_execute_stream_request<'a>(
             if parts.method != http::Method::POST && !supports_local_video_get(parts, decision) {
                 return Ok(LocalExecutionRequestOutcome::NoPath);
             }
-            return maybe_execute_stream_local_path(state, parts, body_bytes, trace_id, decision)
+            return maybe_execute_stream_local_path(state, parts, body_bytes, request_id, decision)
                 .await;
         }
         #[cfg(test)]
@@ -1545,7 +1545,7 @@ pub(crate) fn maybe_execute_stream_request<'a>(
             {
                 return Ok(LocalExecutionRequestOutcome::NoPath);
             }
-            maybe_execute_stream_local_path(state, parts, body_bytes, trace_id, decision).await
+            maybe_execute_stream_local_path(state, parts, body_bytes, request_id, decision).await
         }
     })
 }

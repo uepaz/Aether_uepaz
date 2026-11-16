@@ -421,6 +421,7 @@ async fn gateway_executes_gemini_cli_sync_via_local_decision_gate_with_local_syn
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     let response_status = response.status();
     let response_body = response.text().await.expect("body should read");
@@ -472,7 +473,7 @@ async fn gateway_executes_gemini_cli_sync_via_local_decision_gate_with_local_syn
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-gemini-cli-local-sync-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -745,6 +746,7 @@ async fn gateway_returns_gemini_cli_error_for_local_sync_failure_impl() {
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
@@ -766,7 +768,7 @@ async fn gateway_returns_gemini_cli_error_for_local_sync_failure_impl() {
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-gemini-cli-local-error-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -1264,6 +1266,7 @@ async fn gateway_executes_gemini_cli_sync_via_local_decision_gate_after_oauth_re
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     let response_status = response.status();
     let response_body = response.text().await.expect("response body should read");
@@ -1312,10 +1315,7 @@ async fn gateway_executes_gemini_cli_sync_via_local_decision_gate_after_oauth_re
         seen_execution_runtime_request.outer_model,
         "gemini-cli-upstream"
     );
-    assert_eq!(
-        seen_execution_runtime_request.user_prompt_id,
-        "trace-gemini-cli-oauth-local-sync-123"
-    );
+    assert_eq!(seen_execution_runtime_request.user_prompt_id, request_id);
     assert!(!seen_execution_runtime_request.inner_model_present);
     assert_eq!(
         seen_execution_runtime_request.authorization,
@@ -1342,7 +1342,7 @@ async fn gateway_executes_gemini_cli_sync_via_local_decision_gate_after_oauth_re
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-gemini-cli-oauth-local-sync-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -1750,6 +1750,7 @@ async fn gateway_executes_vertex_ai_gemini_cli_sync_via_local_decision_gate_with
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
 
@@ -1783,7 +1784,7 @@ async fn gateway_executes_vertex_ai_gemini_cli_sync_via_local_decision_gate_with
     assert!(!seen_execution_runtime_request.tool_config_present);
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-vertex-cli-local-sync-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -2286,6 +2287,7 @@ async fn gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_af
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     let response_json: serde_json::Value = response.json().await.expect("body should parse");
@@ -2365,10 +2367,7 @@ async fn gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_af
         seen_execution_runtime_request.project,
         "project-antigravity-local-1"
     );
-    assert_eq!(
-        seen_execution_runtime_request.request_id,
-        "trace-antigravity-cli-oauth-local-sync-123"
-    );
+    assert_eq!(seen_execution_runtime_request.request_id, request_id);
     assert_eq!(seen_execution_runtime_request.model, "claude-sonnet-4-5");
     assert_eq!(
         seen_execution_runtime_request.user_agent,
@@ -2380,7 +2379,7 @@ async fn gateway_executes_antigravity_gemini_cli_sync_via_local_decision_gate_af
     assert!(!seen_execution_runtime_request.request_has_model);
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-antigravity-cli-oauth-local-sync-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);

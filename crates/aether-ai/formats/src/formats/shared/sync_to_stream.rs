@@ -20,6 +20,7 @@ use crate::formats::openai::image::{
 use crate::formats::openai::responses::history::{
     record_converted_response_history, ResponseHistoryRecord,
 };
+use crate::formats::openai::usage::OpenAiUsageFormat;
 use crate::formats::shared::sse::{encode_done_sse, encode_json_sse};
 use crate::formats::shared::stream_core::common::{
     build_openai_chat_chunk, build_openai_chat_finish_chunk,
@@ -1277,44 +1278,21 @@ fn resolve_openai_responses_finish_reason(output: &[Value]) -> String {
 
 fn standardized_usage_from_openai_usage(value: &Value) -> Option<StandardizedUsage> {
     let usage = value.as_object()?;
-    let mut input_tokens = usage
-        .get("input_tokens")
-        .or_else(|| usage.get("prompt_tokens"))
+    // 此处消费的是已转换的 Responses 响应或使用 input/output 字段的图片响应。
+    let format = OpenAiUsageFormat::Responses;
+    let input = format.input_tokens(usage);
+    let mut input_tokens = input.and_then(Value::as_i64).unwrap_or(0);
+    let output_tokens = format
+        .output_tokens(usage)
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    let output_tokens = usage
-        .get("output_tokens")
-        .or_else(|| usage.get("completion_tokens"))
+    let cache_creation_tokens = format
+        .cache_write_tokens(usage)
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    let cache_creation_tokens = usage
-        .get("cache_creation_input_tokens")
+    let cache_read_tokens = format
+        .cache_read_tokens(usage)
         .and_then(Value::as_i64)
-        .or_else(|| {
-            usage
-                .get("input_tokens_details")
-                .or_else(|| usage.get("prompt_tokens_details"))
-                .and_then(Value::as_object)
-                .and_then(|details| {
-                    details
-                        .get("cache_write_tokens")
-                        .or_else(|| details.get("cached_creation_tokens"))
-                        .or_else(|| details.get("cache_creation_tokens"))
-                })
-                .and_then(Value::as_i64)
-        })
-        .unwrap_or(0);
-    let cache_read_tokens = usage
-        .get("cache_read_input_tokens")
-        .and_then(Value::as_i64)
-        .or_else(|| {
-            usage
-                .get("input_tokens_details")
-                .or_else(|| usage.get("prompt_tokens_details"))
-                .and_then(Value::as_object)
-                .and_then(|details| details.get("cached_tokens"))
-                .and_then(Value::as_i64)
-        })
         .unwrap_or(0);
     let total_tokens = usage.get("total_tokens").and_then(Value::as_i64).unwrap_or(
         input_tokens
@@ -1322,7 +1300,7 @@ fn standardized_usage_from_openai_usage(value: &Value) -> Option<StandardizedUsa
             .saturating_add(cache_creation_tokens)
             .saturating_add(cache_read_tokens),
     );
-    if input_tokens == 0 && total_tokens > output_tokens {
+    if input.is_none() && total_tokens > output_tokens {
         input_tokens = total_tokens.saturating_sub(output_tokens);
     }
     let mut standardized_usage = StandardizedUsage::new();
@@ -1345,6 +1323,58 @@ mod tests {
         OpenAiImageOutput,
     };
     use crate::formats::openai::namespace::NamespaceToolAliases;
+
+    #[test]
+    fn sync_bridge_usage_prefers_provider_protocol_fields() {
+        for format in ["openai:chat", "openai:responses"] {
+            for (input, output) in [(3197, 1034), (0, 0)] {
+                let mut usage = json!({
+                    "prompt_tokens": 71, "completion_tokens": 29,
+                    "input_tokens": 71, "output_tokens": 29,
+                    "total_tokens": input + output,
+                });
+                let chat = format == "openai:chat";
+                usage[if chat {
+                    "prompt_tokens"
+                } else {
+                    "input_tokens"
+                }] = input.into();
+                usage[if chat {
+                    "completion_tokens"
+                } else {
+                    "output_tokens"
+                }] = output.into();
+                let response = if chat {
+                    json!({"id": "chatcmpl_usage", "object": "chat.completion", "model": "test",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"}], "usage": usage})
+                } else {
+                    json!({"id": "resp_usage", "object": "response", "model": "test",
+                        "status": "completed", "output": [{"id": "msg_usage", "type": "message",
+                            "role": "assistant", "status": "completed",
+                            "content": [{"type": "output_text", "text": "ok", "annotations": []}]}],
+                        "usage": usage})
+                };
+                // Exercise conversion as well as the same-family bridge.
+                for client in ["openai:chat", "openai:responses", "claude:messages"] {
+                    let outcome =
+                        maybe_bridge_standard_sync_json_to_stream(&response, format, client, None)
+                            .unwrap()
+                            .unwrap();
+                    let measured = outcome
+                        .terminal_summary
+                        .unwrap()
+                        .standardized_usage
+                        .unwrap();
+                    assert_eq!(
+                        (measured.input_tokens, measured.output_tokens),
+                        (input, output),
+                        "{format} -> {client}"
+                    );
+                }
+            }
+        }
+    }
 
     fn utf8(bytes: Vec<u8>) -> String {
         String::from_utf8(bytes).expect("utf8 should decode")

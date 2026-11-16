@@ -49,9 +49,7 @@ async fn gateway_executes_claude_chat_sync_via_local_decision_gate_with_local_sy
         trace_id: String,
         url: String,
         model: String,
-        stream: Option<bool>,
         auth_header_value: String,
-        accept: String,
         anthropic_version: String,
         anthropic_beta: String,
         endpoint_tag: String,
@@ -295,20 +293,9 @@ async fn gateway_executes_claude_chat_sync_via_local_decision_gate_with_local_sy
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_string(),
-                    stream: payload
-                        .get("body")
-                        .and_then(|value| value.get("json_body"))
-                        .and_then(|value| value.get("stream"))
-                        .and_then(|value| value.as_bool()),
                     auth_header_value: payload
                         .get("headers")
                         .and_then(|value| value.get("x-api-key"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    accept: payload
-                        .get("headers")
-                        .and_then(|value| value.get("accept"))
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_string(),
@@ -445,6 +432,7 @@ async fn gateway_executes_claude_chat_sync_via_local_decision_gate_with_local_sy
         .send()
         .await
         .expect("request should succeed");
+    let billing_request_id_1 = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     let response_json: serde_json::Value = response.json().await.expect("body should parse");
@@ -498,7 +486,7 @@ async fn gateway_executes_claude_chat_sync_via_local_decision_gate_with_local_sy
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-claude-chat-local-123")
+        .list_by_request_id(&billing_request_id_1)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -514,98 +502,49 @@ async fn gateway_executes_claude_chat_sync_via_local_decision_gate_with_local_sy
     assert_eq!(*plan_hits.lock().expect("mutex should lock"), 0);
     assert_eq!(*public_hits.lock().expect("mutex should lock"), 0);
 
-    for (case, body, expected_message) in [
-        ("missing-body", None, "Request body is required"),
-        ("invalid-json", Some("{"), "Invalid JSON body"),
+    for (case, body) in [
+        ("missing-body", None),
+        ("invalid-json", Some("{")),
+        ("missing-model", Some(r#"{"messages":[]}"#)),
+        ("missing-messages", Some(r#"{"model":"claude-sonnet-4-5"}"#)),
         (
-            "missing-model",
-            Some(r#"{"messages":[]}"#),
-            "model: Field required",
-        ),
-        (
-            "missing-messages",
-            Some(r#"{"model":"claude-sonnet-4-5"}"#),
-            "messages: Field required",
+            "valid",
+            Some(
+                r#"{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+            ),
         ),
     ] {
+        let trace_id = format!("trace-claude-count-tokens-{case}");
         let mut request = reqwest::Client::new()
             .post(format!("{gateway_url}/v1/messages/count_tokens"))
             .header(http::header::CONTENT_TYPE, "application/json")
             .header("x-api-key", "sk-client-claude-chat-local")
             .header("anthropic-version", "2023-06-01")
-            .header(TRACE_ID_HEADER, format!("trace-claude-count-tokens-{case}"));
+            .header(TRACE_ID_HEADER, &trace_id);
         if let Some(body) = body {
             request = request.body(body);
         }
-        let invalid_response = request
+        let response = request
             .send()
             .await
-            .expect("invalid count_tokens request should complete locally");
-        assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
-        let invalid_json: serde_json::Value = invalid_response
+            .expect("disabled count_tokens should respond locally");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "case: {case}");
+        let payload: serde_json::Value = response
             .json()
             .await
             .expect("Anthropic error body should parse");
-        assert_eq!(invalid_json["type"], "error");
-        assert_eq!(invalid_json["error"]["type"], "invalid_request_error");
-        assert_eq!(invalid_json["error"]["message"], expected_message);
+        assert_eq!(payload["type"], "error");
+        assert_eq!(payload["error"]["type"], "not_found_error");
         assert_eq!(
-            seen_execution_runtime
-                .lock()
-                .expect("mutex should lock")
-                .as_ref()
-                .map(|request| request.url.as_str()),
-            Some("https://api.anthropic.example/custom/v1/messages"),
-            "invalid count_tokens request must not reach the execution runtime"
+            payload["error"]["message"],
+            "Token counting endpoint is disabled"
         );
+        assert!(request_candidate_repository
+            .list_by_request_id(&trace_id)
+            .await
+            .unwrap()
+            .is_empty());
     }
-
-    let count_tokens_response = reqwest::Client::new()
-        .post(format!("{gateway_url}/v1/messages/count_tokens"))
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .header("x-api-key", "sk-client-claude-chat-local")
-        .header("anthropic-version", "2023-06-01")
-        .header(TRACE_ID_HEADER, "trace-claude-count-tokens-local-123")
-        .body(
-            "{\"model\":\"claude-sonnet-4-5\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"stream\":true}",
-        )
-        .send()
-        .await
-        .expect("count_tokens request should succeed");
-
-    assert_eq!(count_tokens_response.status(), StatusCode::OK);
-    assert_eq!(
-        count_tokens_response
-            .headers()
-            .get(EXECUTION_PATH_HEADER)
-            .and_then(|value| value.to_str().ok()),
-        Some(EXECUTION_PATH_EXECUTION_RUNTIME_SYNC)
-    );
-    let seen_count_tokens = seen_execution_runtime
-        .lock()
-        .expect("mutex should lock")
-        .clone()
-        .expect("count_tokens execution request should be captured");
-    assert_eq!(
-        seen_count_tokens.url,
-        "https://api.anthropic.example/custom/v1/messages/count_tokens"
-    );
-    assert_eq!(seen_count_tokens.model, "claude-sonnet-4-5-upstream");
-    assert_eq!(seen_count_tokens.stream, None);
-    assert_eq!(seen_count_tokens.accept, "application/json");
-    assert_eq!(
-        seen_count_tokens.auth_header_value,
-        "sk-upstream-claude-chat"
-    );
-
-    let count_tokens_json: serde_json::Value = count_tokens_response
-        .json()
-        .await
-        .expect("count_tokens response should parse");
-    assert_eq!(
-        count_tokens_json["input_tokens"], 17,
-        "unexpected count_tokens response: {count_tokens_json}"
-    );
 
     use std::io::Write as _;
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -614,7 +553,6 @@ async fn gateway_executes_claude_chat_sync_via_local_decision_gate_with_local_sy
             br#"{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hello"}]}"#,
         )
         .expect("gzip request body should encode");
-    let gzip_body = encoder.finish().expect("gzip request body should finish");
     let gzip_count_tokens_response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/messages/count_tokens"))
         .header(http::header::CONTENT_TYPE, "application/json")
@@ -622,16 +560,27 @@ async fn gateway_executes_claude_chat_sync_via_local_decision_gate_with_local_sy
         .header("x-api-key", "sk-client-claude-chat-local")
         .header("anthropic-version", "2023-06-01")
         .header(TRACE_ID_HEADER, "trace-claude-count-tokens-gzip-123")
-        .body(gzip_body)
+        .body(encoder.finish().expect("gzip request body should finish"))
         .send()
         .await
-        .expect("gzip count_tokens request should succeed");
-    assert_eq!(gzip_count_tokens_response.status(), StatusCode::OK);
-    let gzip_count_tokens_json: serde_json::Value = gzip_count_tokens_response
-        .json()
+        .expect("disabled gzip count_tokens should respond locally");
+    assert_eq!(gzip_count_tokens_response.status(), StatusCode::NOT_FOUND);
+    let payload: serde_json::Value = gzip_count_tokens_response.json().await.unwrap();
+    assert_eq!(payload["error"]["type"], "not_found_error");
+    assert!(request_candidate_repository
+        .list_by_request_id("trace-claude-count-tokens-gzip-123")
         .await
-        .expect("gzip count_tokens response should parse");
-    assert_eq!(gzip_count_tokens_json["input_tokens"], 17);
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        seen_execution_runtime
+            .lock()
+            .expect("mutex should lock")
+            .as_ref()
+            .map(|request| request.url.as_str()),
+        Some("https://api.anthropic.example/custom/v1/messages"),
+        "count_tokens must not replace the successful Messages execution or contact upstream",
+    );
 
     gateway_handle.abort();
     execution_runtime_handle.abort();
@@ -735,6 +684,7 @@ async fn gateway_surfaces_candidate_list_empty_reason_for_claude_chat_runtime_mi
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
@@ -760,7 +710,7 @@ async fn gateway_surfaces_candidate_list_empty_reason_for_claude_chat_runtime_mi
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-claude-chat-empty-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert!(stored_candidates.is_empty());
@@ -1052,6 +1002,7 @@ async fn gateway_returns_claude_chat_error_for_local_sync_failure_impl() {
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
@@ -1074,7 +1025,7 @@ async fn gateway_returns_claude_chat_error_for_local_sync_failure_impl() {
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-claude-chat-local-error-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);

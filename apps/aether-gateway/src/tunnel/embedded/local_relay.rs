@@ -159,8 +159,9 @@ fn map_request_admission_error(error: super::RequestAdmissionError) -> String {
     }
 }
 
-fn relay_header_timeout(meta: &protocol::RequestMeta) -> Duration {
-    Duration::from_millis(resolve_tunnel_request_timeouts(meta).first_byte_ms)
+fn relay_header_timeout(meta: &protocol::RequestMeta) -> Option<Duration> {
+    let timeout_ms = resolve_tunnel_request_timeouts(meta).first_byte_ms;
+    (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms))
 }
 
 fn is_rollout_probe_request(headers: &HeaderMap, forwarded_by_gateway: bool) -> bool {
@@ -665,7 +666,7 @@ mod tests {
 
     #[test]
     fn relay_header_timeout_ignores_request_timeout_for_stream_requests() {
-        let meta = protocol::RequestMeta {
+        let mut meta = protocol::RequestMeta {
             provider_id: None,
             endpoint_id: None,
             key_id: None,
@@ -681,7 +682,9 @@ mod tests {
             transport_profile: None,
         };
 
-        assert_eq!(relay_header_timeout(&meta), Duration::from_secs(7));
+        assert_eq!(relay_header_timeout(&meta), Some(Duration::from_secs(7)));
+        meta.stream_first_byte_timeout_ms = Some(0);
+        assert_eq!(relay_header_timeout(&meta), None);
     }
 
     #[test]
@@ -704,7 +707,9 @@ mod tests {
 
         assert_eq!(
             relay_header_timeout(&meta),
-            Duration::from_millis(aether_contracts::MAX_EXECUTION_REQUEST_TIMEOUT_MS)
+            Some(Duration::from_millis(
+                aether_contracts::MAX_EXECUTION_REQUEST_TIMEOUT_MS
+            ))
         );
     }
 

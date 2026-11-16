@@ -2749,10 +2749,11 @@ async fn execute_execution_runtime_sync_impl(
             oauth_retry_attempted = true;
             let retry_started_at_unix_ms = current_request_candidate_unix_ms();
             let retry_request_order_id = uuid::Uuid::now_v7().to_string();
-            match crate::execution_runtime::execute_execution_runtime_sync_plan(
+            match crate::execution_runtime::execute_execution_runtime_sync_plan_with_report_context(
                 state,
                 Some(trace_id),
                 &plan,
+                report_context.as_ref(),
             )
             .await
             {
@@ -2825,7 +2826,19 @@ async fn execute_execution_runtime_sync_impl(
     if let Some(error) = result.error.as_ref() {
         report_context = crate::usage::reporting::failure::execution_error_analytics_context(report_context.as_ref(), error);
     }
-    if result.status_code >= 400 {
+    // An already absent video satisfies a delete request. Classify the
+    // candidate before writing its terminal row under the current request ID.
+    let video_delete_already_absent = result.status_code == StatusCode::NOT_FOUND.as_u16()
+        && report_kind.as_deref().is_some_and(|kind| {
+            crate::video_tasks::build_local_sync_finalize_read_response(
+                kind,
+                result.status_code,
+                report_context.as_ref(),
+            )
+            .is_some()
+        });
+    let candidate_failed = result.status_code >= 400 && !video_delete_already_absent;
+    if candidate_failed {
         apply_local_execution_effect(
             state,
             LocalExecutionEffectContext {
@@ -2890,7 +2903,7 @@ async fn execute_execution_runtime_sync_impl(
         )
         .await;
     }
-    if matches!(
+    if !video_delete_already_absent && matches!(
         local_failover_analysis.decision,
         LocalFailoverDecision::RetryNextCandidate
     ) {
@@ -3040,7 +3053,7 @@ async fn execute_execution_runtime_sync_impl(
     }
 
     let terminal_unix_secs = current_request_candidate_unix_ms();
-    let error_flow_report_context = (result.status_code >= 400)
+    let error_flow_report_context = candidate_failed
         .then(|| {
             with_sync_error_trace_context(
                 report_context.as_ref(),
@@ -3060,7 +3073,7 @@ async fn execute_execution_runtime_sync_impl(
             .as_ref()
             .or(report_context.as_ref()),
         SchedulerRequestCandidateStatusUpdate {
-            status: if result.status_code >= 400 {
+            status: if candidate_failed {
                 RequestCandidateStatus::Failed
             } else {
                 RequestCandidateStatus::Success
@@ -3472,7 +3485,10 @@ async fn execute_sync_via_remote_execution_runtime(
     let response = match post_sync_plan_to_remote_execution_runtime(
         state,
         remote_execution_runtime_base_url,
-        Some(trace_id),
+        crate::execution_runtime::trace_id_from_report_context(
+            report_context,
+            Some(trace_id),
+        ),
         plan,
     )
     .await

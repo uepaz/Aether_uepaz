@@ -531,6 +531,7 @@ async fn gateway_executes_kiro_claude_cli_stream_via_local_provider_catalog_cand
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -595,7 +596,7 @@ async fn gateway_executes_kiro_claude_cli_stream_via_local_provider_catalog_cand
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-kiro-cli-local-stream-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -1006,6 +1007,7 @@ async fn gateway_executes_claude_cli_stream_via_local_decision_gate_without_wait
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -1061,7 +1063,7 @@ async fn gateway_executes_claude_cli_stream_via_local_decision_gate_without_wait
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-claude-cli-local-stream-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -1540,6 +1542,7 @@ async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_lo
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -1614,7 +1617,7 @@ async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_lo
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-claude-code-cli-local-stream-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -2015,6 +2018,7 @@ async fn gateway_executes_claude_chat_stream_via_local_decision_gate_with_local_
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -2067,7 +2071,7 @@ async fn gateway_executes_claude_chat_stream_via_local_decision_gate_with_local_
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-claude-chat-local-stream-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);

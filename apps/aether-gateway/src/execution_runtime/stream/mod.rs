@@ -2,6 +2,7 @@ mod capture_budget;
 mod commit_policy;
 mod error;
 mod execution;
+mod first_content;
 mod usage_fallback;
 
 pub(crate) use execution::{

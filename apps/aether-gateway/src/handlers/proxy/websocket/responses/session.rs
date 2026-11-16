@@ -44,7 +44,10 @@ use super::request::{
     validated_response_create_model, ResponsesLiteStaticConfig,
 };
 use super::state::BoundResponsesConnection;
-use super::turn::{prepare_responses_websocket_turn_decision, ResponsesWebSocketTurnOutcome};
+use super::turn::{
+    prepare_responses_websocket_turn_decision, ResponsesWebSocketTurnOutcome,
+    ResponsesWebSocketUsageStart,
+};
 use super::turn_state::LogicalTurn;
 use super::upstream::{
     bind_responses_upstream, close_bound_upstream, ResponsesWebSocketUpstreamBindError,
@@ -439,6 +442,7 @@ async fn bootstrap_responses_websocket(
         }
     };
 
+    let request_started_at = std::time::Instant::now();
     let initial_previous_response_id = first_event
         .get("previous_response_id")
         .and_then(Value::as_str)
@@ -761,13 +765,14 @@ async fn bootstrap_responses_websocket(
     let planned = match await_owned_responses_websocket_plan(spawn_owned_responses_websocket_plan(
         state.clone(),
         planning_parts,
-        context.trace_id.clone(),
+        context.request_id.clone(),
         turn_control.decision.clone(),
         turn_control.auth_snapshot.clone(),
         first_event.clone(),
         None,
         None,
         pinned_candidate,
+        0,
     ))
     .await
     {
@@ -912,7 +917,7 @@ async fn bootstrap_responses_websocket(
         };
     let first_turn_decision = prepare_responses_websocket_turn_decision(
         &decision,
-        context.trace_id.clone(),
+        context.request_id.clone(),
         true,
         &first_event,
         &first_provider_event,
@@ -930,6 +935,7 @@ async fn bootstrap_responses_websocket(
         &first_event,
         plan_usage_policy_snapshot.clone(),
         planned_lease,
+        ResponsesWebSocketUsageStart::New(request_started_at),
     )
     .await
     {

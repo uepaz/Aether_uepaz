@@ -9,6 +9,7 @@ use crate::ai_serving::ExecutionRuntimeAuthContext;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LocalCandidatePersistencePolicy<'a> {
+    pub(crate) starting_candidate_index: u32,
     pub(crate) available: LocalAvailableCandidatePersistenceContext<'a>,
     pub(crate) skipped: LocalSkippedCandidatePersistenceContext<'a>,
 }
@@ -21,6 +22,7 @@ pub(crate) fn build_local_candidate_persistence_policy<'a>(
     let spec = ai_candidate_persistence_policy_spec(kind);
 
     LocalCandidatePersistencePolicy {
+        starting_candidate_index: 0,
         available: LocalAvailableCandidatePersistenceContext {
             user_id: &auth_context.user_id,
             api_key_id: &auth_context.api_key_id,

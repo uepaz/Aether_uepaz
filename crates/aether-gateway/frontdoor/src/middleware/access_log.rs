@@ -85,12 +85,10 @@ pub async fn access_log_middleware(mut request: Request<Body>, next: Next) -> Re
         .unwrap_or_else(|| "/".to_string());
     let path = sanitize_access_log_path(&raw_path);
     let trace_id = extract_or_generate_trace_id(request.headers());
-    if !request.headers().contains_key(TRACE_ID_HEADER) {
-        request.headers_mut().insert(
-            HeaderName::from_static(TRACE_ID_HEADER),
-            HeaderValue::from_str(&trace_id).expect("trace id should be a valid header value"),
-        );
-    }
+    request.headers_mut().insert(
+        HeaderName::from_static(TRACE_ID_HEADER),
+        HeaderValue::from_str(&trace_id).expect("trace id should be a valid header value"),
+    );
     trace!(
         event_name = "http_request_started",
         log_type = "access",

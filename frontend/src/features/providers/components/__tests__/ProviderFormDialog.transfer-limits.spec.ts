@@ -256,6 +256,39 @@ describe('ProviderFormDialog transfer limits', () => {
   })
 })
 
+describe('ProviderFormDialog first-byte timeout', () => {
+  it('preserves explicit zero when editing and restores the default when cleared', async () => {
+    mountDialog(makeProvider({ stream_first_byte_timeout: 0 }))
+    await settle()
+    const input = document.body.querySelector<HTMLInputElement>('#stream-first-byte-timeout')
+    expect(input?.value).toBe('0')
+    expect(input?.min).toBe('0')
+    clickButton('保存')
+    await settle()
+    expect(endpointMocks.updateProvider).toHaveBeenLastCalledWith(
+      'provider-1', expect.objectContaining({ stream_first_byte_timeout: 0 }),
+    )
+    await setInput('#stream-first-byte-timeout', '')
+    clickButton('保存')
+    await settle()
+    expect(endpointMocks.updateProvider).toHaveBeenLastCalledWith(
+      'provider-1', expect.objectContaining({ stream_first_byte_timeout: null }),
+    )
+  })
+
+  it('submits zero when disabling the limit on a new provider', async () => {
+    mountDialog(null)
+    await settle()
+    await setInput('#name', 'Unlimited First Byte')
+    await setInput('#stream-first-byte-timeout', '0')
+    clickButton('创建')
+    await settle()
+    expect(endpointMocks.createProvider).toHaveBeenCalledWith(
+      expect.objectContaining({ stream_first_byte_timeout: 0 }),
+    )
+  })
+})
+
 describe('ProviderFormDialog billing configuration', () => {
   it('hides billing configuration and omits billing fields when creating', async () => {
     mountDialog(null)

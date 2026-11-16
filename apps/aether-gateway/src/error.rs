@@ -172,6 +172,29 @@ pub(crate) enum GatewayError {
 }
 
 impl GatewayError {
+    pub(crate) fn with_trace_id(mut self, trace_id: &str) -> Self {
+        match &mut self {
+            Self::UpstreamUnavailable {
+                trace_id: existing, ..
+            }
+            | Self::ControlUnavailable {
+                trace_id: existing, ..
+            }
+            | Self::LocalExecutionPlanningTimeout {
+                trace_id: existing, ..
+            }
+            | Self::AdmissionTimeout {
+                trace_id: existing, ..
+            } => {
+                if existing.as_str() != trace_id {
+                    trace_id.clone_into(existing);
+                }
+            }
+            _ => {}
+        }
+        self
+    }
+
     pub(crate) fn into_message(self) -> String {
         match self {
             Self::UpstreamUnavailable { message, .. }

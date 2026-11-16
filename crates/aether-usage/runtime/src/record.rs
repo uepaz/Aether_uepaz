@@ -231,6 +231,13 @@ fn lifecycle_status_and_billing(
             ("completed", "void")
         }
         UsageEventType::Completed => ("completed", "pending"),
+        UsageEventType::Failed
+            if aether_data_contracts::repository::usage::failed_usage_is_billable(
+                request_metadata,
+            ) =>
+        {
+            ("failed", "pending")
+        }
         UsageEventType::Failed => ("failed", "void"),
         UsageEventType::Cancelled
             if aether_data_contracts::repository::usage::cancelled_request_fee_is_billable(

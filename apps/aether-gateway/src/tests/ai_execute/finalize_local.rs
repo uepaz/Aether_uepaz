@@ -431,6 +431,7 @@ async fn gateway_executes_openai_chat_sync_upstream_stream_via_local_finalize_re
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
     let elapsed = started_at.elapsed();
 
     let response_status = response.status();
@@ -452,7 +453,7 @@ async fn gateway_executes_openai_chat_sync_upstream_stream_via_local_finalize_re
         .expect("mutex should lock")
         .clone();
     let stored_candidates_debug = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-stream-sync-direct-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(
@@ -489,7 +490,7 @@ async fn gateway_executes_openai_chat_sync_upstream_stream_via_local_finalize_re
     let mut stored_candidates = Vec::new();
     for _ in 0..50 {
         stored_candidates = request_candidate_repository
-            .list_by_request_id("trace-openai-chat-stream-sync-direct-123")
+            .list_by_request_id(&request_id)
             .await
             .expect("request candidate trace should read");
         if stored_candidates.len() == 1
@@ -522,10 +523,7 @@ async fn gateway_executes_openai_chat_sync_upstream_stream_via_local_finalize_re
         seen_remote_execution_runtime_request.trace_id,
         "trace-openai-chat-stream-sync-direct-123"
     );
-    assert_eq!(
-        seen_remote_execution_runtime_request.request_id,
-        "trace-openai-chat-stream-sync-direct-123"
-    );
+    assert_eq!(seen_remote_execution_runtime_request.request_id, request_id);
     assert_eq!(
         seen_remote_execution_runtime_request.url,
         "https://api.openai.example/v1/chat/completions"
@@ -903,6 +901,7 @@ async fn gateway_executes_openai_chat_cross_format_upstream_stream_via_local_fin
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
     let elapsed = started_at.elapsed();
     let response_status = response.status();
     let response_body = response.text().await.expect("body should read");
@@ -967,7 +966,7 @@ async fn gateway_executes_openai_chat_cross_format_upstream_stream_via_local_fin
     let mut stored_candidates = Vec::new();
     for _ in 0..50 {
         stored_candidates = request_candidate_repository
-            .list_by_request_id("trace-openai-chat-xfmt-stream-123")
+            .list_by_request_id(&request_id)
             .await
             .expect("request candidate trace should read");
         if stored_candidates.len() == 1
@@ -1366,6 +1365,7 @@ async fn gateway_executes_openai_chat_cross_format_tool_use_upstream_stream_via_
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
     let elapsed = started_at.elapsed();
     let response_status = response.status();
     let response_body = response.text().await.expect("body should read");
@@ -1418,10 +1418,7 @@ async fn gateway_executes_openai_chat_cross_format_tool_use_upstream_stream_via_
         seen_remote_execution_runtime_request.trace_id,
         "trace-openai-chat-xfmt-tool-stream-123"
     );
-    assert_eq!(
-        seen_remote_execution_runtime_request.request_id,
-        "trace-openai-chat-xfmt-tool-stream-123"
-    );
+    assert_eq!(seen_remote_execution_runtime_request.request_id, request_id);
     assert_eq!(
         seen_remote_execution_runtime_request.url,
         "https://api.anthropic.example/custom/v1/messages"
@@ -1442,7 +1439,7 @@ async fn gateway_executes_openai_chat_cross_format_tool_use_upstream_stream_via_
     let mut stored_candidates = Vec::new();
     for _ in 0..50 {
         stored_candidates = request_candidate_repository
-            .list_by_request_id("trace-openai-chat-xfmt-tool-stream-123")
+            .list_by_request_id(&request_id)
             .await
             .expect("request candidate trace should read");
         if stored_candidates.len() == 1
@@ -1896,6 +1893,7 @@ async fn gateway_executes_openai_chat_antigravity_cross_format_sync_via_local_fi
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
     let elapsed = started_at.elapsed();
     let response_status = response.status();
     let response_body = response.text().await.expect("body should read");
@@ -1963,10 +1961,7 @@ async fn gateway_executes_openai_chat_antigravity_cross_format_sync_via_local_fi
         seen_execution_runtime_request.project,
         "project-antigravity-chat-local-1"
     );
-    assert_eq!(
-        seen_execution_runtime_request.request_id,
-        "trace-openai-chat-antigravity-sync-123"
-    );
+    assert_eq!(seen_execution_runtime_request.request_id, request_id);
     assert_eq!(seen_execution_runtime_request.model, "claude-sonnet-4-5");
     assert_eq!(
         seen_execution_runtime_request.user_agent,
@@ -1979,7 +1974,7 @@ async fn gateway_executes_openai_chat_antigravity_cross_format_sync_via_local_fi
     let mut stored_candidates = Vec::new();
     for _ in 0..50 {
         stored_candidates = request_candidate_repository
-            .list_by_request_id("trace-openai-chat-antigravity-sync-123")
+            .list_by_request_id(&request_id)
             .await
             .expect("request candidate trace should read");
         if stored_candidates.len() == 1
@@ -2304,6 +2299,7 @@ async fn gateway_executes_openai_chat_cross_format_claude_upstream_sync_via_loca
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
     let elapsed = started_at.elapsed();
     let response_status = response.status();
     let response_body = response.text().await.expect("body should read");
@@ -2340,7 +2336,7 @@ async fn gateway_executes_openai_chat_cross_format_claude_upstream_sync_via_loca
     let mut stored_candidates = Vec::new();
     for _ in 0..50 {
         stored_candidates = request_candidate_repository
-            .list_by_request_id("trace-openai-chat-claude-direct-sync-123")
+            .list_by_request_id(&request_id)
             .await
             .expect("request candidate trace should read");
         if stored_candidates.len() == 1
@@ -2669,6 +2665,7 @@ async fn gateway_executes_openai_chat_cross_format_gemini_upstream_sync_via_loca
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
     let elapsed = started_at.elapsed();
 
     assert_eq!(response.status(), StatusCode::OK);
@@ -2702,7 +2699,7 @@ async fn gateway_executes_openai_chat_cross_format_gemini_upstream_sync_via_loca
     let mut stored_candidates = Vec::new();
     for _ in 0..50 {
         stored_candidates = request_candidate_repository
-            .list_by_request_id("trace-openai-chat-gemini-direct-sync-123")
+            .list_by_request_id(&request_id)
             .await
             .expect("request candidate trace should read");
         if stored_candidates.len() == 1

@@ -84,8 +84,9 @@ fn unix_secs_to_rfc3339(unix_secs: u64) -> Option<String> {
 
 fn admin_usage_response_time_updated_at(item: &StoredRequestUsageAudit) -> Option<String> {
     item.response_time_ms?;
+    // 秒级时间戳相等仍是有效快照，丢弃它会让延迟创建的记录漏算首字节前的等待。
     if matches!(item.status.as_str(), "pending" | "streaming")
-        && item.updated_at_unix_secs <= item.created_at_unix_ms
+        && item.updated_at_unix_secs < item.created_at_unix_ms
     {
         return None;
     }
@@ -1466,6 +1467,7 @@ pub fn admin_usage_record_json(
     });
     payload["billing_multiplier"] = json!(billing_multiplier);
     payload["billing_cost"] = json!(billing_cost);
+    payload["response_time_updated_at"] = json!(admin_usage_response_time_updated_at(item));
     payload["routing_group_id"] = json!(item.routing_group_id());
     payload["routing_group_name"] = json!(item.routing_group_name());
     payload["chat_pii_redaction"] = json!(admin_usage_chat_pii_redacted(item));
@@ -2989,6 +2991,35 @@ mod tests {
         for payload in [&record, &active] {
             assert_eq!(payload["target_model"], "provider-mapped-model");
             assert_eq!(payload["response_model"], "gpt-5.1");
+        }
+    }
+
+    #[test]
+    fn admin_usage_active_timing_keeps_same_second_anchor() {
+        for status in ["pending", "streaming"] {
+            let item = StoredRequestUsageAudit {
+                created_at_unix_ms: 1_700_000_020,
+                updated_at_unix_secs: 1_700_000_020,
+                response_time_ms: Some(20_000),
+                first_byte_time_ms: Some(20_000),
+                ..sample_usage(status, Some(200), None)
+            };
+            let record = admin_usage_record_json(
+                &item,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                false,
+                false,
+                None,
+            );
+            let active = admin_usage_active_request_json(&item, None, None, None);
+            for payload in [&record, &active] {
+                assert_eq!(payload["response_time_ms"], 20_000);
+                assert_eq!(
+                    payload["response_time_updated_at"],
+                    "2023-11-14T22:13:40+00:00"
+                );
+            }
         }
     }
 

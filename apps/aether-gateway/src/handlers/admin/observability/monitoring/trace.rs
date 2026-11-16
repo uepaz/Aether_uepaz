@@ -119,8 +119,12 @@ async fn resolve_admin_monitoring_trace(
 
     let mut usage_snapshot_fallback = None;
     for usage in usage_candidates {
+        let legacy_candidate_id = usage.routing_candidate_id();
         for trace_request_id in admin_monitoring_usage_trace_request_ids(&usage) {
-            if trace_request_id == request_id {
+            let is_usage_request_id = trace_request_id == usage.request_id;
+            if trace_request_id == request_id
+                || (!is_usage_request_id && legacy_candidate_id.is_none())
+            {
                 continue;
             }
             if let Some(trace) = app
@@ -129,6 +133,14 @@ async fn resolve_admin_monitoring_trace(
                 .await
                 .map_err(|err| GatewayError::Internal(err.to_string()))?
             {
+                // Correlation IDs may be shared. A historical alias must point to this usage row's candidate.
+                if !is_usage_request_id
+                    && !legacy_candidate_id.is_some_and(|id| {
+                        trace.candidates.iter().any(|item| item.candidate.id == id)
+                    })
+                {
+                    continue;
+                }
                 return Ok(Some(ResolvedAdminMonitoringTrace {
                     trace,
                     usage: Some(usage),
@@ -172,7 +184,7 @@ fn build_admin_monitoring_usage_routing_snapshot_trace(
             .routing_candidate_id()
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("usage-routing-snapshot:{}", usage.id)),
-        request_id: admin_monitoring_usage_primary_trace_request_id(usage),
+        request_id: usage.request_id.clone(),
         user_id: usage.user_id.clone(),
         api_key_id: usage.api_key_id.clone(),
         username: usage.username.clone(),
@@ -274,19 +286,6 @@ fn admin_monitoring_usage_candidate_status(
         }
         None => RequestCandidateStatus::Failed,
     }
-}
-
-fn admin_monitoring_usage_primary_trace_request_id(usage: &StoredRequestUsageAudit) -> String {
-    if let Some(trace_id) = usage.trace_id() {
-        return trace_id.to_string();
-    }
-    if let Some(trace_id) = usage_trace_id_from_headers(usage.request_headers.as_ref()) {
-        return trace_id;
-    }
-    if let Some(trace_id) = usage_trace_id_from_headers(usage.provider_request_headers.as_ref()) {
-        return trace_id;
-    }
-    usage.request_id.clone()
 }
 
 fn admin_monitoring_usage_finished_at_unix_ms(usage: &StoredRequestUsageAudit) -> Option<u64> {

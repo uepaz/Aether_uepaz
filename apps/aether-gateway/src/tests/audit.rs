@@ -264,7 +264,7 @@ async fn gateway_exposes_request_id_header_for_local_execution_response_impl() {
         .and_then(|value| value.to_str().ok())
         .expect("request id header should exist")
         .to_string();
-    assert_eq!(request_id, "req-direct-audit-123");
+    assert_ne!(request_id, "req-direct-audit-123");
 
     for _ in 0..50 {
         if usage_repository
@@ -288,7 +288,7 @@ async fn gateway_exposes_request_id_header_for_local_execution_response_impl() {
 
     assert_eq!(audit_response.status(), StatusCode::OK);
     let payload: Value = audit_response.json().await.expect("payload should parse");
-    assert_eq!(payload["request_id"], "req-direct-audit-123");
+    assert_eq!(payload["request_id"], request_id);
     assert_eq!(payload["usage"]["provider_name"], "OpenAI");
     assert_eq!(payload["decision_trace"]["total_candidates"], 1);
     assert_eq!(payload["auth_snapshot"]["api_key_id"], "api-key-1");

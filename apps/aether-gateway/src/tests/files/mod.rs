@@ -712,6 +712,7 @@ async fn gateway_rejects_gemini_files_get_key_mismatch_without_fallback_and_allo
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -735,7 +736,7 @@ async fn gateway_rejects_gemini_files_get_key_mismatch_without_fallback_and_allo
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-gemini-files-local-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);

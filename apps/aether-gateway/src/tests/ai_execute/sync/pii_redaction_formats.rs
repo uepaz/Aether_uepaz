@@ -344,13 +344,11 @@ async fn run_redaction_format_case(
     let seen_execution_runtime = Arc::new(Mutex::new(None::<SeenExecutionRuntimeSyncRequest>));
     let seen_execution_runtime_clone = Arc::clone(&seen_execution_runtime);
     let provider_format = case.provider_format;
-    let trace_id = case.trace_id.to_string();
 
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |request: Request| {
             let seen_execution_runtime_inner = Arc::clone(&seen_execution_runtime_clone);
-            let trace_id = trace_id.clone();
             async move {
                 let (_parts, body) = request.into_parts();
                 let raw_body = to_bytes(body, usize::MAX).await.expect("body should read");
@@ -382,7 +380,7 @@ async fn run_redaction_format_case(
                 });
 
                 Json(json!({
-                    "request_id": trace_id,
+                    "request_id": payload["request_id"],
                     "status_code": 200,
                     "headers": {
                         "content-type": "application/json"
@@ -442,6 +440,7 @@ async fn run_redaction_format_case(
             .header("anthropic-version", "2023-06-01"),
     };
     let response = request.send().await.expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
     let status = response.status();
     let execution_path = response
         .headers()
@@ -460,7 +459,7 @@ async fn run_redaction_format_case(
     let mut stored_candidates = Vec::new();
     for _ in 0..50 {
         stored_candidates = request_candidate_repository
-            .list_by_request_id(case.trace_id)
+            .list_by_request_id(&request_id)
             .await
             .expect("request candidate trace should read");
         if stored_candidates.len() == 1

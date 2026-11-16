@@ -9,7 +9,9 @@ use aether_data_contracts::repository::candidates::{
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
-use aether_data_contracts::repository::usage::ROUTING_CANDIDATE_SKIP_REASON_METADATA_KEY;
+use aether_data_contracts::repository::usage::{
+    insert_usage_client_family_from_captured_headers, ROUTING_CANDIDATE_SKIP_REASON_METADATA_KEY,
+};
 use aether_usage_runtime::{
     build_usage_event_data_seed, UsageEvent, UsageEventData, UsageEventType,
 };
@@ -395,7 +397,23 @@ pub(crate) async fn record_failed_usage_for_exhausted_request(
         Some(other) => Map::from_iter([("seed".to_string(), other)]),
         None => Map::new(),
     };
-    request_metadata.insert("trace_id".to_string(), Value::String(request_id.clone()));
+    if !request_metadata.contains_key("client_family") {
+        if let Some(headers) = data.request_headers.as_ref().and_then(Value::as_object) {
+            insert_usage_client_family_from_captured_headers(headers, None, &mut request_metadata);
+        }
+    }
+    if let Some(trace_id) = data
+        .request_headers
+        .as_ref()
+        .and_then(|headers| headers.get(crate::constants::TRACE_ID_HEADER))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        request_metadata
+            .entry("trace_id".to_string())
+            .or_insert_with(|| Value::String(trace_id.to_string()));
+    }
     if !request_metadata.contains_key("analytics_failure") {
         request_metadata.insert(
             "analytics_failure".into(),
@@ -489,10 +507,15 @@ pub(crate) async fn record_failed_usage_for_runtime_miss_request(
     request_metadata.insert("analytics_failure".into(), json!({
         "origin": "gateway", "stage": "routing", "reason": "execution_route_unavailable", "schema_version": 1,
     }));
-    request_metadata.insert(
-        "trace_id".to_string(),
-        Value::String(request_id.to_string()),
-    );
+    if let Some(trace_id) =
+        crate::headers::header_value_str(request_headers, crate::constants::TRACE_ID_HEADER)
+    {
+        request_metadata.insert("trace_id".to_string(), Value::String(trace_id));
+    }
+    let original_headers = runtime_miss_original_headers_json(request_headers);
+    if let Some(headers) = original_headers.as_object() {
+        insert_usage_client_family_from_captured_headers(headers, None, &mut request_metadata);
+    }
     let mut data = UsageEventData {
         user_id: context.auth_user_id.clone(),
         api_key_id: context.auth_api_key_id.clone(),
@@ -535,7 +558,7 @@ pub(crate) async fn record_failed_usage_for_runtime_miss_request(
         error_message: Some(local_execution_runtime_miss_detail.to_string()),
         error_category: error_category_for_failed_status(status_code),
         response_time_ms: Some(started_at.elapsed().as_millis() as u64),
-        request_headers: Some(runtime_miss_original_headers_json(request_headers)),
+        request_headers: Some(original_headers),
         request_body: runtime_miss_original_request_body_json(request_headers, request_body),
         response_headers: Some(json_header_map()),
         response_body: Some(client_body.clone()),
@@ -1223,6 +1246,100 @@ mod tests {
     };
     use aether_usage_runtime::UsageEventData;
     use serde_json::{json, Map, Value};
+
+    #[tokio::test]
+    async fn failed_usage_preserves_trace_metadata_separately_from_request_id() {
+        use aether_data::repository::usage::InMemoryUsageReadRepository;
+        use aether_data_contracts::repository::usage::UsageReadRepository;
+        use std::sync::Arc;
+
+        let repository = Arc::new(InMemoryUsageReadRepository::default());
+        let state = crate::AppState::new()
+            .unwrap()
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_usage_repository_for_tests(repository.clone()),
+            )
+            .with_usage_runtime_for_tests(crate::usage::UsageRuntimeConfig {
+                enabled: true,
+                ..Default::default()
+            });
+
+        // Exhaustion inherits the planner's trace even when a different header echo
+        // exists, and can recover it from the original headers when the seed lacks it.
+        for (request_id, existing_trace, expected_trace) in [
+            (
+                "exhausted-with-seed",
+                Some("client-seed-trace"),
+                "client-seed-trace",
+            ),
+            ("exhausted-with-headers", None, "client-header-trace"),
+        ] {
+            super::record_failed_usage_for_exhausted_request(
+                &state,
+                super::LocalExecutionExhaustion {
+                    request_id: request_id.to_string(),
+                    data: UsageEventData {
+                        user_id: Some("user-1".into()),
+                        api_key_id: Some("api-key-1".into()),
+                        provider_name: "test-provider".into(),
+                        model: "test-model".into(),
+                        request_headers: Some(json!({"x-trace-id": "client-header-trace"})),
+                        request_metadata: existing_trace.map(|trace| json!({"trace_id": trace})),
+                        ..Default::default()
+                    },
+                    candidate_id: None,
+                    candidate_index: None,
+                    upstream_status_code: None,
+                    upstream_error_type: None,
+                },
+                &std::time::Instant::now(),
+                "no candidates",
+                EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS,
+                None,
+            )
+            .await;
+            let stored = repository
+                .find_by_request_id(request_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.request_id, request_id);
+            assert_eq!(stored.request_metadata.unwrap()["trace_id"], expected_trace);
+        }
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            crate::constants::TRACE_ID_HEADER,
+            "client-header-trace".parse().unwrap(),
+        );
+        super::record_failed_usage_for_runtime_miss_request(
+            &state,
+            "runtime-miss-server-id",
+            &std::time::Instant::now(),
+            "no route",
+            EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS,
+            None,
+            None,
+            &LocalExecutionRuntimeMissContext {
+                auth_user_id: Some("user-1".into()),
+                auth_api_key_id: Some("api-key-1".into()),
+                ..Default::default()
+            },
+            &headers,
+            None,
+        )
+        .await;
+        let stored = repository
+            .find_by_request_id("runtime-miss-server-id")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.request_id, "runtime-miss-server-id");
+        assert_eq!(
+            stored.request_metadata.unwrap()["trace_id"],
+            "client-header-trace"
+        );
+    }
 
     #[test]
     fn local_execution_client_error_message_is_client_friendly() {

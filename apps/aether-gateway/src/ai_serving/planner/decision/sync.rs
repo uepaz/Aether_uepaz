@@ -217,7 +217,7 @@ async fn maybe_build_local_video_task_follow_up_sync_decision_payload(
     {
         return Err(crate::video_tasks::not_found_error());
     }
-    let Some(follow_up) = state.video_tasks.prepare_follow_up_sync_plan_for_user(
+    let Some(mut follow_up) = state.video_tasks.prepare_follow_up_sync_plan_for_user(
         plan_kind,
         parts.uri.path(),
         Some(body_json),
@@ -226,6 +226,7 @@ async fn maybe_build_local_video_task_follow_up_sync_decision_payload(
     ) else {
         return Err(crate::video_tasks::not_found_error());
     };
+    crate::video_tasks::bind_video_follow_up_request_identity(&mut follow_up, &parts.headers);
 
     let aether_video_tasks_core::LocalVideoTaskFollowUpPlan {
         plan,

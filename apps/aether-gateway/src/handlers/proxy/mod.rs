@@ -40,6 +40,7 @@ use crate::constants::{
     TRACE_ID_HEADER, TRUSTED_AUTH_ACCESS_ALLOWED_HEADER, TRUSTED_AUTH_API_KEY_ID_HEADER,
     TRUSTED_AUTH_BALANCE_HEADER, TRUSTED_AUTH_USER_ID_HEADER, TUNNEL_AFFINITY_FORWARDED_BY_HEADER,
     TUNNEL_AFFINITY_NODE_ID_HEADER, TUNNEL_AFFINITY_OWNER_INSTANCE_HEADER,
+    TUNNEL_AFFINITY_REQUEST_ID_HEADER,
 };
 use crate::control::{
     allows_control_execute_emergency, maybe_execute_via_control, request_model_local_rejection,
@@ -556,11 +557,10 @@ async fn maybe_forward_public_request_to_tunnel_owner(
     .map_err(GatewayError::Internal)?;
     let relay_auth = state
         .tunnel
-        .build_relay_auth_headers(
+        .build_tunnel_affinity_relay_auth_headers(
             owner.gateway_instance_id.as_str(),
             node_id,
-            true,
-            false,
+            request_context.request_id.as_str(),
             &auth_metadata,
             buffered_body.unwrap_or(&empty_body),
         )
@@ -613,6 +613,7 @@ fn should_strip_tunnel_affinity_forward_header(name: &http::HeaderName) -> bool 
             TUNNEL_AFFINITY_FORWARDED_BY_HEADER
                 | TUNNEL_AFFINITY_OWNER_INSTANCE_HEADER
                 | TUNNEL_AFFINITY_NODE_ID_HEADER
+                | TUNNEL_AFFINITY_REQUEST_ID_HEADER
                 | TRUSTED_AUTH_USER_ID_HEADER
                 | TRUSTED_AUTH_API_KEY_ID_HEADER
                 | TRUSTED_AUTH_BALANCE_HEADER
@@ -1035,21 +1036,28 @@ pub(crate) async fn proxy_request(
     ConnectInfo(remote_addr): ConnectInfo<std::net::SocketAddr>,
     request: Request,
 ) -> Result<Response<Body>, GatewayError> {
+    let trace_id = extract_or_generate_trace_id(request.headers());
     crate::request_lifecycle::run_request_with_usage(
         state.usage_runtime.clone(),
-        Box::pin(proxy_request_inner(state, remote_addr, request)),
+        Box::pin(proxy_request_inner(
+            state,
+            remote_addr,
+            request,
+            trace_id.clone(),
+        )),
     )
     .await
+    .map_err(|error| error.with_trace_id(&trace_id))
 }
 
 async fn proxy_request_inner(
     state: AppState,
     remote_addr: std::net::SocketAddr,
     request: Request,
+    trace_id: String,
 ) -> Result<Response<Body>, GatewayError> {
     let started_at = Instant::now();
     let direct_client_ip = effective_client_ip(request.headers(), &remote_addr);
-    let trace_id = extract_or_generate_trace_id(request.headers());
     let accepted_at = request
         .extensions()
         .get::<crate::middleware::GatewayRequestAcceptedAt>()
@@ -1072,7 +1080,6 @@ async fn proxy_request_inner(
             gate,
             limit,
         })) => {
-            let trace_id = extract_or_generate_trace_id(request.headers());
             let response = build_local_overloaded_response(
                 &trace_id,
                 None,
@@ -1109,7 +1116,6 @@ async fn proxy_request_inner(
         | Err(RequestAdmissionError::Distributed(
             aether_runtime_state::RuntimeSemaphoreError::Unavailable { gate, limit, .. },
         )) => {
-            let trace_id = extract_or_generate_trace_id(request.headers());
             let response = build_local_overloaded_response(
                 &trace_id,
                 None,
@@ -1315,8 +1321,11 @@ async fn proxy_request_inner(
     };
     let trusted_affinity_auth = affinity_auth.is_some();
     let client_ip = affinity_auth
+        .as_ref()
         .map(|context| context.client_ip)
         .unwrap_or(direct_client_ip);
+    // Only verified relay authentication can carry an existing request ID.
+    parts.headers.remove(TUNNEL_AFFINITY_REQUEST_ID_HEADER);
     match state.admin_security_ip_blacklisted(client_ip).await {
         Ok(true) => {
             warn!(
@@ -1395,8 +1404,6 @@ async fn proxy_request_inner(
         request_origin_from_headers_and_remote_addr(&parts.headers, &remote_addr);
     request_origin.client_ip = Some(client_ip.to_string());
     parts.extensions.insert(request_origin);
-    let trace_id = extract_or_generate_trace_id(&parts.headers);
-    state.clear_local_execution_runtime_miss_diagnostic(&trace_id);
     if request_hits_execution_loop_guard(&parts) {
         warn!(
             event_name = "frontdoor_execution_loop_detected",
@@ -1452,6 +1459,9 @@ async fn proxy_request_inner(
         )
         .await?
     };
+    if let Some(request_id) = affinity_auth.and_then(|context| context.request_id) {
+        request_context.request_id = request_id;
+    }
     request_context.client_ip = Some(client_ip.to_string());
     maybe_promote_management_token_admin_principal(
         &state,
@@ -1461,6 +1471,7 @@ async fn proxy_request_inner(
         &mut request_context,
     )
     .await?;
+    let request_id = request_context.request_id.as_str();
     if let Some(auth_context) = request_context
         .control_decision
         .as_ref()
@@ -2071,7 +2082,7 @@ async fn proxy_request_inner(
                 &state,
                 &parts,
                 buffered_body,
-                &trace_id,
+                request_id,
                 control_decision,
             )
             .await
@@ -2130,7 +2141,7 @@ async fn proxy_request_inner(
                         execution_runtime_response,
                         &redaction_slot,
                     )?;
-                    state.clear_local_execution_runtime_miss_diagnostic(&trace_id);
+                    state.clear_local_execution_runtime_miss_diagnostic(request_id);
                     return Ok(finalize_gateway_response_with_context(
                         &state,
                         execution_runtime_response,
@@ -2152,7 +2163,7 @@ async fn proxy_request_inner(
             &state,
             &parts,
             buffered_body,
-            &trace_id,
+            request_id,
             control_decision,
         )
         .await
@@ -2195,7 +2206,7 @@ async fn proxy_request_inner(
                     &redaction_slot,
                 )
                 .await?;
-                state.clear_local_execution_runtime_miss_diagnostic(&trace_id);
+                state.clear_local_execution_runtime_miss_diagnostic(request_id);
                 return Ok(finalize_gateway_response_with_context(
                     &state,
                     execution_runtime_response,
@@ -2217,7 +2228,7 @@ async fn proxy_request_inner(
                 &state,
                 &parts,
                 buffered_body,
-                &trace_id,
+                request_id,
                 control_decision,
             )
             .await
@@ -2260,7 +2271,7 @@ async fn proxy_request_inner(
                         execution_runtime_response,
                         &redaction_slot,
                     )?;
-                    state.clear_local_execution_runtime_miss_diagnostic(&trace_id);
+                    state.clear_local_execution_runtime_miss_diagnostic(request_id);
                     return Ok(finalize_gateway_response_with_context(
                         &state,
                         execution_runtime_response,
@@ -2283,6 +2294,7 @@ async fn proxy_request_inner(
                 &parts,
                 buffered_body.clone(),
                 &trace_id,
+                request_id,
                 control_decision,
                 stream_request,
             )
@@ -2324,7 +2336,7 @@ async fn proxy_request_inner(
                             .await?
                     };
                     let mut control_response = control_response;
-                    state.clear_local_execution_runtime_miss_diagnostic(&trace_id);
+                    state.clear_local_execution_runtime_miss_diagnostic(request_id);
                     control_response.headers_mut().insert(
                         HeaderName::from_static(DEPENDENCY_REASON_HEADER),
                         HeaderValue::from_static(reason.as_label_value()),
@@ -2346,9 +2358,9 @@ async fn proxy_request_inner(
             }
         }
         let local_execution_runtime_miss_diagnostic =
-            state.take_local_execution_runtime_miss_diagnostic(&trace_id);
+            state.take_local_execution_runtime_miss_diagnostic(request_id);
         let local_execution_runtime_miss_context =
-            build_local_execution_runtime_miss_context(&state, &trace_id, control_decision).await;
+            build_local_execution_runtime_miss_context(&state, request_id, control_decision).await;
         let auth_api_key_concurrency_limited = diagnostic_is_auth_api_key_concurrency_limited(
             local_execution_runtime_miss_diagnostic.as_ref(),
         ) || local_execution_runtime_miss_context
@@ -2400,6 +2412,7 @@ async fn proxy_request_inner(
         );
         warn!(
             trace_id = %trace_id,
+            request_id,
             local_execution_runtime_miss_reason = local_execution_runtime_miss_diagnostic
                 .as_ref()
                 .map(|value| value.reason.as_str())
@@ -2472,7 +2485,7 @@ async fn proxy_request_inner(
         } else {
             record_failed_usage_for_runtime_miss_request(
                 &state,
-                &trace_id,
+                request_id,
                 &started_at,
                 local_execution_runtime_miss_detail.as_str(),
                 local_execution_failure_path,

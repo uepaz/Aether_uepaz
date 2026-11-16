@@ -29,6 +29,27 @@ pub(super) use super::router::{attach_static_frontend, build_router, build_route
 pub(super) use super::state::{AppState, FrontdoorCorsConfig};
 pub(super) use super::usage::UsageRuntimeConfig;
 
+#[track_caller]
+fn response_request_id(headers: &http::HeaderMap) -> String {
+    headers
+        .get(CONTROL_REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .expect("response should expose the gateway request ID")
+        .to_string()
+}
+
+async fn execution_request_id(request: Request) -> String {
+    let body = to_bytes(request.into_body(), usize::MAX)
+        .await
+        .expect("execution plan should read");
+    let plan: serde_json::Value =
+        serde_json::from_slice(&body).expect("execution plan should parse");
+    plan["request_id"]
+        .as_str()
+        .expect("plan request ID should exist")
+        .to_string()
+}
+
 pub(super) async fn start_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
     let listener = crate::test_support::bind_loopback_listener()
         .await

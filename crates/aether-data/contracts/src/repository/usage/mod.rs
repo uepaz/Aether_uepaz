@@ -9,6 +9,7 @@ mod dashboard_summary;
 mod health;
 mod metadata_policy;
 mod policy;
+mod reported_usage;
 mod types;
 
 pub use analytics::*;
@@ -24,6 +25,7 @@ pub use dashboard_summary::*;
 pub use health::*;
 pub use metadata_policy::*;
 pub use policy::*;
+pub use reported_usage::*;
 pub use types::{
     canonical_usage_body_ref_for, extract_provider_actual_service_tier_from_response,
     extract_provider_cache_ttl_minutes_from_metadata, extract_provider_reasoning_effort_from_body,

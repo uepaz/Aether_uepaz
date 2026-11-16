@@ -327,7 +327,7 @@ impl SettlementWriteRepository for InMemorySettlementRepository {
             // identity fields mutate a reservation belonging to another request.
             return Ok(None);
         }
-        if reservation.state == UsagePolicyCostReservationState::Reserved {
+        if reservation.allows_reconciliation(&input) {
             reservation.state = input.terminal_state;
             reservation.actual_cost_units = Some(input.actual_cost_units);
             reservation.finalized_at_unix_secs = Some(input.finalized_at_unix_secs);
@@ -1007,6 +1007,57 @@ mod usage_policy_cost_tests {
     }
 
     #[tokio::test]
+    async fn later_reported_usage_recovers_released_reservation_once() {
+        let repository = InMemorySettlementRepository::default();
+        let reservation = reserve("late-usage", 20_000, 10, 100);
+        repository
+            .reserve_usage_policy_cost(reservation.clone())
+            .await
+            .unwrap();
+        let mut input = ReconcileUsagePolicyCostInput {
+            request_id: reservation.request_id,
+            subject_id: reservation.subject_id,
+            reservation_token: reservation.reservation_token,
+            actual_cost_units: 0,
+            terminal_state: UsagePolicyCostReservationState::Released,
+            finalized_at_unix_secs: 20_001,
+        };
+        repository
+            .reconcile_usage_policy_cost(input.clone())
+            .await
+            .unwrap();
+        input.terminal_state = UsagePolicyCostReservationState::Finalized;
+        input.actual_cost_units = 23;
+        input.finalized_at_unix_secs = 20_000;
+        assert_eq!(
+            repository
+                .reconcile_usage_policy_cost(input.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            UsagePolicyCostReservationState::Released
+        );
+        input.finalized_at_unix_secs = 20_002;
+        let recovered = repository
+            .reconcile_usage_policy_cost(input.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.state, UsagePolicyCostReservationState::Finalized);
+        assert_eq!(recovered.actual_cost_units, Some(23));
+        input.actual_cost_units = 99;
+        assert_eq!(
+            repository
+                .reconcile_usage_policy_cost(input)
+                .await
+                .unwrap()
+                .unwrap(),
+            recovered
+        );
+    }
+
+    #[tokio::test]
     async fn reconciliation_ignores_subject_or_token_mismatches() {
         let repository = InMemorySettlementRepository::default();
         repository
@@ -1194,6 +1245,24 @@ mod tests {
             assert!(repository.provider_monthly_used.read().unwrap().is_empty());
             assert!(repository.settlements.read().unwrap().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn failed_billable_usage_settles_wallet_and_replay_does_not_debit_twice() {
+        let repository = InMemorySettlementRepository::seed(vec![sample_wallet()]);
+        let mut input = group_billed_input("failed-billable-replay");
+        input.status = "failed".into();
+        let first = repository
+            .settle_usage(input.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let replay = repository.settle_usage(input).await.unwrap().unwrap();
+        assert_eq!(first.billing_status, "settled");
+        assert_eq!(first.wallet_balance_before, Some(12.0));
+        assert_eq!(first.wallet_balance_after, Some(9.0));
+        assert_eq!(first.provider_monthly_used_usd, Some(0.5));
+        assert_eq!(replay, first);
     }
 
     #[tokio::test]

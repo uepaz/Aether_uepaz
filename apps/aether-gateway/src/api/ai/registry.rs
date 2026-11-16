@@ -73,11 +73,17 @@ pub(crate) fn mount_ai_routes(mut router: Router<AppState>) -> Router<AppState> 
     router = router.route("/v1/live/{call_id}", get(live_websocket));
     router = router.route("/v1/realtime", get(dispatch_realtime_websocket));
     for path in CLAUDE_POST_ROUTE_PATTERNS {
-        router = router.route(
-            path,
-            post(proxy_request).fallback(claude_method_not_allowed),
-        );
+        let post_route = if *path == "/v1/messages/count_tokens" {
+            post(claude_count_tokens_disabled)
+        } else {
+            post(proxy_request)
+        };
+        router = router.route(path, post_route.fallback(claude_method_not_allowed));
     }
+    router = router.route(
+        "/v1/messages/count_tokens/",
+        post(claude_count_tokens_disabled).fallback(claude_method_not_allowed),
+    );
     for path in AI_ANY_ROUTE_PATTERNS {
         router = router.route(path, any(proxy_request));
     }
@@ -137,6 +143,18 @@ fn realtime_query_is_codex_live(query: Option<&str>, headers: &HeaderMap) -> boo
                 || value.eq_ignore_ascii_case("codex_work_web")
                 || value.eq_ignore_ascii_case("codex_work_mobile")
         })
+}
+
+async fn claude_count_tokens_disabled(request: Request) -> Result<Response<Body>, GatewayError> {
+    // 在进入代理处理前拒绝，避免建立候选、预留额度或生成用量记录。
+    let trace_id = extract_or_generate_trace_id(request.headers());
+    build_local_http_error_response_with_request_path(
+        &trace_id,
+        None,
+        Some(request.uri().path()),
+        StatusCode::NOT_FOUND,
+        "Token counting endpoint is disabled",
+    )
 }
 
 async fn claude_method_not_allowed(request: Request) -> Result<Response<Body>, GatewayError> {

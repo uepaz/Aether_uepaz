@@ -36,6 +36,24 @@ afterEach(() => {
 })
 
 describe('ElapsedTimeText', () => {
+  it('includes the upstream wait when the record and first byte share a timestamp', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-11-03T12:00:21Z'))
+
+    const root = mountElapsedTimeText({
+      status: 'streaming',
+      createdAt: '2026-11-03T12:00:20Z',
+      responseTimeUpdatedAt: '2026-11-03T12:00:20Z',
+      responseTimeMs: 20000,
+    })
+    await nextTick()
+
+    expect(root.textContent).toBe('21.00s')
+    vi.advanceTimersByTime(1000)
+    await nextTick()
+    expect(Number.parseFloat(root.textContent ?? '')).toBeGreaterThanOrEqual(21.98)
+  })
+
   it('uses active response timing from response_time_updated_at instead of stale created_at', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-06-08T12:00:10.000Z'))

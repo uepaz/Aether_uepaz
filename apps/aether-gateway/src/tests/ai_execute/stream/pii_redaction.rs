@@ -387,6 +387,7 @@ async fn ai_execute_stream_pii_redaction_round_trip_impl() {
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     let status = response.status();
     let execution_path = response
@@ -417,7 +418,7 @@ async fn ai_execute_stream_pii_redaction_round_trip_impl() {
     assert!(provider_body_text.contains("<AETHER:EMAIL:"));
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-ai-execute-stream-pii-redaction")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);

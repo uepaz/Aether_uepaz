@@ -297,6 +297,19 @@ pub struct StoredUsagePolicyCostReservation {
     pub finalized_at_unix_secs: Option<u64>,
 }
 
+impl StoredUsagePolicyCostReservation {
+    /// A late authoritative usage report can recover a provisional release. Once finalized,
+    /// the reservation remains immutable so retries cannot change consumed quota.
+    pub fn allows_reconciliation(&self, input: &ReconcileUsagePolicyCostInput) -> bool {
+        self.state == UsagePolicyCostReservationState::Reserved
+            || (self.state == UsagePolicyCostReservationState::Released
+                && input.terminal_state == UsagePolicyCostReservationState::Finalized
+                && self
+                    .finalized_at_unix_secs
+                    .is_some_and(|released_at| input.finalized_at_unix_secs >= released_at))
+    }
+}
+
 fn validate_non_empty_id(value: &str, field: &str) -> Result<(), crate::DataLayerError> {
     if value.trim().is_empty() {
         return Err(crate::DataLayerError::InvalidInput(format!(
@@ -517,7 +530,9 @@ pub fn plan_finite_wallet_debit(
 
 pub fn settlement_billing_status_for_usage_status(status: &str) -> &'static str {
     match status {
-        "completed" | "cancelled" => "settled",
+        // Eligibility is captured by the usage writer's pending/void billing status. A failed
+        // delivery can still have authoritative upstream consumption requiring settlement.
+        "completed" | "cancelled" | "failed" => "settled",
         _ => "void",
     }
 }

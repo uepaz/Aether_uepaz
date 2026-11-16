@@ -761,7 +761,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             stream
-                .wait_headers(Duration::from_secs(1))
+                .wait_headers(Some(Duration::from_secs(1)))
                 .await
                 .unwrap()
                 .status,

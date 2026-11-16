@@ -150,13 +150,17 @@
             </Label>
             <Input
               :model-value="form.stream_first_byte_timeout ?? ''"
+              id="stream-first-byte-timeout"
               type="number"
-              min="1"
+              min="0"
               max="300"
               step="1"
               placeholder="30"
               @update:model-value="(v) => form.stream_first_byte_timeout = parseNumberInput(v)"
             />
+            <p class="text-xs text-muted-foreground">
+              {{ t('ui.streamingFirstByteTimeoutHint') }}
+            </p>
           </div>
           <div class="space-y-1.5">
             <Label>

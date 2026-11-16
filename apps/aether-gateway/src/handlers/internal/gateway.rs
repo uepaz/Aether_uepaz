@@ -11,7 +11,7 @@ use super::{
 use crate::ai_serving::api;
 use crate::constants::{
     CONTROL_EXECUTED_HEADER, EXECUTION_PATH_EXECUTION_RUNTIME_STREAM,
-    EXECUTION_PATH_EXECUTION_RUNTIME_SYNC,
+    EXECUTION_PATH_EXECUTION_RUNTIME_SYNC, TRACE_ID_HEADER,
 };
 use crate::control::GatewayControlDecision;
 use crate::control::GatewayPublicRequestContext;
@@ -30,6 +30,30 @@ use axum::http::{self, HeaderName, HeaderValue, Response};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Value};
+
+fn build_internal_execution_request_parts(
+    payload: &InternalGatewayExecuteRequest,
+    ingress_trace_id: &str,
+) -> Result<(http::request::Parts, String), Response<Body>> {
+    let mut parts = build_internal_gateway_request_parts(
+        &payload.method,
+        &payload.path,
+        payload.query_string.as_deref(),
+        &payload.headers,
+    )?;
+    let trace_id = payload.trace_id.as_deref().unwrap_or(ingress_trace_id);
+    if crate::headers::header_value_str(&parts.headers, TRACE_ID_HEADER).is_none() {
+        let trace_header = HeaderValue::from_str(trace_id.trim())
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| {
+                HeaderValue::from_str(ingress_trace_id)
+                    .expect("ingress trace ID should be a valid header value")
+            });
+        parts.headers.insert(TRACE_ID_HEADER, trace_header);
+    }
+    Ok((parts, trace_id.to_owned()))
+}
 
 fn reject_supplied_auth_context(
     auth_context: Option<&crate::control::GatewayControlAuthContext>,
@@ -263,20 +287,13 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                 if let Err(response) = reject_supplied_auth_context(payload.auth_context.as_ref()) {
                     return Ok(Some(response));
                 }
-                let parts = match build_internal_gateway_request_parts(
-                    &payload.method,
-                    &payload.path,
-                    payload.query_string.as_deref(),
-                    &payload.headers,
+                let (parts, trace_id) = match build_internal_execution_request_parts(
+                    &payload,
+                    request_context.trace_id.as_str(),
                 ) {
-                    Ok(parts) => parts,
+                    Ok(parts_and_trace) => parts_and_trace,
                     Err(response) => return Ok(Some(response)),
                 };
-                let trace_id = payload
-                    .trace_id
-                    .as_deref()
-                    .unwrap_or(request_context.trace_id.as_str())
-                    .to_string();
                 let body_is_empty = payload.body_base64.is_none()
                     && payload
                         .body_json
@@ -309,7 +326,7 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                 let Some(mut local_payload) = api::maybe_build_sync_decision_payload(
                     state,
                     &parts,
-                    trace_id.as_str(),
+                    request_context.request_id.as_str(),
                     &resolved,
                     &payload.body_json,
                     payload.body_base64.as_deref(),
@@ -355,20 +372,13 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                 if let Err(response) = reject_supplied_auth_context(payload.auth_context.as_ref()) {
                     return Ok(Some(response));
                 }
-                let parts = match build_internal_gateway_request_parts(
-                    &payload.method,
-                    &payload.path,
-                    payload.query_string.as_deref(),
-                    &payload.headers,
+                let (parts, trace_id) = match build_internal_execution_request_parts(
+                    &payload,
+                    request_context.trace_id.as_str(),
                 ) {
-                    Ok(parts) => parts,
+                    Ok(parts_and_trace) => parts_and_trace,
                     Err(response) => return Ok(Some(response)),
                 };
-                let trace_id = payload
-                    .trace_id
-                    .as_deref()
-                    .unwrap_or(request_context.trace_id.as_str())
-                    .to_string();
                 let body_is_empty = payload.body_base64.is_none()
                     && payload
                         .body_json
@@ -401,7 +411,7 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                 let Some(mut local_payload) = api::maybe_build_stream_decision_payload(
                     state,
                     &parts,
-                    trace_id.as_str(),
+                    request_context.request_id.as_str(),
                     &resolved,
                     &payload.body_json,
                     payload.body_base64.as_deref(),
@@ -446,20 +456,13 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                 if let Err(response) = reject_supplied_auth_context(payload.auth_context.as_ref()) {
                     return Ok(Some(response));
                 }
-                let parts = match build_internal_gateway_request_parts(
-                    &payload.method,
-                    &payload.path,
-                    payload.query_string.as_deref(),
-                    &payload.headers,
+                let (parts, trace_id) = match build_internal_execution_request_parts(
+                    &payload,
+                    request_context.trace_id.as_str(),
                 ) {
-                    Ok(parts) => parts,
+                    Ok(parts_and_trace) => parts_and_trace,
                     Err(response) => return Ok(Some(response)),
                 };
-                let trace_id = payload
-                    .trace_id
-                    .as_deref()
-                    .unwrap_or(request_context.trace_id.as_str())
-                    .to_string();
                 let body_is_empty = payload.body_base64.is_none()
                     && payload
                         .body_json
@@ -480,7 +483,7 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                 if let Some(mut planned) = api::maybe_build_sync_plan_payload(
                     state,
                     &parts,
-                    trace_id.as_str(),
+                    request_context.request_id.as_str(),
                     &resolved,
                     &payload.body_json,
                     payload.body_base64.as_deref(),
@@ -532,20 +535,13 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                 if let Err(response) = reject_supplied_auth_context(payload.auth_context.as_ref()) {
                     return Ok(Some(response));
                 }
-                let parts = match build_internal_gateway_request_parts(
-                    &payload.method,
-                    &payload.path,
-                    payload.query_string.as_deref(),
-                    &payload.headers,
+                let (parts, trace_id) = match build_internal_execution_request_parts(
+                    &payload,
+                    request_context.trace_id.as_str(),
                 ) {
-                    Ok(parts) => parts,
+                    Ok(parts_and_trace) => parts_and_trace,
                     Err(response) => return Ok(Some(response)),
                 };
-                let trace_id = payload
-                    .trace_id
-                    .as_deref()
-                    .unwrap_or(request_context.trace_id.as_str())
-                    .to_string();
                 let Some(mut resolved) = crate::control::resolve_control_route(
                     state,
                     &parts.method,
@@ -560,7 +556,7 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                 if let Some(mut planned) = api::maybe_build_stream_plan_payload(
                     state,
                     &parts,
-                    trace_id.as_str(),
+                    request_context.request_id.as_str(),
                     &resolved,
                     &payload.body_json,
                     payload.body_base64.as_deref(),
@@ -612,20 +608,13 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                 if let Err(response) = reject_supplied_auth_context(payload.auth_context.as_ref()) {
                     return Ok(Some(response));
                 }
-                let parts = match build_internal_gateway_request_parts(
-                    &payload.method,
-                    &payload.path,
-                    payload.query_string.as_deref(),
-                    &payload.headers,
+                let (parts, trace_id) = match build_internal_execution_request_parts(
+                    &payload,
+                    request_context.trace_id.as_str(),
                 ) {
-                    Ok(parts) => parts,
+                    Ok(parts_and_trace) => parts_and_trace,
                     Err(response) => return Ok(Some(response)),
                 };
-                let trace_id = payload
-                    .trace_id
-                    .as_deref()
-                    .unwrap_or(request_context.trace_id.as_str())
-                    .to_string();
                 let body_is_empty = payload.body_base64.is_none()
                     && payload
                         .body_json
@@ -646,7 +635,7 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                 if let Some(plan_payload) = api::maybe_build_sync_plan_payload(
                     state,
                     &parts,
-                    trace_id.as_str(),
+                    request_context.request_id.as_str(),
                     &resolved,
                     &payload.body_json,
                     payload.body_base64.as_deref(),
@@ -701,20 +690,13 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                 if let Err(response) = reject_supplied_auth_context(payload.auth_context.as_ref()) {
                     return Ok(Some(response));
                 }
-                let parts = match build_internal_gateway_request_parts(
-                    &payload.method,
-                    &payload.path,
-                    payload.query_string.as_deref(),
-                    &payload.headers,
+                let (parts, trace_id) = match build_internal_execution_request_parts(
+                    &payload,
+                    request_context.trace_id.as_str(),
                 ) {
-                    Ok(parts) => parts,
+                    Ok(parts_and_trace) => parts_and_trace,
                     Err(response) => return Ok(Some(response)),
                 };
-                let trace_id = payload
-                    .trace_id
-                    .as_deref()
-                    .unwrap_or(request_context.trace_id.as_str())
-                    .to_string();
                 let Some(mut resolved) = crate::control::resolve_control_route(
                     state,
                     &parts.method,
@@ -729,7 +711,7 @@ pub(crate) async fn maybe_build_local_internal_proxy_response_impl(
                 if let Some(plan_payload) = api::maybe_build_stream_plan_payload(
                     state,
                     &parts,
-                    trace_id.as_str(),
+                    request_context.request_id.as_str(),
                     &resolved,
                     &payload.body_json,
                     payload.body_base64.as_deref(),

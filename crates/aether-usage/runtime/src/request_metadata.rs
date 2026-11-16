@@ -13,7 +13,7 @@ use aether_data_contracts::repository::usage::{
     PROVIDER_REASONING_EFFORT_METADATA_KEY, PROVIDER_RESPONSE_MODEL_METADATA_KEY,
     PROVIDER_SERVICE_TIER_METADATA_KEY, REQUESTED_REASONING_EFFORT_METADATA_KEY,
     ROUTING_GROUP_BILLING_MULTIPLIER_METADATA_KEY, ROUTING_GROUP_ID_METADATA_KEY,
-    ROUTING_GROUP_NAME_METADATA_KEY,
+    ROUTING_GROUP_NAME_METADATA_KEY, USAGE_CLIENT_FAMILY_SOURCE_METADATA_KEY,
 };
 use serde_json::{Map, Value};
 
@@ -68,7 +68,7 @@ pub(crate) fn build_usage_request_metadata_seed(
     _plan: &ExecutionPlan,
     context: Option<&Map<String, Value>>,
 ) -> Option<Value> {
-    context.and_then(project_usage_request_metadata_object)
+    strip_reported_usage(context.and_then(project_usage_request_metadata_object))
 }
 
 pub(crate) fn merge_usage_request_metadata(
@@ -76,7 +76,26 @@ pub(crate) fn merge_usage_request_metadata(
     override_value: Option<Value>,
 ) -> Option<Value> {
     let mut metadata = projected_metadata_object(base.as_ref());
-    metadata.extend(projected_metadata_object(override_value.as_ref()));
+    let mut override_metadata = projected_metadata_object(override_value.as_ref());
+    // Keep the source and the label together when combining lifecycle facts.
+    if override_metadata.contains_key("client_family") {
+        if metadata.contains_key(USAGE_CLIENT_FAMILY_SOURCE_METADATA_KEY)
+            && !override_metadata.contains_key(USAGE_CLIENT_FAMILY_SOURCE_METADATA_KEY)
+        {
+            override_metadata.remove("client_family");
+        } else {
+            metadata.remove(USAGE_CLIENT_FAMILY_SOURCE_METADATA_KEY);
+        }
+    }
+    metadata.extend(override_metadata);
+    strip_reported_usage((!metadata.is_empty()).then_some(Value::Object(metadata)))
+}
+
+fn strip_reported_usage(metadata: Option<Value>) -> Option<Value> {
+    let Value::Object(mut metadata) = metadata? else {
+        return None;
+    };
+    metadata.remove(aether_data_contracts::repository::usage::REPORTED_USAGE_METADATA_KEY);
     (!metadata.is_empty()).then_some(Value::Object(metadata))
 }
 
@@ -101,6 +120,7 @@ pub(crate) fn retain_first_byte_request_metadata(value: Option<Value>) -> Option
             "trace_id"
                 | "client_ip"
                 | "client_family"
+                | USAGE_CLIENT_FAMILY_SOURCE_METADATA_KEY
                 | "client_requested_stream"
                 | "upstream_is_stream"
                 | "api_key_is_standalone"

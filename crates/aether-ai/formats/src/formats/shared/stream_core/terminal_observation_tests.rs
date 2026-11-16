@@ -2,6 +2,82 @@ use serde_json::{json, Value};
 
 use super::{ProviderStreamParser, StreamingStandardTerminalObserver, TerminalStreamParser};
 
+#[test]
+fn terminal_usage_prefers_protocol_fields_over_compatibility_aliases() {
+    for format in ["openai:chat", "openai:responses"] {
+        for (input, output) in [(3197, 1034), (0, 0)] {
+            let mut usage = json!({
+                "prompt_tokens": 71, "completion_tokens": 29,
+                "input_tokens": 71, "output_tokens": 29,
+                "prompt_tokens_details": {"cached_tokens": 17},
+                "input_tokens_details": {"cached_tokens": 17},
+                "completion_tokens_details": {"reasoning_tokens": 13},
+                "output_tokens_details": {"reasoning_tokens": 13},
+                "total_tokens": input + output,
+            });
+            let chat = format == "openai:chat";
+            usage[if chat {
+                "prompt_tokens"
+            } else {
+                "input_tokens"
+            }] = input.into();
+            usage[if chat {
+                "completion_tokens"
+            } else {
+                "output_tokens"
+            }] = output.into();
+            usage[if chat {
+                "prompt_tokens_details"
+            } else {
+                "input_tokens_details"
+            }] = json!({"cached_tokens": 0});
+            usage[if chat {
+                "completion_tokens_details"
+            } else {
+                "output_tokens_details"
+            }] = json!({"reasoning_tokens": 0});
+            let context =
+                json!({"provider_api_format": format, "client_api_format": "claude:messages"});
+            let event = if chat {
+                json!({"id": "chatcmpl_usage", "object": "chat.completion.chunk",
+                    "model": "test", "choices": [], "usage": usage})
+            } else {
+                json!({"type": "response.completed", "response": {
+                    "id": "resp_usage", "model": "test", "status": "completed",
+                    "output": [], "usage": usage,
+                }})
+            };
+            for mut observer in [
+                StreamingStandardTerminalObserver::default(),
+                full_observer(&context),
+            ] {
+                if chat {
+                    let finish = json!({"id": "chatcmpl_usage", "object": "chat.completion.chunk",
+                        "model": "test", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]});
+                    observer
+                        .push_line(&context, format!("data: {finish}\n").into_bytes())
+                        .unwrap();
+                }
+                observer
+                    .push_line(&context, format!("data: {event}\n").into_bytes())
+                    .unwrap();
+                let summary = observer.finish(&context).unwrap().unwrap();
+                let measured = summary.standardized_usage.unwrap();
+                assert_eq!(
+                    (
+                        measured.input_tokens,
+                        measured.output_tokens,
+                        measured.cache_read_tokens,
+                        measured.reasoning_tokens
+                    ),
+                    (input, output, 0, 0),
+                    "{format}: {event}",
+                );
+            }
+        }
+    }
+}
+
 fn full_observer(context: &Value) -> StreamingStandardTerminalObserver {
     StreamingStandardTerminalObserver {
         provider: Some(TerminalStreamParser::Standard(

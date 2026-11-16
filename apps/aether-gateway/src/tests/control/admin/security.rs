@@ -72,7 +72,13 @@ async fn gateway_shapes_blacklist_rejections_for_claude_routes_before_routing() 
 
         let response = send_request(gateway.clone(), request).await;
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN, "path: {path}");
+        let disabled = path == "/v1/messages/count_tokens";
+        let expected_status = if disabled {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        assert_eq!(response.status(), expected_status, "path: {path}");
         let payload = response
             .into_body()
             .collect()
@@ -82,9 +88,19 @@ async fn gateway_shapes_blacklist_rejections_for_claude_routes_before_routing() 
         let payload: serde_json::Value =
             serde_json::from_slice(&payload).expect("response should be json");
         assert_eq!(payload["type"], "error", "path: {path}");
-        assert_eq!(payload["error"]["type"], "permission_error", "path: {path}");
+        let expected_type = if disabled {
+            "not_found_error"
+        } else {
+            "permission_error"
+        };
+        assert_eq!(payload["error"]["type"], expected_type, "path: {path}");
         assert_eq!(
-            payload["error"]["message"], "当前 IP 已被禁止访问",
+            payload["error"]["message"],
+            if disabled {
+                "Token counting endpoint is disabled"
+            } else {
+                "当前 IP 已被禁止访问"
+            },
             "path: {path}"
         );
     }

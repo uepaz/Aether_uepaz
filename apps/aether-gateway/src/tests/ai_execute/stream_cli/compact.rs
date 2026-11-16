@@ -526,6 +526,7 @@ async fn gateway_executes_openai_responses_compact_as_unary_request_impl() {
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     if response.status() != StatusCode::OK {
         let status = response.status();
@@ -675,7 +676,7 @@ async fn gateway_executes_openai_responses_compact_as_unary_request_impl() {
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-compact-local-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);

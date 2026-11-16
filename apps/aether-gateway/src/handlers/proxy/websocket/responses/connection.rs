@@ -14,8 +14,8 @@ use super::continuation::{
 };
 use super::frame::{encode_opaque_websocket_event, ParsedResponsesWebSocketFrame};
 use super::lifecycle::{
-    await_pending_adapter_observation, finalize_active_turn, queue_turn_finalization,
-    settle_turn_finalization, spawn_bounded_adapter_observation, PreviousAttemptSettled,
+    await_pending_adapter_observation, finalize_active_turn, finish_attempt_for_quota_retry,
+    queue_turn_finalization, spawn_bounded_adapter_observation, QuotaRetry,
 };
 use super::plan_admission::terminate_responses_websocket_for_plan_permit_loss;
 use super::quota::{
@@ -374,11 +374,35 @@ pub(super) async fn relay_bound_connection(
                     }
                     _ => None,
                 };
-                if matches!(
+                let is_close = matches!(upstream_message, WreqWsMessage::Close(_));
+                let drain_for_adapter = adapter_drain_ready(
+                    bound.pending_adapter_drain,
+                    bound.turn_state.response_in_flight(),
                     observation,
-                    Some(ResponsesWebSocketTurnObservation::Started)
-                        | Some(ResponsesWebSocketTurnObservation::Terminal(_))
-                ) {
+                    is_close,
+                );
+                let quota_facts = QuotaRelayFacts {
+                    drain_ready: drain_for_adapter,
+                    retry_current_turn: bound
+                        .pending_adapter_drain
+                        .is_some_and(|directive| directive.retry_current_turn)
+                        && bound
+                            .turn_state
+                            .logical()
+                            .is_some_and(|turn| turn.quota_retry_block_reason().is_none()),
+                    transparent_retry_failed: false,
+                    usage_limit_error: parsed_upstream_event.is_some_and(is_usage_limit_error_event),
+                    upstream_closed: is_close,
+                };
+                let mut quota_relay_action = classify_quota_relay(quota_facts);
+                // The original 429 is still internal while considering replay.
+                if quota_relay_action != QuotaRelayAction::AttemptTransparentRetry
+                    && matches!(
+                        observation,
+                        Some(ResponsesWebSocketTurnObservation::Started)
+                            | Some(ResponsesWebSocketTurnObservation::Terminal(_))
+                    )
+                {
                     if let Some(turn) = bound.turn_state.attempt_mut() {
                         turn.mark_stream_started(state).await;
                     }
@@ -456,43 +480,13 @@ pub(super) async fn relay_bound_connection(
                     .await;
                     break;
                 }
-                let is_close = matches!(upstream_message, WreqWsMessage::Close(_));
-                let drain_for_adapter = adapter_drain_ready(
-                    bound.pending_adapter_drain,
-                    bound.turn_state.response_in_flight(),
-                    observation,
-                    is_close,
-                );
-                let quota_facts = QuotaRelayFacts {
-                    drain_ready: drain_for_adapter,
-                    retry_current_turn: bound
-                        .pending_adapter_drain
-                        .is_some_and(|directive| directive.retry_current_turn)
-                        && bound
-                            .turn_state
-                            .logical()
-                            .is_some_and(|turn| turn.quota_retry_block_reason().is_none()),
-                    transparent_retry_failed: false,
-                    usage_limit_error: parsed_upstream_event.is_some_and(is_usage_limit_error_event),
-                    upstream_closed: is_close,
-                };
-                let mut quota_relay_action = classify_quota_relay(quota_facts);
+                let mut quota_retry = None;
                 if matches!(quota_relay_action, QuotaRelayAction::AttemptTransparentRetry) {
-                    // detach_attempt 保留 logical turn：重试是同一轮请求的下一个 attempt。
-                    let retry_turn = bound.turn_state.detach_attempt();
-                    // 先结算旧 attempt 并等它落地，再规划下一个 attempt。两个理由：
-                    //
-                    // 1. 规划要读 health / adaptive / pool 状态，而这些正是旧
-                    //    attempt 结算时才投射的。普通的新 turn 早就在 client.rs 里
-                    //    用 await_pending_turn_finalization 挡住了「基于陈旧状态
-                    //    规划」，透明重试这条路径原先漏了这一步。
-                    // 2. 旧 attempt 还占着自己的 pool key lease。不先释放，重试就
-                    //    可能因为「这把 key 仍被占用」而挑不到本该可用的替代 key，
-                    //    或者干脆判成无可用供应商。
-                    let settled = match retry_turn {
-                        Some(mut turn) => {
-                            turn.release_admission().await;
-                            settle_turn_finalization(
+                    // Finish candidate/effects before selecting a new key, while
+                    // keeping the same logical turn and its usage record open.
+                    quota_retry = match bound.turn_state.detach_attempt() {
+                        Some(turn) => {
+                            finish_attempt_for_quota_retry(
                                 bound,
                                 state,
                                 turn,
@@ -502,15 +496,15 @@ pub(super) async fn relay_bound_connection(
                             )
                             .await
                         }
-                        None => Some(PreviousAttemptSettled::nothing_to_settle()),
+                        None => None,
                     };
                     // Planning and binding a replacement carries the complete
                     // scheduler/provider state machine. Keep that large future
                     // off the relay task's stack; the default Tokio/test worker
                     // stack is otherwise easy to exhaust on this rare branch.
-                    if let Some(settled) = settled {
+                    if let Some(retry) = quota_retry.as_mut().filter(|retry| retry.permits_replay()) {
                         match Box::pin(retry_active_turn_after_quota_exhaustion(
-                            bound, state, context, settled,
+                            bound, state, context, retry,
                         ))
                         .await
                         {
@@ -530,9 +524,8 @@ pub(super) async fn relay_bound_connection(
                             }
                         }
                     }
-                    // 重试失败。旧 attempt 已经结算，logical turn 仍停在
-                    // Replanning，所以后面分支里的 end() / finalize_active_turn
-                    // 只会清掉 logical turn 而不会交出 attempt——不存在重复结算。
+                    // Keep the rejected attempt's usage until the original
+                    // error is relayed if the replacement never sent a request.
                     quota_relay_action = classify_quota_relay(QuotaRelayFacts {
                         retry_current_turn: false,
                         transparent_retry_failed: true,
@@ -597,11 +590,10 @@ pub(super) async fn relay_bound_connection(
                         if let Some(client_frame) = client_frame {
                             match send_client_message(client_socket, client_frame).await {
                                 Ok(()) => {
-                                    if let (Some(turn), Some(frame)) = (
-                                        bound.turn_state.attempt_mut(),
-                                        parsed_upstream_frame.as_ref(),
-                                    ) {
-                                        turn.capture_client_frame(frame.event());
+                                    if let Some(frame) = parsed_upstream_frame.as_ref() {
+                                        capture_delivered_event(
+                                            bound, quota_retry.as_mut(), frame.event(),
+                                        );
                                     }
                                 }
                                 Err(error) => relay_send_error = Some(error),
@@ -635,9 +627,7 @@ pub(super) async fn relay_bound_connection(
                             .await
                             {
                                 Ok(()) => {
-                                    if let Some(turn) = bound.turn_state.attempt_mut() {
-                                        turn.capture_client_frame(event);
-                                    }
+                                    capture_delivered_event(bound, quota_retry.as_mut(), event);
                                 }
                                 Err(error) => {
                                     relay_send_error = Some(error);
@@ -658,6 +648,7 @@ pub(super) async fn relay_bound_connection(
                         }
                     }
                 }
+                drop(quota_retry);
                 if relay_serialization_failed {
                     warn!(
                         event_name = "responses_websocket_provider_event_serialization_failed",
@@ -759,6 +750,18 @@ pub(super) async fn relay_bound_connection(
                 }
             }
         }
+    }
+}
+
+fn capture_delivered_event(
+    bound: &mut BoundResponsesConnection,
+    quota_retry: Option<&mut QuotaRetry>,
+    event: &Value,
+) {
+    if let Some(turn) = bound.turn_state.attempt_mut() {
+        turn.capture_client_frame(event);
+    } else if let Some(retry) = quota_retry {
+        retry.record_client_event();
     }
 }
 

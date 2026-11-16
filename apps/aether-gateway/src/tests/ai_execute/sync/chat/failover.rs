@@ -11,6 +11,7 @@ use super::{
     EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS, LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER,
     TRACE_ID_HEADER,
 };
+use crate::constants::CONTROL_REQUEST_ID_HEADER;
 
 large_stack_async_test!(
     gateway_skips_unsupported_local_openai_chat_sync_candidate_before_trying_next_one,
@@ -21,6 +22,7 @@ async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_tryin
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
+        request_id: String,
         url: String,
         model: String,
         authorization: String,
@@ -231,6 +233,10 @@ async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_tryin
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or_default()
                         .to_string(),
+                    request_id: payload["request_id"]
+                        .as_str()
+                        .expect("plan should carry a request ID")
+                        .to_string(),
                     url: payload
                         .get("url")
                         .and_then(|value| value.as_str())
@@ -251,7 +257,7 @@ async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_tryin
                         .to_string(),
                 });
                 Json(json!({
-                    "request_id": "trace-openai-chat-skip-local-123",
+                    "request_id": payload["request_id"],
                     "status_code": 200,
                     "headers": {
                         "content-type": "application/json"
@@ -364,6 +370,20 @@ async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_tryin
         .expect("request should succeed");
 
     assert_eq!(response.status(), StatusCode::OK);
+    let request_id = response
+        .headers()
+        .get(CONTROL_REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .expect("response should carry the gateway request ID")
+        .to_string();
+    assert_ne!(request_id, "trace-openai-chat-skip-local-123");
+    assert_eq!(
+        response
+            .headers()
+            .get(TRACE_ID_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some("trace-openai-chat-skip-local-123")
+    );
     assert_eq!(
         response
             .headers()
@@ -383,6 +403,7 @@ async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_tryin
         seen_execution_runtime_request.trace_id,
         "trace-openai-chat-skip-local-123"
     );
+    assert_eq!(seen_execution_runtime_request.request_id, request_id);
     assert_eq!(
         seen_execution_runtime_request.url,
         "https://api.openai.backup.example/chat/completions"
@@ -397,7 +418,7 @@ async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_tryin
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-skip-local-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 2);
@@ -652,6 +673,13 @@ async fn gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_ch
         .expect("request should succeed");
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let request_id = response
+        .headers()
+        .get(CONTROL_REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .expect("response should carry the gateway request ID")
+        .to_string();
+    assert_ne!(request_id, "trace-openai-chat-local-miss-123");
     assert_eq!(
         response
             .headers()
@@ -674,7 +702,7 @@ async fn gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_ch
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-local-miss-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -699,6 +727,7 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
+        request_id: String,
         url: String,
         model: String,
         authorization: String,
@@ -950,6 +979,10 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
                             .and_then(|value| value.to_str().ok())
                             .unwrap_or_default()
                             .to_string(),
+                        request_id: payload["request_id"]
+                            .as_str()
+                            .expect("plan should carry a request ID")
+                            .to_string(),
                         url: payload
                             .get("url")
                             .and_then(|value| value.as_str())
@@ -974,7 +1007,7 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
                 // sticky_key_attempts; both must fail to reach the backup.
                 if attempt <= 2 {
                     return Json(json!({
-                        "request_id": "trace-openai-chat-local-failover-123",
+                        "request_id": payload["request_id"],
                         "status_code": 401,
                         "headers": {
                             "content-type": "application/json"
@@ -993,7 +1026,7 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
                 }
 
                 Json(json!({
-                    "request_id": "trace-openai-chat-local-failover-123",
+                    "request_id": payload["request_id"],
                     "status_code": 200,
                     "headers": {
                         "content-type": "application/json"
@@ -1113,6 +1146,21 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
         .expect("request should succeed");
 
     assert_eq!(response.status(), StatusCode::OK);
+    let request_id = response
+        .headers()
+        .get(CONTROL_REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .expect("response should carry the gateway request ID")
+        .to_string();
+    assert_ne!(request_id, "trace-openai-chat-local-failover-123");
+    assert!(uuid::Uuid::parse_str(&request_id).is_ok());
+    assert_eq!(
+        response
+            .headers()
+            .get(TRACE_ID_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some("trace-openai-chat-local-failover-123")
+    );
     assert_eq!(
         response
             .headers()
@@ -1130,11 +1178,11 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
     // Default sticky_key_attempts is 2: the primary key is retried once on
     // the same key, then failover moves to the backup with a single attempt.
     assert_eq!(seen_execution_runtime_requests.len(), 3);
+    for attempt in &seen_execution_runtime_requests {
+        assert_eq!(attempt.request_id, request_id);
+        assert_eq!(attempt.trace_id, "trace-openai-chat-local-failover-123");
+    }
     for primary_request in &seen_execution_runtime_requests[..2] {
-        assert_eq!(
-            primary_request.trace_id,
-            "trace-openai-chat-local-failover-123"
-        );
         assert_eq!(
             primary_request.url,
             "https://api.openai.primary.example/chat/completions"
@@ -1157,10 +1205,13 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
         "Bearer sk-upstream-openai-backup"
     );
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-local-failover-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 3);
+    assert!(stored_candidates
+        .iter()
+        .all(|candidate| candidate.request_id == request_id));
     for (retry_index, failed_candidate) in stored_candidates[..2].iter().enumerate() {
         assert_eq!(failed_candidate.candidate_index, 0);
         assert_eq!(failed_candidate.retry_index, retry_index as u32);

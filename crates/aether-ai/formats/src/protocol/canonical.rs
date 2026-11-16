@@ -9,6 +9,7 @@ use crate::formats::openai::responses::{
     decode_gemini_tool_signature_carrier, GeminiToolSignatureCarrierDirection,
 };
 use crate::formats::openai::shared::map_thinking_budget_to_openai_reasoning_effort;
+use crate::formats::openai::usage::OpenAiUsageFormat;
 use crate::formats::shared::model_directives::ReasoningEffort;
 use crate::formats::shared::response::remove_empty_pages_from_tool_input_value;
 
@@ -6601,41 +6602,32 @@ pub(crate) fn canonical_response_format_to_openai_responses(
 }
 
 pub(crate) fn openai_usage_to_canonical(value: Option<&Value>) -> Option<CanonicalUsage> {
+    openai_usage_to_canonical_with_format(value, OpenAiUsageFormat::Chat)
+}
+
+fn openai_usage_to_canonical_with_format(
+    value: Option<&Value>,
+    format: OpenAiUsageFormat,
+) -> Option<CanonicalUsage> {
     let usage = value?.as_object()?;
-    let input_tokens = usage
-        .get("prompt_tokens")
-        .or_else(|| usage.get("input_tokens"))
+    let input_tokens = format
+        .input_tokens(usage)
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let output_tokens = usage
-        .get("completion_tokens")
-        .or_else(|| usage.get("output_tokens"))
+    let output_tokens = format
+        .output_tokens(usage)
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let reasoning_tokens = usage
-        .get("completion_tokens_details")
-        .or_else(|| usage.get("output_tokens_details"))
-        .and_then(Value::as_object)
-        .and_then(|details| details.get("reasoning_tokens"))
+    let reasoning_tokens = format
+        .reasoning_tokens(usage)
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let cache_read_tokens = usage
-        .get("prompt_tokens_details")
-        .or_else(|| usage.get("input_tokens_details"))
-        .and_then(Value::as_object)
-        .and_then(|details| details.get("cached_tokens"))
+    let cache_read_tokens = format
+        .cache_read_tokens(usage)
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let cache_write_tokens = usage
-        .get("prompt_tokens_details")
-        .or_else(|| usage.get("input_tokens_details"))
-        .and_then(Value::as_object)
-        .and_then(|details| {
-            details
-                .get("cache_write_tokens")
-                .or_else(|| details.get("cached_creation_tokens"))
-                .or_else(|| details.get("cache_creation_tokens"))
-        })
+    let cache_write_tokens = format
+        .cache_write_tokens(usage)
         .and_then(Value::as_u64)
         .unwrap_or(0);
     Some(CanonicalUsage {
@@ -6659,7 +6651,7 @@ pub(crate) fn openai_usage_to_canonical(value: Option<&Value>) -> Option<Canonic
 
 pub(crate) fn openai_responses_usage_to_canonical(value: Option<&Value>) -> Option<CanonicalUsage> {
     let usage = value?.as_object()?;
-    let mut canonical = openai_usage_to_canonical(value)?;
+    let mut canonical = openai_usage_to_canonical_with_format(value, OpenAiUsageFormat::Responses)?;
     let provider_fields = usage
         .iter()
         .filter(|(key, _)| {
@@ -7364,6 +7356,61 @@ mod tests {
         CanonicalEmbeddingInput, CanonicalEmbeddingRequest, CanonicalRole, CanonicalUsage,
     };
     use serde_json::{json, Value};
+
+    #[test]
+    fn sync_response_usage_respects_protocol_field_precedence() {
+        for chat in [true, false] {
+            for (input, output) in [(3197, 1034), (0, 0)] {
+                let mut usage = json!({
+                    "prompt_tokens": 71, "completion_tokens": 29,
+                    "input_tokens": 71, "output_tokens": 29,
+                    "prompt_tokens_details": {"cached_tokens": 17, "cache_write_tokens": 19},
+                    "input_tokens_details": {"cached_tokens": 17, "cache_write_tokens": 19},
+                    "completion_tokens_details": {"reasoning_tokens": 13},
+                    "output_tokens_details": {"reasoning_tokens": 13},
+                    "total_tokens": input + output,
+                });
+                usage[if chat {
+                    "prompt_tokens"
+                } else {
+                    "input_tokens"
+                }] = input.into();
+                usage[if chat {
+                    "completion_tokens"
+                } else {
+                    "output_tokens"
+                }] = output.into();
+                usage[if chat {
+                    "prompt_tokens_details"
+                } else {
+                    "input_tokens_details"
+                }] = json!({"cached_tokens": 0, "cache_write_tokens": 0});
+                usage[if chat {
+                    "completion_tokens_details"
+                } else {
+                    "output_tokens_details"
+                }] = json!({"reasoning_tokens": 0});
+                let parsed = if chat {
+                    from_openai_chat_to_canonical_response(&json!({"id": "chatcmpl_usage", "model": "test",
+                        "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                        "usage": usage}))
+                } else {
+                    from_openai_responses_to_canonical_response(&json!({"id": "resp_usage", "model": "test",
+                        "status": "completed", "output": [], "usage": usage}))
+                }.unwrap().usage.unwrap();
+                assert_eq!(
+                    (
+                        parsed.input_tokens,
+                        parsed.output_tokens,
+                        parsed.cache_read_tokens,
+                        parsed.cache_write_tokens,
+                        parsed.reasoning_tokens
+                    ),
+                    (input, output, 0, 0, 0)
+                );
+            }
+        }
+    }
 
     #[test]
     fn canonical_embedding_request_accepts_axonhub_input_shapes() {

@@ -1403,6 +1403,147 @@ async fn run_versioned_codex_model_cards_frontdoor_scenario() {
     execution_runtime_handle.abort();
 }
 
+#[test]
+fn gateway_records_responses_websocket_first_turns_under_distinct_request_ids() {
+    super::run_frontdoor_async_test(
+        "responses-websocket-request-identity",
+        run_responses_websocket_request_identity_scenario(),
+    );
+}
+
+async fn run_responses_websocket_request_identity_scenario() {
+    use aether_data_contracts::repository::candidates::{
+        RequestCandidateReadRepository, RequestCandidateStatus,
+    };
+
+    const TRACE_ID: &str = "reused-responses-trace";
+    const MODEL: &str = "responses-identity-model";
+    const PROVIDER_ID: &str = "provider-responses-identity";
+    const FORMAT: &str = "openai:responses";
+
+    let upstream =
+        Router::new().route(
+            "/v1/responses",
+            get(|ws: WebSocketUpgrade| async move {
+                ws.on_upgrade(|mut socket| async move {
+                while let Some(Ok(AxumWsMessage::Text(event))) = socket.recv().await {
+                    let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+                    assert_eq!(event["type"], "response.create");
+                    let terminal = json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": format!("resp-{}", uuid::Uuid::new_v4().simple()),
+                            "object": "response", "status": "completed", "model": MODEL,
+                            "output": [],
+                            "usage": {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13}
+                        }
+                    });
+                    socket.send(AxumWsMessage::Text(terminal.to_string().into())).await.unwrap();
+                }
+            })
+            }),
+        );
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+
+    let mut provider = sample_provider(PROVIDER_ID, "Responses identity", 10);
+    provider.config = Some(json!({"responses_websocket": {"enabled": true}}));
+    let mut row = sample_models_candidate_row(PROVIDER_ID, "Responses identity", FORMAT, MODEL, 10);
+    row.endpoint_kind = Some("responses".to_string());
+    let mut endpoint = sample_endpoint(
+        &row.endpoint_id,
+        PROVIDER_ID,
+        FORMAT,
+        &format!("{upstream_url}/v1"),
+    );
+    endpoint.api_family = Some("openai".to_string());
+    endpoint.endpoint_kind = Some("responses".to_string());
+    let key = sample_key(&row.key_id, PROVIDER_ID, FORMAT, "upstream-key");
+    let usage = Arc::new(InMemoryUsageReadRepository::default());
+    let candidates = Arc::new(InMemoryRequestCandidateRepository::default());
+    let state = AppState::new()
+        .unwrap()
+        .with_data_state_for_tests(
+            GatewayDataState::with_auth_candidate_selection_provider_catalog_request_candidates_and_usage_for_tests(
+                Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+                    Some(hash_api_key("sk-responses-identity")),
+                    unrestricted_models_snapshot("client-key", "client-user"),
+                )])),
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![row])),
+                Arc::new(InMemoryProviderCatalogReadRepository::seed(vec![provider], vec![endpoint], vec![key])),
+                candidates.clone(),
+                usage.clone(),
+                DEVELOPMENT_ENCRYPTION_KEY,
+            ),
+        )
+        .with_usage_runtime_for_tests(crate::usage::UsageRuntimeConfig {
+            enabled: true,
+            ..crate::usage::UsageRuntimeConfig::default()
+        });
+    let (gateway_url, gateway_handle) = start_server(build_router_with_state(state)).await;
+    let ws_url = format!(
+        "{}/v1/responses",
+        gateway_url.replacen("http://", "ws://", 1)
+    );
+    let client = wreq::Client::new();
+    let mut request_ids = Vec::new();
+    for _ in 0..2 {
+        let response = client
+            .websocket(&ws_url)
+            .header("authorization", "Bearer sk-responses-identity")
+            .header("x-trace-id", TRACE_ID)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(response.headers()["x-trace-id"], TRACE_ID);
+        request_ids.push(crate::tests::response_request_id(response.headers()));
+        let mut socket = response.into_websocket().await.unwrap();
+        let event = json!({"type": "response.create", "model": MODEL, "input": "Hello"});
+        socket
+            .send(WreqWsMessage::Text(event.to_string().into()))
+            .await
+            .unwrap();
+        let WreqWsMessage::Text(event) = receive_realtime_message(&mut socket).await else {
+            panic!("Responses WebSocket should return a text event");
+        };
+        let event: serde_json::Value = serde_json::from_str(event.as_str()).unwrap();
+        assert_eq!(event["type"], "response.completed", "{event}");
+    }
+
+    assert_ne!(request_ids[0], request_ids[1]);
+    for request_id in request_ids {
+        uuid::Uuid::parse_str(&request_id).unwrap();
+        let (record, attempt) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let record = usage.find_by_request_id(&request_id).await.unwrap();
+                let attempts = candidates.list_by_request_id(&request_id).await.unwrap();
+                if let (Some(record), Some(attempt)) = (record, attempts.into_iter().next()) {
+                    if record.total_tokens == 13
+                        && attempt.status == RequestCandidateStatus::Success
+                    {
+                        break (record, attempt);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("first turn should be recorded under handshake ID {request_id}")
+        });
+        assert_eq!(record.request_id, request_id);
+        assert_eq!(attempt.request_id, request_id);
+    }
+    assert!(usage.find_by_request_id(TRACE_ID).await.unwrap().is_none());
+    assert!(candidates
+        .list_by_request_id(TRACE_ID)
+        .await
+        .unwrap()
+        .is_empty());
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
 #[derive(Debug)]
 struct ObservedOpenAiRealtimeWebSocket {
     request_target: String,

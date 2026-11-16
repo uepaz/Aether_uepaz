@@ -89,8 +89,10 @@ async fn handle_live_http(
     let mut call_audit = LiveCallCreateAuditGuard::new(
         state,
         request_context.control_decision.as_ref(),
+        request_context.request_id.as_str(),
         request_context.trace_id.as_str(),
         request_context.request_path.as_str(),
+        &parts.headers,
     );
     if dialect == LiveRouteDialect::Realtime {
         if let Err(error) = validate_realtime_call_create_query(parts.uri.query()) {
@@ -182,7 +184,7 @@ async fn handle_live_http(
 
     let planning = match plan_live_candidate(
         state,
-        request_context.trace_id.as_str(),
+        request_context.request_id.as_str(),
         control_decision,
         &parts.headers,
         remote_addr,
@@ -1028,6 +1030,7 @@ mod tests {
     fn live_http_handler_future_stays_stack_bounded() {
         let state = AppState::new().expect("gateway state should build");
         let request_context = GatewayPublicRequestContext {
+            request_id: "request-live-future-size".to_string(),
             trace_id: "trace-live-future-size".to_string(),
             request_method: http::Method::POST,
             request_path: "/v1/live".to_string(),
@@ -1064,6 +1067,7 @@ mod tests {
             Some("openai:realtime".to_string()),
         );
         let request_context = GatewayPublicRequestContext {
+            request_id: "request-ordinary-realtime-call".to_string(),
             trace_id: "trace-ordinary-realtime-call".to_string(),
             request_method: http::Method::POST,
             request_path: "/v1/realtime/calls".to_string(),
@@ -1119,6 +1123,7 @@ mod tests {
             verified_api_key_hash: None,
         });
         let request_context = GatewayPublicRequestContext {
+            request_id: "request-codex-realtime-call".to_string(),
             trace_id: "trace-codex-realtime-call".to_string(),
             request_method: http::Method::POST,
             request_path: "/v1/realtime/calls".to_string(),
@@ -1175,6 +1180,7 @@ mod tests {
             verified_api_key_hash: None,
         });
         let request_context = GatewayPublicRequestContext {
+            request_id: "request-live-finite".to_string(),
             trace_id: "trace-live-finite".to_string(),
             request_method: http::Method::POST,
             request_path: "/v1/live".to_string(),
@@ -1243,6 +1249,7 @@ mod tests {
             verified_api_key_hash: None,
         });
         let request_context = GatewayPublicRequestContext {
+            request_id: "request-live-unmapped".to_string(),
             trace_id: "trace-live-unmapped".to_string(),
             request_method: http::Method::POST,
             request_path: "/v1/live".to_string(),
@@ -1272,7 +1279,7 @@ mod tests {
                 ..crate::usage::UsageRuntimeConfig::default()
             });
         state.set_local_execution_runtime_miss_diagnostic(
-            request_context.trace_id.as_str(),
+            request_context.request_id.as_str(),
             crate::LocalExecutionRuntimeMissDiagnostic {
                 reason: "test_sentinel".to_string(),
                 ..Default::default()
@@ -1309,13 +1316,13 @@ mod tests {
         assert!(String::from_utf8_lossy(body.as_ref())
             .contains("No eligible Codex Live provider mapping is available"));
         assert!(state
-            .take_local_execution_runtime_miss_diagnostic(request_context.trace_id.as_str())
+            .take_local_execution_runtime_miss_diagnostic(request_context.request_id.as_str())
             .is_none());
 
         let usage = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let Some(usage) = usage_repository
-                    .find_by_request_id(request_context.trace_id.as_str())
+                    .find_by_request_id(request_context.request_id.as_str())
                     .await
                     .expect("Live preflight usage read should succeed")
                 {

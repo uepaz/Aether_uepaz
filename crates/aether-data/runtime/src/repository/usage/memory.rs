@@ -27,7 +27,7 @@ use aether_data_contracts::repository::usage::{
     PROVIDER_CACHE_TTL_MINUTES_METADATA_KEY, PROVIDER_REASONING_EFFORT_METADATA_KEY,
     PROVIDER_SERVICE_TIER_METADATA_KEY, REQUESTED_REASONING_EFFORT_METADATA_KEY,
     ROUTING_GROUP_BILLING_MULTIPLIER_METADATA_KEY, ROUTING_GROUP_ID_METADATA_KEY,
-    ROUTING_GROUP_NAME_METADATA_KEY,
+    ROUTING_GROUP_NAME_METADATA_KEY, USAGE_CLIENT_FAMILY_SOURCE_METADATA_KEY,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -3140,6 +3140,7 @@ fn retain_previous_request_audit_metadata(
         "client_ip",
         "user_agent",
         "client_family",
+        USAGE_CLIENT_FAMILY_SOURCE_METADATA_KEY,
         "client_requested_stream",
         "client_session_affinity",
         "api_key_is_standalone",

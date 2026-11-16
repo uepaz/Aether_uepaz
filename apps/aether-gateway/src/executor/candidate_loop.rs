@@ -19,6 +19,7 @@ use tracing::{debug, warn, Instrument};
 
 use crate::ai_serving::LocalExecutionAttemptSource;
 use crate::clock::current_unix_ms;
+use crate::constants::TRACE_ID_HEADER;
 use crate::control::GatewayControlDecision;
 use crate::execution_runtime::{
     acquire_upstream_execution_gate, build_transport_error_stop_response,
@@ -32,6 +33,7 @@ use crate::executor::{
     mark_deferred_upstream_response, LocalExecutionRequestOutcome,
 };
 use crate::handlers::shared::provider_pool::release_admin_provider_pool_key_lease;
+use crate::headers::header_value_str;
 use crate::log_ids::short_request_id;
 use crate::orchestration::{
     local_execution_candidate_metadata_from_report_context,
@@ -119,7 +121,8 @@ where
         .to_string();
     let span = tracing::debug_span!(
         "candidates",
-        trace_id = %trace_id,
+        trace_id = %transfer_tracker.trace_id(trace_id),
+        request_id = %trace_id,
         plan_kind,
         candidate_count,
     );
@@ -128,7 +131,8 @@ where
         tracing::debug!(
             event_name = "candidate_loop_started",
             log_type = "event",
-            trace_id = %trace_id,
+            trace_id = %transfer_tracker.trace_id(trace_id),
+            request_id = %trace_id,
             plan_kind,
             candidate_count,
             first_provider = first_provider.as_str(),
@@ -208,13 +212,19 @@ where
     T: AiExecutionAttempt + Send + Sync + 'static,
     S: LocalExecutionAttemptSource<T>,
 {
-    let span = tracing::debug_span!("candidates", trace_id = %trace_id, plan_kind);
+    let span = tracing::debug_span!(
+        "candidates",
+        trace_id = %transfer_tracker.trace_id(trace_id),
+        request_id = %trace_id,
+        plan_kind,
+    );
 
     async move {
         tracing::debug!(
             event_name = "candidate_loop_started",
             log_type = "event",
-            trace_id = %trace_id,
+            trace_id = %transfer_tracker.trace_id(trace_id),
+            request_id = %trace_id,
             plan_kind,
             "dynamic candidate loop started"
         );
@@ -448,7 +458,7 @@ where
         warn!(
             event_name = "candidate_loop_exhausted",
             log_type = "ops",
-            trace_id = %self.trace_id,
+            trace_id = %self.transfer_tracker.trace_id(self.trace_id),
             plan_kind = self.plan_kind,
             request_id = %short_request_id(last_plan.request_id.as_str()),
             candidate_id = ?last_plan.candidate_id,
@@ -512,7 +522,8 @@ where
         .to_string();
     let span = tracing::debug_span!(
         "candidates",
-        trace_id = %trace_id,
+        trace_id = %transfer_tracker.trace_id(trace_id),
+        request_id = %trace_id,
         plan_kind,
         candidate_count,
     );
@@ -521,7 +532,8 @@ where
         tracing::debug!(
             event_name = "candidate_loop_started",
             log_type = "event",
-            trace_id = %trace_id,
+            trace_id = %transfer_tracker.trace_id(trace_id),
+            request_id = %trace_id,
             plan_kind,
             candidate_count,
             first_provider = first_provider.as_str(),
@@ -597,13 +609,19 @@ where
     T: AiExecutionAttempt + Send + Sync + 'static,
     S: LocalExecutionAttemptSource<T>,
 {
-    let span = tracing::debug_span!("candidates", trace_id = %trace_id, plan_kind);
+    let span = tracing::debug_span!(
+        "candidates",
+        trace_id = %transfer_tracker.trace_id(trace_id),
+        request_id = %trace_id,
+        plan_kind,
+    );
 
     async move {
         tracing::debug!(
             event_name = "candidate_loop_started",
             log_type = "event",
-            trace_id = %trace_id,
+            trace_id = %transfer_tracker.trace_id(trace_id),
+            request_id = %trace_id,
             plan_kind,
             "dynamic candidate loop started"
         );
@@ -739,6 +757,7 @@ impl GlobalTransferState {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProviderTransferTracker {
     state: std::sync::Arc<tokio::sync::Mutex<ProviderTransferStateTracker>>,
+    trace_id: Option<String>,
     usage_policy_reservation: Option<crate::plan_usage_policy::PlanUsageReservationContext>,
     usage_policy_reservation_plan:
         std::sync::Arc<std::sync::Mutex<Option<aether_contracts::ExecutionPlan>>>,
@@ -756,11 +775,16 @@ impl ProviderTransferTracker {
             .cloned();
         Self {
             state: Default::default(),
+            trace_id: header_value_str(&parts.headers, TRACE_ID_HEADER),
             usage_policy_reservation,
             usage_policy_reservation_plan: Default::default(),
             usage_policy_cost_reserved: Default::default(),
             _background_admission_permit: background_admission_permit,
         }
+    }
+
+    fn trace_id<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.trace_id.as_deref().unwrap_or(fallback)
     }
 
     fn usage_policy_reservation_token(&self) -> Option<&str> {
@@ -1301,7 +1325,7 @@ where
         debug!(
             event_name = "candidate_loop_attempt_started",
             log_type = "debug",
-            trace_id = %self.trace_id,
+            trace_id = %self.transfer_tracker.trace_id(self.trace_id),
             plan_kind = self.plan_kind,
             request_id = %short_request_id(plan.request_id.as_str()),
             candidate_id = ?plan.candidate_id,
@@ -1469,7 +1493,7 @@ where
         warn!(
             event_name = "candidate_loop_exhausted",
             log_type = "ops",
-            trace_id = %self.trace_id,
+            trace_id = %self.transfer_tracker.trace_id(self.trace_id),
             plan_kind = self.plan_kind,
             request_id = %short_request_id(last_plan.request_id.as_str()),
             candidate_id = ?last_plan.candidate_id,
@@ -1762,14 +1786,13 @@ fn should_skip_unused_persistence_from_metadata(
 fn resolve_stream_candidate_watchdog_timeout(
     plan: &aether_contracts::ExecutionPlan,
     _report_context: Option<&serde_json::Value>,
-) -> Duration {
+) -> Option<Duration> {
     let timeout_ms = plan
         .timeouts
         .as_ref()
         .and_then(|timeouts| timeouts.first_byte_ms)
-        .unwrap_or(DEFAULT_STREAM_FIRST_BYTE_WATCHDOG_TIMEOUT_MS)
-        .max(1);
-    Duration::from_millis(timeout_ms)
+        .unwrap_or(DEFAULT_STREAM_FIRST_BYTE_WATCHDOG_TIMEOUT_MS);
+    (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms))
 }
 
 fn stream_candidate_watchdog_timeout_message() -> &'static str {
@@ -1842,6 +1865,9 @@ fn log_stream_candidate_admission_timeout(
     report_context: Option<&serde_json::Value>,
     error: &GatewayError,
 ) {
+    let trace_id =
+        crate::execution_runtime::trace_id_from_report_context(report_context, None)
+            .unwrap_or(trace_id);
     let provider_name = plan.provider_name.as_deref().unwrap_or("-");
     let model_name = plan.model_name.as_deref().unwrap_or("-");
     let candidate_index = parse_request_candidate_report_context(report_context)
@@ -1920,18 +1946,22 @@ where
     let watchdog_progress = StreamCandidateWatchdogProgress::shared();
     let execution = watchdog_progress.clone().scope(execute());
     tokio::pin!(execution);
-    let deadline = tokio::time::sleep(timeout_duration);
-    tokio::pin!(deadline);
-    let execution_result = tokio::select! {
-        biased;
-        result = &mut execution => Some(result),
-        () = &mut deadline => {
-            if watchdog_progress.terminal_started() {
-                Some(execution.await)
-            } else {
-                None
+    let execution_result = if let Some(timeout_duration) = timeout_duration {
+        let deadline = tokio::time::sleep(timeout_duration);
+        tokio::pin!(deadline);
+        tokio::select! {
+            biased;
+            result = &mut execution => Some(result),
+            () = &mut deadline => {
+                if watchdog_progress.first_content_observed() || watchdog_progress.terminal_started() {
+                    Some(execution.await)
+                } else {
+                    None
+                }
             }
         }
+    } else {
+        Some(execution.await)
     };
     let outcome = match execution_result {
         Some(result) => result.map(StreamCandidateWatchdogOutcome::Executed),
@@ -1948,7 +1978,12 @@ where
                 .and_then(|context| context.candidate_index)
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            let timeout_ms = u64::try_from(timeout_duration.as_millis()).unwrap_or(u64::MAX);
+            let timeout_ms = u64::try_from(
+                timeout_duration
+                    .expect("watchdog deadline elapsed")
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
             record_local_request_candidate_status(
                 state,
                 plan,
@@ -1967,7 +2002,7 @@ where
             warn!(
                 event_name = "local_stream_candidate_watchdog_timed_out",
                 log_type = "event",
-                trace_id = %trace_id,
+                trace_id = %crate::execution_runtime::trace_id_from_report_context(report_context, None).unwrap_or(trace_id),
                 plan_kind,
                 request_id = %request_id,
                 candidate_id = ?plan.candidate_id,
@@ -3255,7 +3290,7 @@ mod tests {
             Some(&report_context),
         );
 
-        assert_eq!(timeout, Duration::from_millis(12_345));
+        assert_eq!(timeout, Some(Duration::from_millis(12_345)));
     }
 
     #[test]
@@ -3264,8 +3299,42 @@ mod tests {
 
         assert_eq!(
             timeout,
-            Duration::from_millis(DEFAULT_STREAM_FIRST_BYTE_WATCHDOG_TIMEOUT_MS)
+            Some(Duration::from_millis(
+                DEFAULT_STREAM_FIRST_BYTE_WATCHDOG_TIMEOUT_MS
+            ))
         );
+    }
+
+    #[tokio::test]
+    async fn stream_candidate_watchdog_waits_for_content_when_limit_is_disabled() {
+        let writer = TestRequestCandidateWriter::default();
+        let plan = test_plan(Some(ExecutionTimeouts {
+            first_byte_ms: Some(0),
+            total_ms: Some(1),
+            ..ExecutionTimeouts::default()
+        }));
+        assert_eq!(resolve_stream_candidate_watchdog_timeout(&plan, None), None);
+        let result = execute_stream_candidate_with_watchdog(
+            &writer,
+            "trace_unlimited",
+            "claude_cli_stream",
+            &plan,
+            Some(&test_report_context()),
+            false,
+            || async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(AiAttemptExecutionOutcome::Responded(Response::new(
+                    Body::from("late content"),
+                )))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            StreamCandidateWatchdogOutcome::Executed(AiAttemptExecutionOutcome::Responded(_))
+        ));
+        assert!(writer.records.lock().await.is_empty());
     }
 
     #[test]
@@ -3281,7 +3350,9 @@ mod tests {
 
         assert_eq!(
             timeout,
-            Duration::from_millis(DEFAULT_STREAM_FIRST_BYTE_WATCHDOG_TIMEOUT_MS)
+            Some(Duration::from_millis(
+                DEFAULT_STREAM_FIRST_BYTE_WATCHDOG_TIMEOUT_MS
+            ))
         );
     }
 
@@ -3297,7 +3368,7 @@ mod tests {
             Some(&report_context),
         );
 
-        assert_eq!(timeout, Duration::from_millis(12_345));
+        assert_eq!(timeout, Some(Duration::from_millis(12_345)));
     }
 
     #[test]
@@ -3313,7 +3384,9 @@ mod tests {
 
         assert_eq!(
             timeout,
-            Duration::from_millis(DEFAULT_STREAM_FIRST_BYTE_WATCHDOG_TIMEOUT_MS)
+            Some(Duration::from_millis(
+                DEFAULT_STREAM_FIRST_BYTE_WATCHDOG_TIMEOUT_MS
+            ))
         );
     }
 
@@ -3329,7 +3402,7 @@ mod tests {
             Some(&report_context),
         );
 
-        assert_eq!(timeout, Duration::from_millis(12_345));
+        assert_eq!(timeout, Some(Duration::from_millis(12_345)));
     }
 
     #[test]
@@ -3641,6 +3714,39 @@ mod tests {
             Ok(StreamCandidateWatchdogOutcome::Executed(
                 AiAttemptExecutionOutcome::Responded(_)
             ))
+        ));
+        assert!(writer.records.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_candidate_watchdog_stops_first_byte_deadline_after_real_content() {
+        let writer = TestRequestCandidateWriter::default();
+        let plan = test_plan(Some(ExecutionTimeouts {
+            first_byte_ms: Some(10),
+            ..ExecutionTimeouts::default()
+        }));
+        let result = execute_stream_candidate_with_watchdog(
+            &writer,
+            "trace-real-content",
+            "openai_responses_stream",
+            &plan,
+            None,
+            false,
+            || async {
+                StreamCandidateWatchdogProgress::current()
+                    .expect("watchdog scope")
+                    .mark_first_content_observed();
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                Ok(AiAttemptExecutionOutcome::Responded(Response::new(
+                    Body::empty(),
+                )))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            StreamCandidateWatchdogOutcome::Executed(AiAttemptExecutionOutcome::Responded(_))
         ));
         assert!(writer.records.lock().await.is_empty());
     }

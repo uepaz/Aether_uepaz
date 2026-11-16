@@ -525,7 +525,7 @@ async fn gateway_settles_stream_attempt_when_client_disconnects_before_first_byt
     let mut stored_candidates = Vec::new();
     for _ in 0..200 {
         stored_candidates = request_candidate_repository
-            .list_by_request_id("trace-openai-chat-stream-precommit-disconnect-123")
+            .list_recent(10)
             .await
             .expect("request candidate trace should read");
         if stored_candidates
@@ -648,6 +648,7 @@ async fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error_
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
@@ -667,7 +668,7 @@ async fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error_
     let body_json: serde_json::Value = response.json().await.expect("response body should parse");
     assert_eq!(body_json["error"]["type"], "http_error");
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-stream-prefetch-error-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     let failed_candidate = stored_candidates

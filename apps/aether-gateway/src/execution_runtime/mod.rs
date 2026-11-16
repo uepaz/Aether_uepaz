@@ -54,6 +54,18 @@ pub(crate) use crate::orchestration::{
 pub(crate) use aether_ai_serving::AdaptationMode;
 pub(crate) use aether_ai_serving::{ConversionMode, ExecutionStrategy};
 
+pub(crate) fn trace_id_from_report_context<'a>(
+    report_context: Option<&'a Value>,
+    fallback: Option<&'a str>,
+) -> Option<&'a str> {
+    report_context
+        .and_then(|context| context.get("trace_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(fallback)
+}
+
 pub(crate) fn ai_attempt_retry_scope_from_failure_disposition(
     disposition: crate::orchestration::FailureDisposition,
 ) -> aether_ai_serving::AiAttemptRetryScope {

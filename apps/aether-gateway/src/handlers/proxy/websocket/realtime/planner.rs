@@ -118,7 +118,7 @@ pub(super) async fn plan_realtime_candidate(
     let Some(execution) = maybe_build_stream_decision_payload(
         state,
         &parts,
-        context.trace_id.as_str(),
+        context.request_id.as_str(),
         &context.decision,
         &body,
         None,

@@ -145,3 +145,53 @@ pub(crate) async fn execute_sync_plan_via_remote_execution_runtime(
         )
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::build_remote_execution_runtime_request;
+    use crate::execution_runtime::trace_id_from_report_context;
+    use serde_json::json;
+
+    #[test]
+    fn remote_runtime_keeps_trace_header_separate_from_plan_request_id() {
+        let state = crate::AppState::new().unwrap();
+        let plan: aether_contracts::ExecutionPlan = serde_json::from_value(json!({
+            "request_id": "server-request-id",
+            "provider_id": "provider-1",
+            "endpoint_id": "endpoint-1",
+            "key_id": "key-1",
+            "method": "POST",
+            "url": "https://upstream.example/v1/chat/completions",
+            "body": {"json_body": {"model": "test"}},
+            "client_api_format": "openai:chat",
+            "provider_api_format": "openai:chat"
+        }))
+        .unwrap();
+        for (context, expected_trace) in [
+            (
+                Some(json!({"trace_id": "client-correlation-id"})),
+                "client-correlation-id",
+            ),
+            (Some(json!({"trace_id": "   "})), "fallback-trace"),
+            (None, "fallback-trace"),
+        ] {
+            let request = build_remote_execution_runtime_request(
+                &state,
+                "http://localhost:8080",
+                "/v1/execute/sync",
+                trace_id_from_report_context(context.as_ref(), Some("fallback-trace")),
+                &plan,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            assert_eq!(
+                request.headers()[crate::constants::TRACE_ID_HEADER],
+                expected_trace
+            );
+            let body: serde_json::Value =
+                serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+            assert_eq!(body["request_id"], "server-request-id");
+        }
+    }
+}

@@ -208,7 +208,11 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
         any(move |request: Request| {
             let seen_plans_inner = Arc::clone(&seen_plans_clone);
             async move {
-                let (_, body) = request.into_parts();
+                let (parts, body) = request.into_parts();
+                let trace_id = parts
+                    .headers
+                    .get(TRACE_ID_HEADER)
+                    .and_then(|value| value.to_str().ok());
                 let bytes = to_bytes(body, usize::MAX).await.expect("body should read");
                 let payload: serde_json::Value =
                     serde_json::from_slice(&bytes).expect("execution payload should parse");
@@ -224,7 +228,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
                     .lock()
                     .expect("mutex should lock")
                     .push(payload);
-                let execution_result = if request_id == "trace-search-error-1" {
+                let execution_result = if trace_id == Some("trace-search-error-1") {
                     json!({
                         "request_id": request_id,
                         "status_code": 400,
@@ -245,7 +249,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
                         },
                         "telemetry": {"elapsed_ms": 17}
                     })
-                } else if request_id == "trace-search-failover-1"
+                } else if trace_id == Some("trace-search-failover-1")
                     && provider_id == "provider-codex-search-1"
                 {
                     json!({
@@ -265,7 +269,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
                         },
                         "telemetry": {"elapsed_ms": 11}
                     })
-                } else if request_id == "trace-search-failover-1" {
+                } else if trace_id == Some("trace-search-failover-1") {
                     json!({
                         "request_id": request_id,
                         "status_code": 200,
@@ -399,6 +403,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
         .send()
         .await
         .expect("search request should succeed");
+    let billing_request_id_1 = crate::tests::response_request_id(response.headers());
 
     if response.status() != StatusCode::CREATED {
         let status = response.status();
@@ -472,7 +477,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
     assert!(body.get("service_tier").is_none());
 
     let candidates = request_candidates
-        .list_by_request_id("trace-search-1")
+        .list_by_request_id(&billing_request_id_1)
         .await
         .expect("request candidates should read");
     assert_eq!(candidates.len(), 1);
@@ -504,6 +509,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
         .send()
         .await
         .expect("search error response should return");
+    let error_request_id = crate::tests::response_request_id(error_response.headers());
 
     assert_eq!(error_response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
@@ -521,7 +527,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
         expected_error_body
     );
     let error_candidates = request_candidates
-        .list_by_request_id("trace-search-error-1")
+        .list_by_request_id(&error_request_id)
         .await
         .expect("error request candidates should read");
     assert_eq!(error_candidates.len(), 1);
@@ -544,6 +550,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
         .send()
         .await
         .expect("search failover response should return");
+    let failover_request_id = crate::tests::response_request_id(failover_response.headers());
 
     assert_eq!(failover_response.status(), StatusCode::OK);
     assert_eq!(
@@ -564,7 +571,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
         .lock()
         .expect("mutex should lock")
         .iter()
-        .filter(|plan| plan["request_id"] == "trace-search-failover-1")
+        .filter(|plan| plan["request_id"] == failover_request_id)
         .map(|plan| plan["provider_id"].clone())
         .collect::<Vec<_>>();
     // Default sticky_key_attempts is 2: the first provider is retried once on
@@ -578,7 +585,7 @@ async fn gateway_executes_codex_search_with_responses_permission_and_search_cont
         ]
     );
     let failover_candidates = request_candidates
-        .list_by_request_id("trace-search-failover-1")
+        .list_by_request_id(&failover_request_id)
         .await
         .expect("failover request candidates should read");
     assert_eq!(failover_candidates.len(), 3);
@@ -609,11 +616,13 @@ fn gateway_executes_codex_memories_with_responses_permission_and_native_json() {
             let captured = Arc::clone(&captured);
             let response_body = expected.clone();
             async move {
-                let bytes = to_bytes(request.into_body(), usize::MAX).await.expect("read plan");
+                let (parts, body) = request.into_parts();
+                let trace_id = parts.headers.get(TRACE_ID_HEADER).and_then(|value| value.to_str().ok());
+                let bytes = to_bytes(body, usize::MAX).await.expect("read plan");
                 let plan: serde_json::Value = serde_json::from_slice(&bytes).expect("parse plan");
                 let request_id = plan["request_id"].clone();
                 *captured.lock().expect("capture lock") = Some(plan);
-                let (status_code, response_body) = if request_id == json!("trace-memory-error") {
+                let (status_code, response_body) = if trace_id == Some("trace-memory-error") {
                     (400, json!({"error":{"type":"invalid_request_error","message":"synthetic invalid trace","code":"invalid_trace"},"future_error_field":{"enabled":true}}))
                 } else { (200, response_body) };
                 Json(json!({"request_id":request_id,"status_code":status_code,"headers":{"content-type":"application/json"},"body":{"json_body":response_body},"telemetry":{"elapsed_ms":1}}))
@@ -652,6 +661,7 @@ fn gateway_executes_codex_memories_with_responses_permission_and_native_json() {
                 .send()
                 .await
                 .expect("send request");
+            let billing_request_id_1 = crate::tests::response_request_id(response.headers());
             let status = response.status();
             let body: serde_json::Value = response.json().await.expect("read response");
             assert_eq!(status, StatusCode::OK, "{body}");
@@ -682,7 +692,7 @@ fn gateway_executes_codex_memories_with_responses_permission_and_native_json() {
             expected_input["reasoning"]["effort"] = json!("max");
             assert_eq!(plan["body"]["json_body"], expected_input);
             let stored = request_candidates
-                .list_by_request_id("trace-memory-1")
+                .list_by_request_id(&billing_request_id_1)
                 .await
                 .expect("read candidates");
             assert_eq!(stored.len(), 1);
@@ -695,6 +705,7 @@ fn gateway_executes_codex_memories_with_responses_permission_and_native_json() {
                 .send()
                 .await
                 .expect("error response");
+            let error_request_id = crate::tests::response_request_id(error.headers());
             let error_status = error.status();
             assert_eq!(error_status, StatusCode::BAD_REQUEST);
             assert_eq!(
@@ -702,7 +713,7 @@ fn gateway_executes_codex_memories_with_responses_permission_and_native_json() {
                 json!({"error":{"type":"invalid_request_error","message":"synthetic invalid trace","code":"invalid_trace"},"future_error_field":{"enabled":true}})
             );
             let error_candidates = request_candidates
-                .list_by_request_id("trace-memory-error")
+                .list_by_request_id(&error_request_id)
                 .await
                 .expect("error candidate");
             assert_eq!(error_candidates.len(), 1);

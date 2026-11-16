@@ -964,6 +964,52 @@ async fn gateway_handles_internal_gateway_report_sync_locally() {
 }
 
 #[tokio::test]
+async fn gateway_internal_plans_keep_reports_separate_for_a_reused_trace_id() {
+    let state = internal_report_planner_state();
+    let (gateway_url, gateway_handle) = start_server(build_router_with_state(state.clone())).await;
+    let client = reqwest::Client::new();
+    let trace_id = "shared-internal-planner-trace";
+    let mut request_ids = Vec::new();
+
+    for endpoint in ["decision-sync", "plan-sync"] {
+        let (report_kind, report_context) =
+            issue_openai_chat_report_capability(&client, &gateway_url, endpoint, trace_id, false)
+                .await;
+        let request_id = report_context["request_id"].as_str().unwrap().to_owned();
+        assert_ne!(request_id, trace_id);
+        assert_eq!(report_context["trace_id"], trace_id);
+        let response = post_internal_sync_report(
+            &client,
+            &gateway_url,
+            trace_id,
+            &report_kind,
+            report_context,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let candidates = state
+            .data
+            .list_request_candidates_by_request_id(&request_id)
+            .await
+            .unwrap();
+        assert!(candidates.iter().any(|candidate| {
+            candidate.status
+                == aether_data_contracts::repository::candidates::RequestCandidateStatus::Success
+        }));
+        request_ids.push(request_id);
+    }
+
+    assert_ne!(request_ids[0], request_ids[1]);
+    assert!(state
+        .data
+        .list_request_candidates_by_request_id(trace_id)
+        .await
+        .unwrap()
+        .is_empty());
+    gateway_handle.abort();
+}
+
+#[tokio::test]
 async fn gateway_handles_internal_gateway_report_stream_locally() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);

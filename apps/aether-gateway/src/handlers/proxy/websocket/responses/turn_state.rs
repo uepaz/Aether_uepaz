@@ -49,7 +49,7 @@ pub(super) struct LogicalTurn {
     pub(super) plan_usage_permit: Option<aether_runtime::AdmissionPermit>,
     /// Cost limits are evaluated against the policy and entitlement window
     /// that admitted this logical response.create. Every transparent provider
-    /// attempt reuses this snapshot while receiving its own reservation token.
+    /// attempt reuses this snapshot and the logical turn's cost reservation.
     pub(super) plan_usage_policy_snapshot: Option<PlanUsagePolicySnapshot>,
 }
 

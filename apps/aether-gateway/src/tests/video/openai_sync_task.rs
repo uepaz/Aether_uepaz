@@ -178,7 +178,7 @@ async fn gateway_executes_openai_video_delete_via_reconstructed_data_backed_loca
                         .to_string(),
                 });
                 Json(json!({
-                    "request_id": "trace-openai-video-delete-local-123",
+                    "request_id": payload["request_id"],
                     "status_code": 404,
                     "headers": {
                         "content-type": "application/json"
@@ -315,6 +315,7 @@ async fn gateway_executes_openai_video_delete_via_reconstructed_data_backed_loca
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     let response_status = response.status();
     let response_text = response.text().await.expect("body should read");
@@ -350,7 +351,7 @@ async fn gateway_executes_openai_video_delete_via_reconstructed_data_backed_loca
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("request-openai-video-delete-local-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);

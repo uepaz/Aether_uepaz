@@ -2,6 +2,9 @@ use http::{HeaderMap, Method, Uri};
 
 #[derive(Debug, Clone)]
 pub struct PublicRequestContext<Decision> {
+    /// Gateway-owned identity for execution, usage, and settlement.
+    pub request_id: String,
+    /// Client correlation value for tracing.
     pub trace_id: String,
     pub request_method: Method,
     pub request_path: String,
@@ -27,6 +30,7 @@ impl<Decision> PublicRequestContext<Decision> {
         };
 
         Self {
+            request_id: uuid::Uuid::new_v4().to_string(),
             trace_id: trace_id.into(),
             request_method: method.clone(),
             request_path,

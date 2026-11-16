@@ -12,6 +12,7 @@ use super::{
     UsageReadRepository, UsageRuntimeConfig, DEVELOPMENT_ENCRYPTION_KEY, TRACE_ID_HEADER,
 };
 use crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER;
+use crate::tests::{execution_request_id, response_request_id};
 use aether_data_contracts::repository::usage::UsageBodyCaptureState;
 
 fn deep_nested_metadata(levels: usize) -> serde_json::Value {
@@ -202,9 +203,10 @@ async fn gateway_handles_local_openai_chat_sync_report_with_local_reporting_when
 
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
-        any(|_request: Request| async move {
+        any(|request: Request| async move {
+            let request_id = execution_request_id(request).await;
             Json(json!({
-                "request_id": "trace-openai-chat-local-report-sync-123",
+                "request_id": request_id,
                 "status_code": 200,
                 "headers": {
                     "content-type": "application/json"
@@ -276,23 +278,27 @@ async fn gateway_handles_local_openai_chat_sync_report_with_local_reporting_when
             "Bearer sk-client-openai-local-report-sync",
         )
         .header(TRACE_ID_HEADER, "trace-openai-chat-local-report-sync-123")
+        .header(http::header::USER_AGENT, "deepseek-harness/0.2.0")
+        .header("x-stainless-lang", "js")
         .body("{\"model\":\"gpt-5\",\"messages\":[]}")
         .send()
         .await
         .expect("request should succeed");
 
+    let request_id = response_request_id(response.headers());
+
     assert_eq!(response.status(), StatusCode::OK);
     let body_json: serde_json::Value = response.json().await.expect("body should parse");
     assert_eq!(body_json["model"], "gpt-5-upstream");
 
-    let stored_usage = wait_for_usage_status(
-        usage_repository.as_ref(),
-        "trace-openai-chat-local-report-sync-123",
-        "completed",
-    )
-    .await;
+    let stored_usage =
+        wait_for_usage_status(usage_repository.as_ref(), &request_id, "completed").await;
     assert_eq!(stored_usage.status, "completed");
     assert_eq!(stored_usage.total_tokens, 5);
+    assert_eq!(
+        stored_usage.client_family.as_deref(),
+        Some("deepseek_harness")
+    );
     assert_eq!(stored_usage.response_time_ms, Some(25));
     let end_to_end_time_ms = stored_usage
         .request_metadata
@@ -309,7 +315,7 @@ async fn gateway_handles_local_openai_chat_sync_report_with_local_reporting_when
     assert!(end_to_end_first_byte_time_ms <= end_to_end_time_ms);
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-local-report-sync-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -345,9 +351,10 @@ async fn gateway_truncates_deep_request_echo_for_local_openai_chat_sync_usage_im
 
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
-        any(|_request: Request| async move {
+        any(|request: Request| async move {
+            let request_id = execution_request_id(request).await;
             Json(json!({
-                "request_id": "trace-openai-chat-local-report-sync-deep-123",
+                "request_id": request_id,
                 "status_code": 200,
                 "headers": {
                     "content-type": "application/json"
@@ -436,12 +443,14 @@ async fn gateway_truncates_deep_request_echo_for_local_openai_chat_sync_usage_im
         .await
         .expect("request should succeed");
 
+    let request_id = response_request_id(response.headers());
+
     assert_eq!(response.status(), StatusCode::OK);
 
     let mut stored_usage = None;
     for _ in 0..50 {
         stored_usage = usage_repository
-            .find_by_request_id("trace-openai-chat-local-report-sync-deep-123")
+            .find_by_request_id(&request_id)
             .await
             .expect("usage lookup should succeed");
         if stored_usage
@@ -502,9 +511,10 @@ async fn gateway_ignores_legacy_max_request_body_size_for_local_openai_chat_sync
 
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
-        any(|_request: Request| async move {
+        any(|request: Request| async move {
+            let request_id = execution_request_id(request).await;
             Json(json!({
-                "request_id": "trace-openai-chat-local-report-sync-request-limit-123",
+                "request_id": request_id,
                 "status_code": 200,
                 "headers": {
                     "content-type": "application/json"
@@ -597,14 +607,12 @@ async fn gateway_ignores_legacy_max_request_body_size_for_local_openai_chat_sync
         .await
         .expect("request should succeed");
 
+    let request_id = response_request_id(response.headers());
+
     assert_eq!(response.status(), StatusCode::OK);
 
-    let stored_usage = wait_for_usage_status(
-        usage_repository.as_ref(),
-        "trace-openai-chat-local-report-sync-request-limit-123",
-        "completed",
-    )
-    .await;
+    let stored_usage =
+        wait_for_usage_status(usage_repository.as_ref(), &request_id, "completed").await;
     assert_eq!(stored_usage.total_tokens, 5);
     assert!(
         stored_usage.request_body.as_ref().unwrap()["messages"][0]["content"]
@@ -663,9 +671,10 @@ async fn gateway_honors_request_record_level_impl(record_level: &str) {
 
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
-        any(|_request: Request| async move {
+        any(|request: Request| async move {
+            let request_id = execution_request_id(request).await;
             Json(json!({
-                "request_id": "trace-openai-chat-local-report-sync-base-123",
+                "request_id": request_id,
                 "status_code": 200,
                 "headers": {
                     "content-type": "application/json"
@@ -762,16 +771,14 @@ async fn gateway_honors_request_record_level_impl(record_level: &str) {
         .await
         .expect("request should succeed");
 
+    let request_id = response_request_id(response.headers());
+
     assert_eq!(response.status(), StatusCode::OK);
     let body_json: serde_json::Value = response.json().await.expect("body should parse");
     assert_eq!(body_json["model"], "gpt-5-upstream");
 
-    let stored_usage = wait_for_usage_status(
-        usage_repository.as_ref(),
-        "trace-openai-chat-local-report-sync-base-123",
-        "completed",
-    )
-    .await;
+    let stored_usage =
+        wait_for_usage_status(usage_repository.as_ref(), &request_id, "completed").await;
     assert_eq!(stored_usage.status, "completed");
     assert_eq!(stored_usage.total_tokens, 5);
     assert_eq!(stored_usage.response_time_ms, Some(25));
@@ -810,7 +817,7 @@ async fn gateway_honors_request_record_level_impl(record_level: &str) {
     }
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-local-report-sync-base-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -907,9 +914,13 @@ async fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exha
             TRACE_ID_HEADER,
             "trace-openai-chat-local-report-sync-failure-123",
         )
+        .header("x-ide-name", "WorkBuddy")
+        .header(http::header::USER_AGENT, "OpenAI/JS 6.0.0")
         .body(Body::from("{\"model\":\"gpt-5\",\"messages\":[]}"))
         .expect("request should build");
     let response = send_request(gateway, request).await;
+
+    let request_id = response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body_json: serde_json::Value = serde_json::from_slice(
@@ -920,12 +931,8 @@ async fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exha
     .expect("body should parse");
     assert_eq!(body_json["error"]["type"], "http_error");
 
-    let stored_usage = wait_for_usage_status(
-        usage_repository.as_ref(),
-        "trace-openai-chat-local-report-sync-failure-123",
-        "failed",
-    )
-    .await;
+    let stored_usage =
+        wait_for_usage_status(usage_repository.as_ref(), &request_id, "failed").await;
     assert_eq!(stored_usage.status, "failed");
     assert_eq!(stored_usage.billing_status, "void");
     assert_eq!(stored_usage.status_code, Some(503));
@@ -937,6 +944,7 @@ async fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exha
     assert_eq!(stored_usage.provider_name, "openai");
     assert_eq!(stored_usage.model, "gpt-5");
     assert_eq!(stored_usage.api_format.as_deref(), Some("openai:chat"));
+    assert_eq!(stored_usage.client_family.as_deref(), Some("workbuddy"));
     assert_eq!(
         stored_usage
             .request_metadata
@@ -959,7 +967,7 @@ async fn gateway_records_failed_usage_when_all_local_openai_chat_candidates_exha
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-local-report-sync-failure-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     // The only candidate is the sticky first key: the default policy retries
@@ -1043,16 +1051,14 @@ async fn gateway_records_failed_usage_when_sync_runtime_transport_is_unavailable
         .expect("request should build");
     let response = send_request(gateway, request).await;
 
+    let request_id = response_request_id(response.headers());
+
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     // The sticky first key is retried once on the same key before exhaustion.
     assert_eq!(*execution_hits.lock().expect("mutex should lock"), 2);
 
-    let stored_usage = wait_for_usage_status(
-        usage_repository.as_ref(),
-        "trace-openai-chat-local-transport-unavailable-123",
-        "failed",
-    )
-    .await;
+    let stored_usage =
+        wait_for_usage_status(usage_repository.as_ref(), &request_id, "failed").await;
     assert_eq!(stored_usage.status, "failed");
     assert_eq!(stored_usage.billing_status, "void");
     assert_eq!(stored_usage.status_code, Some(503));
@@ -1064,7 +1070,7 @@ async fn gateway_records_failed_usage_when_sync_runtime_transport_is_unavailable
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-local-transport-unavailable-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 2);
@@ -1186,8 +1192,9 @@ async fn sync_transport_error_policy_stops_or_retries_candidates_end_to_end_impl
             .body(Body::from("{\"model\":\"gpt-5\",\"messages\":[]}"))
             .expect("request should build");
         let response = send_request(gateway, request).await;
+        let request_id = response_request_id(response.headers());
         let candidates = request_candidate_repository
-            .list_by_request_id(trace_id)
+            .list_by_request_id(&request_id)
             .await
             .expect("request candidates should read");
         (
@@ -1345,10 +1352,14 @@ async fn gateway_records_failed_usage_for_claude_runtime_miss_without_execution_
         .header("x-api-key", "sk-client-claude-runtime-miss-usage")
         .header("anthropic-version", "2023-06-01")
         .header(TRACE_ID_HEADER, "trace-claude-runtime-miss-usage-123")
+        .header("originator", "codex_cli_rs")
+        .header(http::header::USER_AGENT, "codex_cli_rs/0.144.1")
         .body("{\"model\":\"claude-sonnet-4-5\",\"messages\":[]}")
         .send()
         .await
         .expect("request should complete");
+
+    let request_id = response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
@@ -1366,12 +1377,8 @@ async fn gateway_records_failed_usage_for_claude_runtime_miss_without_execution_
         "没有可用提供商支持模型 claude-sonnet-4-5 的同步请求"
     );
 
-    let stored_usage = wait_for_usage_status(
-        usage_repository.as_ref(),
-        "trace-claude-runtime-miss-usage-123",
-        "failed",
-    )
-    .await;
+    let stored_usage =
+        wait_for_usage_status(usage_repository.as_ref(), &request_id, "failed").await;
     assert_eq!(stored_usage.status, "failed");
     assert_eq!(stored_usage.billing_status, "void");
     assert_eq!(stored_usage.status_code, Some(503));
@@ -1383,6 +1390,7 @@ async fn gateway_records_failed_usage_for_claude_runtime_miss_without_execution_
     assert_eq!(stored_usage.provider_name, "unknown");
     assert_eq!(stored_usage.model, "claude-sonnet-4-5");
     assert_eq!(stored_usage.api_format.as_deref(), Some("claude:messages"));
+    assert_eq!(stored_usage.client_family.as_deref(), Some("codex"));
     assert_eq!(
         stored_usage.routing_execution_path(),
         Some("local_execution_runtime_miss")
@@ -1410,7 +1418,7 @@ async fn gateway_records_failed_usage_for_claude_runtime_miss_without_execution_
     assert!(stored_usage.error_message.is_none());
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-claude-runtime-miss-usage-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert!(stored_candidates.is_empty());
@@ -1571,6 +1579,8 @@ async fn gateway_handles_local_openai_chat_stream_report_with_local_reporting_wh
         .await
         .expect("request should succeed");
 
+    let request_id = response_request_id(response.headers());
+
     assert_eq!(response.status(), StatusCode::OK);
     let body_text =
         strip_sse_keepalive_comments(&response.text().await.expect("stream body should read"));
@@ -1579,12 +1589,8 @@ async fn gateway_handles_local_openai_chat_stream_report_with_local_reporting_wh
         "data: {\"id\":\"chatcmpl-local-report-stream-123\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}],\"usage\":{\"input_tokens\":2,\"output_tokens\":4,\"total_tokens\":6}}\n\ndata: [DONE]\n\n"
     );
 
-    let stored_usage = wait_for_usage_status(
-        usage_repository.as_ref(),
-        "trace-openai-chat-local-report-stream-123",
-        "completed",
-    )
-    .await;
+    let stored_usage =
+        wait_for_usage_status(usage_repository.as_ref(), &request_id, "completed").await;
     assert_eq!(stored_usage.status, "completed");
     assert_eq!(stored_usage.total_tokens, 6);
     assert!(stored_usage.first_byte_time_ms.is_some());
@@ -1616,7 +1622,7 @@ async fn gateway_handles_local_openai_chat_stream_report_with_local_reporting_wh
     }
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-local-report-stream-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -1780,16 +1786,14 @@ async fn gateway_ignores_legacy_max_response_body_size_for_stream_usage_impl() {
         .await
         .expect("request should succeed");
 
+    let request_id = response_request_id(response.headers());
+
     assert_eq!(response.status(), StatusCode::OK);
     let body_text = response.text().await.expect("stream body should read");
     assert!(body_text.contains("chatcmpl-local-report-stream-truncated-123"));
 
-    let stored_usage = wait_for_usage_status(
-        usage_repository.as_ref(),
-        "trace-openai-chat-local-report-stream-truncated-123",
-        "completed",
-    )
-    .await;
+    let stored_usage =
+        wait_for_usage_status(usage_repository.as_ref(), &request_id, "completed").await;
     assert_eq!(stored_usage.total_tokens, 6);
     assert!(
         stored_usage
@@ -2042,6 +2046,8 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
         .await
         .expect("request should complete");
 
+    let request_id = response_request_id(response.headers());
+
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         response
@@ -2058,12 +2064,8 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
         "没有可用提供商支持模型 gpt-5.4 的同步请求"
     );
 
-    let stored_usage = wait_for_usage_status(
-        usage_repository.as_ref(),
-        "trace-claude-cli-usage-local-miss-123",
-        "failed",
-    )
-    .await;
+    let stored_usage =
+        wait_for_usage_status(usage_repository.as_ref(), &request_id, "failed").await;
     assert_eq!(stored_usage.status, "failed");
     assert_eq!(stored_usage.billing_status, "void");
     assert_eq!(stored_usage.status_code, Some(503));
@@ -2113,7 +2115,7 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-claude-cli-usage-local-miss-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -2348,6 +2350,8 @@ fn gateway_keeps_failed_usage_request_capture_lightweight_for_large_local_claude
             .await
             .expect("request should complete");
 
+        let request_id = response_request_id(response.headers());
+
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             response
@@ -2357,12 +2361,8 @@ fn gateway_keeps_failed_usage_request_capture_lightweight_for_large_local_claude
             Some("all_candidates_skipped")
         );
 
-        let stored_usage = wait_for_usage_status(
-            usage_repository.as_ref(),
-            "trace-claude-cli-usage-local-miss-large-123",
-            "failed",
-        )
-        .await;
+        let stored_usage =
+            wait_for_usage_status(usage_repository.as_ref(), &request_id, "failed").await;
         assert_eq!(stored_usage.status, "failed");
         assert_eq!(
             stored_usage.request_body_state,
@@ -2381,7 +2381,7 @@ fn gateway_keeps_failed_usage_request_capture_lightweight_for_large_local_claude
         );
 
         let stored_candidates = request_candidate_repository
-            .list_by_request_id("trace-claude-cli-usage-local-miss-large-123")
+            .list_by_request_id(&request_id)
             .await
             .expect("request candidate trace should read");
         assert_eq!(stored_candidates.len(), 1);

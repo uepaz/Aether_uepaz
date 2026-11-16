@@ -922,10 +922,10 @@ const traceRecord = computed<Record<string, unknown> | null>(() =>
 )
 
 const traceTimelineRequestId = computed(() =>
-  getNestedString(traceRecord.value, 'trace_id')
+  (detail.value?.request_id?.trim() || null)
+  ?? getNestedString(traceRecord.value, 'trace_id')
   ?? getNestedString(traceRequestMetadata.value, 'trace_id')
   ?? getCaseInsensitiveString(asRecord(detail.value?.request_headers ?? null), 'x-trace-id')
-  ?? detail.value?.request_id
   ?? detail.value?.id
   ?? null,
 )

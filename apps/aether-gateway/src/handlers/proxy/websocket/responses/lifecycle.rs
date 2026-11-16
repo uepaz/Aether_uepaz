@@ -12,8 +12,10 @@ use tokio::time::timeout;
 
 use super::state::BoundResponsesConnection;
 use super::turn::{
-    begin_unowned_responses_websocket_turn, ResponsesProviderAttempt, ResponsesWebSocketTurnOutcome,
+    begin_unowned_responses_websocket_turn, ResponsesProviderAttempt,
+    ResponsesWebSocketTurnOutcome, ResponsesWebSocketUsageStart,
 };
+use crate::execution_runtime::attempt_lifecycle::DeferredAttemptUsage;
 use crate::handlers::proxy::websocket::session::{
     CLOSE_INTERNAL_ERROR, CLOSE_POLICY_VIOLATION, CLOSE_TRY_AGAIN, WEBSOCKET_LOG_TRANSPORT,
 };
@@ -87,6 +89,7 @@ pub(super) async fn begin_responses_websocket_turn(
     decision: crate::ai_serving::AiExecutionDecision,
     client_event: &serde_json::Value,
     plan_usage_policy_snapshot: Option<PlanUsagePolicySnapshot>,
+    usage_start: ResponsesWebSocketUsageStart,
 ) -> Result<ActiveProviderAttempt, GatewayError> {
     let state = state.clone();
     let trace_id = trace_id.to_string();
@@ -111,6 +114,7 @@ pub(super) async fn begin_responses_websocket_turn(
                 decision,
                 &client_event,
                 plan_usage_policy_snapshot,
+                usage_start,
             )
             .await?;
             Ok(ActiveProviderAttempt::new(&state, turn))
@@ -159,9 +163,10 @@ where
 
 impl Drop for ActiveProviderAttempt {
     fn drop(&mut self) {
-        let Some(turn) = self.turn.take() else {
+        let Some(mut turn) = self.turn.take() else {
             return;
         };
+        turn.record_request_finished();
         let outcome = turn.abandonment_outcome();
         let state = self.state.clone();
         // No runtime means the process is going down; the spawn could not
@@ -198,9 +203,10 @@ pub(super) async fn finalize_active_turn(
 pub(super) async fn queue_turn_finalization(
     bound: &mut BoundResponsesConnection,
     state: &AppState,
-    turn: ActiveProviderAttempt,
+    mut turn: ActiveProviderAttempt,
     outcome: ResponsesWebSocketTurnOutcome,
 ) {
+    turn.record_request_finished();
     await_pending_adapter_observation(bound).await;
     await_pending_turn_finalization(bound).await;
     bound.pending_turn_finalization = Some(spawn_guarded_turn_finalization(
@@ -210,53 +216,77 @@ pub(super) async fn queue_turn_finalization(
     ));
 }
 
-/// 「上一个 attempt 已经结算完毕」的凭证。
-///
-/// 只能由本模块颁发，且只有在结算真正落地之后。规划下一个 attempt 的入口
-/// ([`super::quota::retry_active_turn_after_quota_exhaustion`]) 要求这个参数，
-/// 于是「先结算、再规划」成为签名的一部分，而不是一句注释——顺序写反连编译都
-/// 过不了。
-pub(super) struct PreviousAttemptSettled(());
+/// The rejected attempt's provider effects are done, but the logical turn's
+/// one usage record is still open for the replacement attempt.
+pub(super) struct QuotaRetry {
+    pub(super) request_id: String,
+    pub(super) starting_candidate_index: u32,
+    pub(super) usage_start: ResponsesWebSocketUsageStart,
+    original_usage: Option<DeferredAttemptUsage>,
+}
 
-impl PreviousAttemptSettled {
-    /// 没有 attempt 要结算（连接此刻不在 `Responding`）。
-    pub(super) const fn nothing_to_settle() -> Self {
-        Self(())
+impl QuotaRetry {
+    pub(super) fn permits_replay(&self) -> bool {
+        self.original_usage
+            .as_ref()
+            .is_some_and(DeferredAttemptUsage::permits_replay)
+    }
+
+    pub(super) fn record_client_event(&mut self) {
+        if let Some(usage) = self.original_usage.as_mut() {
+            usage.record_client_event();
+        }
+    }
+
+    pub(super) fn hand_off_usage(&mut self) {
+        if let Some(usage) = self.original_usage.take() {
+            usage.hand_off();
+        }
     }
 }
 
-/// 结算一个 attempt 并等它落地。
-///
-/// 与 [`queue_turn_finalization`] 的区别只在于「等」：后者把 handle 挂在连接上
-/// 让 relay loop 继续跑，适用于结算之后不再需要读取共享状态的出口；这个用在
-/// 必须先看到结算结果才能继续的路径上——典型的就是透明重试，它紧接着要按
-/// health / adaptive / pool 状态规划下一个 attempt。
-pub(super) async fn settle_turn_finalization(
+/// Finish the rejected candidate and release its leases before planning again.
+pub(super) async fn finish_attempt_for_quota_retry(
     bound: &mut BoundResponsesConnection,
     state: &AppState,
     mut turn: ActiveProviderAttempt,
     outcome: ResponsesWebSocketTurnOutcome,
-) -> Option<PreviousAttemptSettled> {
-    // This awaited finalization entry is used only by transparent quota retry.
-    // Free the old attempt's durable cost reservation before planning can
-    // reserve the replacement, otherwise two per-attempt estimates briefly
-    // count against the same user and can manufacture a false local 429.
-    if let Err(error) = turn.release_plan_usage_cost_for_retry(state).await {
-        warn!(
-            event_name = "responses_websocket_plan_usage_cost_retry_release_failed",
-            log_type = "ops",
-            transport = WEBSOCKET_LOG_TRANSPORT,
-            websocket = true,
-            error = ?error,
-            "gateway stopped a transparent Responses WebSocket retry because the old plan cost reservation could not be released"
-        );
-        queue_turn_finalization(bound, state, turn, outcome).await;
-        await_pending_turn_finalization(bound).await;
-        return None;
-    }
-    queue_turn_finalization(bound, state, turn, outcome).await;
+) -> Option<QuotaRetry> {
+    turn.record_request_finished();
+    await_pending_adapter_observation(bound).await;
     await_pending_turn_finalization(bound).await;
-    Some(PreviousAttemptSettled(()))
+    let state = state.clone();
+    match tokio::spawn(async move {
+        let request_id = turn.request_id().to_owned();
+        let starting_candidate_index = turn.next_candidate_index;
+        let usage_start = turn.quota_retry_usage_start();
+        turn.release_admission().await;
+        let usage = turn
+            .disarm()
+            .finalize_for_quota_retry(&state, outcome)
+            .await?;
+        Some(QuotaRetry {
+            request_id,
+            starting_candidate_index,
+            usage_start,
+            original_usage: Some(usage),
+        })
+    })
+    .await
+    {
+        Ok(retry) => retry,
+        Err(error) => {
+            warn!(
+                event_name = "responses_websocket_quota_retry_finalization_join_failed",
+                log_type = "ops",
+                transport = WEBSOCKET_LOG_TRANSPORT,
+                websocket = true,
+                error = ?error,
+                "gateway could not finish the exhausted Responses WebSocket attempt before retry"
+            );
+            None
+        }
+    }
 }
 
 pub(super) fn spawn_bounded_adapter_observation(
@@ -311,13 +341,13 @@ pub(super) fn finalize_unbound_turn(
 
 fn spawn_guarded_turn_finalization(
     state: AppState,
-    turn: ActiveProviderAttempt,
+    mut turn: ActiveProviderAttempt,
     outcome: ResponsesWebSocketTurnOutcome,
 ) -> JoinHandle<()> {
     // Spawn synchronously while the armed guard is still owned here. Caller
     // cancellation cannot drop an unguarded attempt between cleanup awaits.
+    turn.record_request_finished();
     tokio::spawn(async move {
-        let mut turn = turn;
         turn.release_admission().await;
         turn.disarm().finalize_detached(&state, outcome).await;
     })

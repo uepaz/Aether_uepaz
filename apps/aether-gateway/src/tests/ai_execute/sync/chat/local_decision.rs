@@ -333,6 +333,7 @@ async fn proxy_pii_redaction_local_openai_chat_runtime_masks_headers_and_restore
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     let status = response.status();
     let execution_path = response
@@ -366,7 +367,7 @@ async fn proxy_pii_redaction_local_openai_chat_runtime_masks_headers_and_restore
     assert_eq!(seen.body["messages"][0]["role"], "user");
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-proxy-pii-redaction-sync")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -706,6 +707,7 @@ async fn gateway_executes_openai_chat_sync_via_local_decision_gate_without_execu
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -730,7 +732,7 @@ async fn gateway_executes_openai_chat_sync_via_local_decision_gate_without_execu
     );
     assert_eq!(seen_upstream_request.content_type, "application/json");
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-local-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -1015,6 +1017,7 @@ async fn gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -1039,7 +1042,7 @@ async fn gateway_executes_openai_chat_sync_with_regex_model_mapping_in_execution
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-regex-mapping-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -1534,6 +1537,7 @@ async fn gateway_executes_openai_chat_sync_via_local_cross_format_gemini_candida
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -1597,7 +1601,7 @@ async fn gateway_executes_openai_chat_sync_via_local_cross_format_gemini_candida
     assert!((seen_execution_runtime_request.temperature - 0.2).abs() < f64::EPSILON);
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-gemini-local-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -1983,6 +1987,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_cli_syn
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     let status = response.status();
     let execution_path = response
@@ -2074,7 +2079,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_cli_syn
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-claude-cli-local-error-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -2462,6 +2467,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     let response_status = response.status();
     let execution_path = response
@@ -2505,10 +2511,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
         seen_execution_runtime_request.outer_model,
         "gemini-cli-upstream"
     );
-    assert_eq!(
-        seen_execution_runtime_request.user_prompt_id,
-        "trace-openai-chat-gemini-cli-local-error-123"
-    );
+    assert_eq!(seen_execution_runtime_request.user_prompt_id, request_id);
     assert!(!seen_execution_runtime_request.inner_model_present);
     assert_eq!(
         seen_execution_runtime_request.auth_header_value,
@@ -2521,7 +2524,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_cli_syn
     assert!(seen_execution_runtime_request.has_contents);
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-gemini-cli-local-error-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -2888,6 +2891,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_sync_fa
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
@@ -2936,7 +2940,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_claude_sync_fa
     assert!(seen_execution_runtime_request.has_messages);
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-claude-local-error-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -3338,6 +3342,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_sync_fa
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
@@ -3390,7 +3395,7 @@ async fn gateway_returns_openai_chat_error_for_local_cross_format_gemini_sync_fa
     assert!((seen_execution_runtime_request.temperature - 0.2).abs() < f64::EPSILON);
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-openai-chat-gemini-local-error-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);

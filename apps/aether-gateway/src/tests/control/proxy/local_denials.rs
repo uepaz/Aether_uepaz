@@ -535,19 +535,34 @@ async fn gateway_claude_routes_use_anthropic_authentication_error_for_invalid_ap
             .await
             .expect("request should complete locally");
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "path: {path}");
+        let disabled = path == "/v1/messages/count_tokens";
+        let expected_status = if disabled {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::UNAUTHORIZED
+        };
+        assert_eq!(response.status(), expected_status, "path: {path}");
         assert_eq!(
             response
                 .headers()
                 .get(EXECUTION_PATH_HEADER)
                 .and_then(|value| value.to_str().ok()),
-            Some(EXECUTION_PATH_LOCAL_AUTH_DENIED),
+            if disabled {
+                None
+            } else {
+                Some(EXECUTION_PATH_LOCAL_AUTH_DENIED)
+            },
             "path: {path}"
         );
         let payload: serde_json::Value = response.json().await.expect("response json should parse");
         assert_eq!(payload["type"], "error", "path: {path}");
         assert_eq!(
-            payload["error"]["type"], "authentication_error",
+            payload["error"]["type"],
+            if disabled {
+                "not_found_error"
+            } else {
+                "authentication_error"
+            },
             "path: {path}"
         );
     }

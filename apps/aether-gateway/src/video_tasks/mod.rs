@@ -34,6 +34,30 @@ mod service;
 mod store;
 mod types;
 
+pub(crate) fn bind_video_follow_up_request_identity(
+    follow_up: &mut LocalVideoTaskFollowUpPlan,
+    headers: &http::HeaderMap,
+) {
+    let Some(context) = follow_up
+        .report_context
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    // The task ID still identifies the original video. This operation has its
+    // own candidate and usage lifecycle, keyed by the current execution plan.
+    context.insert(
+        "request_id".to_string(),
+        follow_up.plan.request_id.clone().into(),
+    );
+    if let Some(trace_id) =
+        crate::headers::header_value_str(headers, crate::constants::TRACE_ID_HEADER)
+    {
+        context.insert("trace_id".to_string(), trace_id.into());
+    }
+}
+
 pub(crate) fn not_found_body() -> serde_json::Value {
     serde_json::json!({"detail": "Video task not found"})
 }

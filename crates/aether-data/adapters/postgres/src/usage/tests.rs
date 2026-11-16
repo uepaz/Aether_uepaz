@@ -1742,6 +1742,8 @@ async fn live_terminal_none_capture_clears_fast_from_detail_and_lightweight_list
     pending_record.local_execution_runtime_miss_reason = Some("miss-a".to_string());
     pending_record.request_metadata = Some(json!({
         "trace_id": "trace-a",
+        "client_family": "my-agent_2",
+        "client_family_source": "declared",
         "provider_service_tier": "priority",
         "provider_actual_service_tier": "priority",
         "billing_snapshot": {
@@ -1808,6 +1810,8 @@ async fn live_terminal_none_capture_clears_fast_from_detail_and_lightweight_list
         .as_ref()
         .and_then(serde_json::Value::as_object)
         .expect("terminal audit metadata should remain");
+    assert_eq!(stored.client_family.as_deref(), Some("my-agent_2"));
+    assert_eq!(stored_metadata["client_family_source"], "declared");
     assert_eq!(
         stored_metadata
             .get("trace_id")
@@ -1959,6 +1963,7 @@ async fn live_terminal_none_capture_clears_fast_from_detail_and_lightweight_list
     let list_item = repository
         .list_usage_audits(&UsageAuditListQuery {
             provider_name: Some(provider_name.clone()),
+            client_family: Some("my-agent_2".to_string()),
             limit: Some(10),
             newest_first: true,
             ..UsageAuditListQuery::default()
@@ -1968,6 +1973,7 @@ async fn live_terminal_none_capture_clears_fast_from_detail_and_lightweight_list
         .into_iter()
         .find(|item| item.request_id == request_id)
         .expect("usage list should contain the test row");
+    assert_eq!(list_item.client_family.as_deref(), Some("my-agent_2"));
     assert_eq!(list_item.provider_request_body_state, None);
     assert_eq!(list_item.provider_service_tier(), None);
     assert_eq!(list_item.target_model, None);

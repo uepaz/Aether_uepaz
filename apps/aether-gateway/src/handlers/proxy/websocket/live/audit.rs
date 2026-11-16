@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use aether_ai_serving::{AiStreamAttempt, AiSyncAttempt};
 use aether_contracts::ExecutionPlan;
 use aether_data_contracts::repository::usage::{
-    UsageBodyCaptureState, LIVE_SESSION_METADATA_KEY, USAGE_AVAILABLE_METADATA_KEY,
-    USAGE_PRICING_AVAILABLE_METADATA_KEY, WEBSOCKET_MODE_METADATA_KEY,
-    WEBSOCKET_TRANSPORT_METADATA_KEY,
+    insert_usage_client_family_from_headers, UsageBodyCaptureState, LIVE_SESSION_METADATA_KEY,
+    USAGE_AVAILABLE_METADATA_KEY, USAGE_PRICING_AVAILABLE_METADATA_KEY,
+    WEBSOCKET_MODE_METADATA_KEY, WEBSOCKET_TRANSPORT_METADATA_KEY,
 };
 use aether_usage_runtime::build_usage_event_data_seed;
 use serde_json::{json, Map, Value};
@@ -72,7 +72,9 @@ pub(super) fn mark_live_call_create_report_context(report_context: &mut Option<V
 fn build_live_preflight_event(
     decision: Option<&GatewayControlDecision>,
     request_id: &str,
+    trace_id: &str,
     request_path: &str,
+    client_metadata: Map<String, Value>,
     client_model: Option<&str>,
     transport: LiveAuditTransport,
     terminal: LiveSessionTerminal,
@@ -82,10 +84,8 @@ fn build_live_preflight_event(
     let mut request_metadata = attach_terminal_metadata(None, transport, &terminal)
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
-    request_metadata.insert(
-        "trace_id".to_string(),
-        Value::String(request_id.to_string()),
-    );
+    request_metadata.extend(client_metadata);
+    request_metadata.insert("trace_id".to_string(), Value::String(trace_id.to_string()));
     request_metadata.insert(
         "request_path".to_string(),
         Value::String(request_path.to_string()),
@@ -157,8 +157,10 @@ pub(super) fn record_live_websocket_preflight_failure(
     state: &AppState,
     decision: &GatewayControlDecision,
     request_id: &str,
+    trace_id: &str,
     request_path: &str,
     request_query: Option<&str>,
+    request_headers: &http::HeaderMap,
     status: http::StatusCode,
     termination: &'static str,
 ) {
@@ -173,13 +175,26 @@ pub(super) fn record_live_websocket_preflight_failure(
     let event = build_live_preflight_event(
         Some(decision),
         request_id,
+        trace_id,
         request_path,
+        preflight_client_metadata(request_headers),
         client_model.as_deref(),
         transport,
         LiveSessionTerminal::failure(status.as_u16(), termination, 0),
         None,
     );
     spawn_live_audit_event_detached(state, event, "websocket_preflight");
+}
+
+fn preflight_client_metadata(request_headers: &http::HeaderMap) -> Map<String, Value> {
+    let headers = crate::headers::collect_control_headers(request_headers);
+    let mut metadata = Map::new();
+    insert_usage_client_family_from_headers(
+        &mut metadata,
+        |name| headers.get(name).map(String::as_str),
+        headers.keys().any(|name| name.starts_with("x-stainless-")),
+    );
+    metadata
 }
 
 fn query_has_parameter(query: Option<&str>, expected: &str) -> bool {
@@ -346,7 +361,9 @@ struct LiveCallCreateAuditState {
     state: AppState,
     decision: Option<Box<GatewayControlDecision>>,
     request_id: String,
+    trace_id: String,
     request_path: String,
+    client_metadata: Map<String, Value>,
     client_model: Option<String>,
     diagnostic: Option<LocalExecutionRuntimeMissDiagnostic>,
     attempt: Option<Box<LiveSessionAudit>>,
@@ -359,14 +376,18 @@ impl LiveCallCreateAuditGuard {
         state: &AppState,
         decision: Option<&GatewayControlDecision>,
         request_id: &str,
+        trace_id: &str,
         request_path: &str,
+        request_headers: &http::HeaderMap,
     ) -> Self {
         Self {
             inner: Box::new(LiveCallCreateAuditState {
                 state: state.clone(),
                 decision: decision.cloned().map(Box::new),
                 request_id: request_id.to_string(),
+                trace_id: trace_id.to_string(),
                 request_path: request_path.to_string(),
+                client_metadata: preflight_client_metadata(request_headers),
                 client_model: None,
                 diagnostic: None,
                 attempt: None,
@@ -434,7 +455,9 @@ impl LiveCallCreateAuditGuard {
             None => build_live_preflight_event(
                 inner.decision.as_deref(),
                 inner.request_id.as_str(),
+                inner.trace_id.as_str(),
                 inner.request_path.as_str(),
+                std::mem::take(&mut inner.client_metadata),
                 inner.client_model.as_deref(),
                 LiveAuditTransport::WebRtc,
                 terminal,
@@ -1043,8 +1066,10 @@ mod tests {
 
         let event = build_live_preflight_event(
             Some(&decision),
+            "request-live-preflight",
             "trace-live-preflight",
             "/v1/realtime/calls",
+            Map::new(),
             Some("gpt-live-unmapped"),
             LiveAuditTransport::WebRtc,
             LiveSessionTerminal::failure(503, "candidate_unavailable", 37),
@@ -1107,7 +1132,9 @@ mod tests {
                 &state,
                 Some(&decision),
                 "live-call-create-cancelled",
+                "trace-live-call-create-cancelled",
                 "/v1/live",
+                &http::HeaderMap::new(),
             );
             guard.set_validated_client_model("gpt-live-cancelled");
         }
@@ -1116,7 +1143,9 @@ mod tests {
                 &state,
                 Some(&decision),
                 "live-call-create-explicit",
+                "trace-live-call-create-explicit",
                 "/v1/live",
+                &http::HeaderMap::new(),
             );
             guard.set_validated_client_model("gpt-live-explicit");
             guard.fail(http::StatusCode::BAD_REQUEST, "explicit_failure");
@@ -1215,12 +1244,19 @@ mod tests {
             verified_api_key_hash: None,
         });
 
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "originator",
+            http::HeaderValue::from_static("codex_work_desktop"),
+        );
         record_live_websocket_preflight_failure(
             &state,
             &decision,
             "live-ws-preflight-failed",
+            "trace-live-ws-preflight-failed",
             "/v1/realtime",
             Some("model=gpt-realtime-1.5"),
+            &headers,
             http::StatusCode::SERVICE_UNAVAILABLE,
             "candidate_unavailable",
         );
@@ -1243,6 +1279,7 @@ mod tests {
         assert_eq!(record.status, "failed");
         assert_eq!(record.billing_status, "void");
         assert_eq!(record.status_code, Some(503));
+        assert_eq!(record.client_family.as_deref(), Some("codex"));
         assert_eq!(record.request_type.as_deref(), Some("live"));
         assert_eq!(record.api_format.as_deref(), Some("codex:live"));
         assert_eq!(record.model, "gpt-realtime-1.5");
@@ -1283,7 +1320,9 @@ mod tests {
             &state,
             None,
             "live-call-create-without-runtime",
+            "trace-live-call-create-without-runtime",
             "/v1/live",
+            &http::HeaderMap::new(),
         );
         drop(guard);
     }

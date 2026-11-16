@@ -445,7 +445,7 @@ async fn maybe_execute_local_video_task_follow_up_sync(
     {
         return build_video_task_not_found_outcome(trace_id, decision);
     }
-    let Some(follow_up) = state.video_tasks.prepare_follow_up_sync_plan_for_user(
+    let Some(mut follow_up) = state.video_tasks.prepare_follow_up_sync_plan_for_user(
         plan_kind,
         parts.uri.path(),
         Some(body_json),
@@ -454,6 +454,7 @@ async fn maybe_execute_local_video_task_follow_up_sync(
     ) else {
         return build_video_task_not_found_outcome(trace_id, decision);
     };
+    crate::video_tasks::bind_video_follow_up_request_identity(&mut follow_up, &parts.headers);
 
     execute_sync_plan_and_reports_with_transfer_tracker(
         state,

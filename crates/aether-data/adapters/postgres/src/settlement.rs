@@ -1024,7 +1024,7 @@ ON CONFLICT (reservation_token) DO UPDATE SET
                         // reservation can be finalized.
                         return Ok(None);
                     }
-                    if reservation.state == UsagePolicyCostReservationState::Reserved {
+                    if reservation.allows_reconciliation(&input) {
                         sqlx::query(
                             r#"
 UPDATE usage_cost_reservations
@@ -1035,7 +1035,8 @@ SET state = $4,
 WHERE reservation_token = $1
   AND request_id = $2
   AND subject_id = $3
-  AND state = 'reserved'
+  AND (state = 'reserved' OR (state = 'released' AND $4 = 'finalized'
+       AND finalized_at <= TO_TIMESTAMP($6::double precision)))
                             "#,
                         )
                         .bind(&input.reservation_token)
@@ -1121,8 +1122,12 @@ WHERE retain_until <= TO_TIMESTAMP($1::double precision)
                         return settlement_from_row(&usage_row).map(Some);
                     }
 
-                    let mut final_billing_status =
-                        settlement_billing_status_for_usage_status(&input.status).to_string();
+                    let mut final_billing_status = if input.billing_status == "void" {
+                        "void"
+                    } else {
+                        settlement_billing_status_for_usage_status(&input.status)
+                    }
+                    .to_string();
                     let finalized_at =
                         i64::try_from(input.finalized_at_unix_secs.unwrap_or_else(|| {
                             std::time::SystemTime::now()
@@ -1518,6 +1523,8 @@ mod tests {
             let repository = SqlxSettlementRepository::new(pool.clone());
             for (scenario, charge, quota_covered) in [
                 ("wallet", 20.0, 0.0),
+                ("failed_wallet", 20.0, 0.0),
+                ("failed_quota_and_wallet", 20.0, 7.0),
                 ("quota_and_wallet", 20.0, 7.0),
                 ("wallet_fallback", 20.0, 0.0),
                 ("zero_charge", 0.0, 0.0),
@@ -1529,7 +1536,7 @@ mod tests {
                 sqlx::query("INSERT INTO wallets (id, user_id, balance, gift_balance, total_consumed, limit_mode, created_at, updated_at) VALUES ($1, $1, 100, 0, 0, 'finite', NOW(), NOW())")
                     .bind(scenario).execute(&pool).await.expect("wallet should insert");
                 // A zero-charge request must leave an active quota untouched too.
-                if scenario != "wallet" {
+                if !matches!(scenario, "wallet" | "failed_wallet") {
                     let grant = serde_json::json!([{
                         "type": "daily_quota", "daily_quota_usd": 7.0,
                         "reset_timezone": "UTC", "allow_wallet_overage": false,
@@ -1543,13 +1550,14 @@ mod tests {
                 let metadata = serde_json::json!({"plan_wallet_fallback": scenario == "wallet_fallback", "billing_multiplier_snapshot": {
                     "version": 1, "factors": {"routing_group": multiplier}, "multiplier": multiplier,
                 }});
-                sqlx::query("INSERT INTO usage (id, request_id, user_id, provider_id, provider_name, model, status, billing_status, total_cost_usd, actual_total_cost_usd, request_metadata) VALUES ($1, $1, $1, 'provider', 'Provider', 'model', 'completed', 'pending', 10, 5, $2)")
-                    .bind(scenario).bind(metadata).execute(&pool).await.expect("usage should insert");
+                let status = if scenario.starts_with("failed_") { "failed" } else { "completed" };
+                sqlx::query("INSERT INTO usage (id, request_id, user_id, provider_id, provider_name, model, status, billing_status, total_cost_usd, actual_total_cost_usd, request_metadata) VALUES ($1, $1, $1, 'provider', 'Provider', 'model', $3, 'pending', 10, 5, $2)")
+                    .bind(scenario).bind(metadata).bind(status).execute(&pool).await.expect("usage should insert");
                 let input = UsageSettlementInput {
                     request_id: scenario.to_string(), user_id: Some(scenario.to_string()),
                     api_key_id: None, api_key_is_standalone: false,
                     provider_id: Some("provider".to_string()),
-                    status: "completed".to_string(), billing_status: "pending".to_string(),
+                    status: status.to_string(), billing_status: "pending".to_string(),
                     total_cost_usd: 10.0, actual_total_cost_usd: 5.0,
                     billing_cost_usd: Some(charge), finalized_at_unix_secs: None,
                 };
@@ -1571,6 +1579,9 @@ mod tests {
                 let costs: (f64, f64) = sqlx::query_as("SELECT total_cost_usd::double precision, actual_total_cost_usd::double precision FROM usage WHERE request_id = $1")
                     .bind(scenario).fetch_one(&pool).await.unwrap();
                 assert_eq!(costs, (10.0, 5.0), "base and upstream cost must remain unchanged");
+                let persisted_status: String = sqlx::query_scalar("SELECT status FROM usage WHERE request_id = $1")
+                    .bind(scenario).fetch_one(&pool).await.unwrap();
+                assert_eq!(persisted_status, status);
                 let provider_cost: (i64, f64) = sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(total_cost_usd_delta), 0)::double precision FROM usage_counter_deltas WHERE request_id = $1 AND kind = 'provider_monthly' AND target_id = 'provider'")
                     .bind(scenario).fetch_one(&pool).await.unwrap();
                 assert_eq!(provider_cost, (1, 5.0), "upstream cost must be recorded once even for a zero-charge request");
@@ -1658,6 +1669,16 @@ mod tests {
             cost.reserved_cost_units = 4;
             assert_eq!(repo.reserve_usage_policy_cost(cost).await.unwrap(),
                 ReserveUsagePolicyCostOutcome::Rejected { window_index: 0, limit_cost_units: 15, used_cost_units: 12 });
+
+            let mut recovered_input = ReconcileUsagePolicyCostInput {
+                request_id: "released".into(), subject_id: "subject".into(), reservation_token: "released".into(),
+                actual_cost_units: 17, terminal_state: UsagePolicyCostReservationState::Finalized, finalized_at_unix_secs: 175,
+            };
+            let recovered = repo.reconcile_usage_policy_cost(recovered_input.clone()).await.unwrap().unwrap();
+            assert_eq!(recovered.state, UsagePolicyCostReservationState::Finalized);
+            assert_eq!(recovered.actual_cost_units, Some(17));
+            recovered_input.actual_cost_units = 99;
+            assert_eq!(repo.reconcile_usage_policy_cost(recovered_input).await.unwrap().unwrap(), recovered);
 
             sqlx::query("DELETE FROM usage_request_admissions").execute(&pool).await.unwrap();
             let make_request = |id: &str| ReserveUsagePolicyRequestInput {

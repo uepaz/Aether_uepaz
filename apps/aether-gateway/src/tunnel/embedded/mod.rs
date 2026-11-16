@@ -68,7 +68,7 @@ pub(crate) struct RelayRequestAuthenticated;
 
 pub(crate) struct PendingRelayAuth {
     pub(crate) payload_digest: aether_contracts::tunnel::TunnelRelayPayloadDigest,
-    nonce: String,
+    pub(super) nonce: String,
     sender: String,
     expires_at_unix_secs: u64,
 }

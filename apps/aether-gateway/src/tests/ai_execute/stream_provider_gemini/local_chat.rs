@@ -415,6 +415,7 @@ async fn gateway_executes_gemini_chat_stream_via_local_decision_gate_with_local_
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -462,7 +463,7 @@ async fn gateway_executes_gemini_chat_stream_via_local_decision_gate_with_local_
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-gemini-chat-local-stream-1")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);

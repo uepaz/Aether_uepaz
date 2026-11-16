@@ -7,7 +7,8 @@ use aether_data_contracts::repository::settlement::{
 };
 use aether_data_contracts::repository::usage::PLAN_USAGE_RESERVATION_DEFERRED_METADATA_KEY;
 use aether_data_contracts::repository::usage::{
-    billing_multiplier_snapshot, cancelled_request_fee_is_billable, StoredRequestUsageAudit,
+    billing_multiplier_snapshot, cancelled_request_fee_is_billable, failed_usage_is_billable,
+    StoredRequestUsageAudit,
 };
 use aether_data_contracts::{DataLayerError, DataLayerError::InvalidInput};
 use async_trait::async_trait;
@@ -52,6 +53,11 @@ pub(crate) async fn reconcile_usage_policy_cost_for_event_with_result(
     }
     let terminal_state = match event.event_type {
         UsageEventType::Completed => UsagePolicyCostReservationState::Finalized,
+        UsageEventType::Failed
+            if failed_usage_is_billable(event.data.request_metadata.as_ref()) =>
+        {
+            UsagePolicyCostReservationState::Finalized
+        }
         UsageEventType::Cancelled
             if cancelled_request_fee_is_billable(event.data.request_metadata.as_ref()) =>
         {
@@ -136,6 +142,8 @@ pub(crate) async fn settle_usage_after_upsert(
         && !plan_usage_reservation_reconciliation_is_deferred(event.data.request_metadata.as_ref())
     {
         let billable = event.event_type == UsageEventType::Completed
+            || (event.event_type == UsageEventType::Failed
+                && failed_usage_is_billable(event.data.request_metadata.as_ref()))
             || (event.event_type == UsageEventType::Cancelled
                 && cancelled_request_fee_is_billable(event.data.request_metadata.as_ref()));
         if billable
@@ -185,6 +193,8 @@ pub(crate) async fn settle_usage_with_reconciled_cost(
             usage_policy_reservation_token(usage),
         ) {
             let (terminal_state, actual_cost_units) = if usage.status == "completed"
+                || (usage.status == "failed"
+                    && failed_usage_is_billable(usage.request_metadata.as_ref()))
                 || (usage.status == "cancelled"
                     && cancelled_request_fee_is_billable(usage.request_metadata.as_ref()))
             {
@@ -233,7 +243,13 @@ pub(crate) async fn settle_usage_with_reconciled_cost(
         api_key_is_standalone: usage_api_key_is_standalone(usage),
         provider_id: usage.provider_id.clone(),
         status: usage.status.clone(),
-        billing_status: usage.billing_status.clone(),
+        billing_status: if usage.status == "failed"
+            && !failed_usage_is_billable(usage.request_metadata.as_ref())
+        {
+            "void".to_string()
+        } else {
+            usage.billing_status.clone()
+        },
         total_cost_usd: finite_cost(usage.total_cost_usd)?,
         actual_total_cost_usd: finite_cost(usage.actual_total_cost_usd)?,
         billing_cost_usd: Some(billing_cost_usd),
@@ -649,6 +665,28 @@ mod tests {
             UsagePolicyCostReservationState::Finalized
         );
         assert_eq!(reconciliations[0].actual_cost_units, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn failed_reported_usage_finalizes_reservation_without_changing_request_status() {
+        let writer = TestSettlementWriter {
+            has_writer: true,
+            ..Default::default()
+        };
+        let mut usage = sample_usage();
+        usage.status = "failed".into();
+        usage.request_metadata.as_mut().unwrap()["reported_usage"] = json!({"output_tokens": 100});
+        settle_usage_if_needed(&writer, &usage).await.unwrap();
+        let inputs = writer.inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].status, "failed");
+        assert_eq!(inputs[0].billing_cost_usd, Some(0.75));
+        let reconciliations = writer.reconciliations.lock().unwrap();
+        assert_eq!(
+            reconciliations[0].terminal_state,
+            UsagePolicyCostReservationState::Finalized
+        );
+        assert_eq!(reconciliations[0].actual_cost_units, 75_000_000);
     }
 
     #[tokio::test]

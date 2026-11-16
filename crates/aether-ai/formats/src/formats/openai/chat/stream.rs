@@ -116,7 +116,7 @@ impl OpenAIChatProviderState {
         if !has_token_fields {
             return None;
         }
-        canonical_usage_from_openai_usage(value)
+        canonical_usage_from_openai_chat_usage(value)
     }
 
     fn identity(&self, report_context: &Value) -> (String, String) {

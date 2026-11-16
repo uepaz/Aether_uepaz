@@ -390,7 +390,7 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
                     .to_string();
                 *seen_execution_runtime_inner.lock().expect("mutex should lock") =
                     Some(SeenExecutionRuntimeSyncRequest {
-                        trace_id: trace_id.clone(),
+                        trace_id,
                         url: payload
                             .get("url")
                             .and_then(|value| value.as_str())
@@ -482,7 +482,7 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
                 .concat();
 
                 Json(json!({
-                    "request_id": trace_id,
+                    "request_id": payload["request_id"],
                     "status_code": 200,
                     "headers": {
                         "content-type": "application/vnd.amazon.eventstream"
@@ -546,7 +546,7 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
         gateway_url: &str,
         trace_id: &str,
         body: String,
-    ) -> (StatusCode, String) {
+    ) -> (StatusCode, String, String) {
         let response = reqwest::Client::new()
             .post(format!("{gateway_url}/v1/messages"))
             .header(http::header::CONTENT_TYPE, "application/json")
@@ -562,11 +562,12 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
             .expect("request should succeed");
 
         let status = response.status();
+        let request_id = crate::tests::response_request_id(response.headers());
         let response_body = response.text().await.expect("body should read");
-        (status, response_body)
+        (status, response_body, request_id)
     }
 
-    let (status, response_body) = send_kiro_request(
+    let (status, response_body, request_id) = send_kiro_request(
         &gateway_url,
         "trace-kiro-cli-local-sync-123",
         "{\"model\":\"claude-sonnet-4\",\"messages\":[{\"role\":\"user\",\"content\":\"hello kiro\"}],\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":64}}".to_string(),
@@ -639,7 +640,7 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
     );
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-kiro-cli-local-sync-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -661,7 +662,7 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
         "messages": [{"role": "user", "content": "reuse this Kiro prompt"}]
     })
     .to_string();
-    let (first_cache_status, first_cache_body) = send_kiro_request(
+    let (first_cache_status, first_cache_body, first_cache_request_id) = send_kiro_request(
         &gateway_url,
         "trace-kiro-cli-local-sync-cache-1",
         cacheable_request_body.clone(),
@@ -671,18 +672,15 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
         first_cache_status == StatusCode::OK,
         "unexpected first cache status={first_cache_status} body={first_cache_body}"
     );
-    let first_usage = wait_for_completed_usage(
-        usage_repository.as_ref(),
-        "trace-kiro-cli-local-sync-cache-1",
-    )
-    .await;
+    let first_usage =
+        wait_for_completed_usage(usage_repository.as_ref(), &first_cache_request_id).await;
     assert!(
         first_usage.cache_creation_input_tokens > 0,
         "first Kiro sync cacheable request should create simulated cache"
     );
     assert_eq!(first_usage.cache_read_input_tokens, 0);
 
-    let (second_cache_status, second_cache_body) = send_kiro_request(
+    let (second_cache_status, second_cache_body, second_cache_request_id) = send_kiro_request(
         &gateway_url,
         "trace-kiro-cli-local-sync-cache-2",
         cacheable_request_body,
@@ -692,11 +690,8 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
         second_cache_status == StatusCode::OK,
         "unexpected second cache status={second_cache_status} body={second_cache_body}"
     );
-    let second_usage = wait_for_completed_usage(
-        usage_repository.as_ref(),
-        "trace-kiro-cli-local-sync-cache-2",
-    )
-    .await;
+    let second_usage =
+        wait_for_completed_usage(usage_repository.as_ref(), &second_cache_request_id).await;
     assert!(
         second_usage.cache_read_input_tokens > 0,
         "second Kiro sync cacheable request should read simulated cache"
@@ -1066,7 +1061,7 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
 
                 if authorization == "Bearer stale-kiro-access-token" {
                     return Json(json!({
-                        "request_id": "trace-kiro-cli-local-refresh-123",
+                        "request_id": payload["request_id"],
                         "status_code": 401,
                         "headers": {
                             "content-type": "application/json"
@@ -1097,7 +1092,7 @@ async fn gateway_executes_kiro_claude_cli_sync_via_local_provider_catalog_candid
                 .concat();
 
                 Json(json!({
-                    "request_id": "trace-kiro-cli-local-refresh-123",
+                    "request_id": payload["request_id"],
                     "status_code": 200,
                     "headers": {
                         "content-type": "application/vnd.amazon.eventstream"

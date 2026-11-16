@@ -17,6 +17,7 @@ use crate::api::response::{
     build_local_auth_rejection_response, build_local_http_error_response,
     build_local_overloaded_response,
 };
+use crate::constants::CONTROL_REQUEST_ID_HEADER;
 use crate::control::{
     trusted_auth_local_rejection, GatewayControlDecision, GatewayCredentialCarrier,
     GatewayLocalAuthRejection,
@@ -30,6 +31,7 @@ use crate::{AppState, GatewayError};
 /// Request facts that survive the HTTP Upgrade and are needed by a protocol
 /// adapter for planning, rate limiting, and connection-scoped audit logs.
 pub(crate) struct WebSocketRequestContext {
+    pub(crate) request_id: String,
     pub(crate) trace_id: String,
     pub(crate) headers: HeaderMap,
     pub(crate) uri: Uri,
@@ -77,12 +79,17 @@ impl AuthenticatedAiWebSocketUpgrade {
         status: StatusCode,
         message: &str,
     ) -> Result<Response<Body>, GatewayError> {
-        build_local_http_error_response(
+        let mut response = build_local_http_error_response(
             self.context.trace_id.as_str(),
             Some(&self.context.decision),
             status,
             message,
-        )
+        )?;
+        crate::api::response::insert_request_id_header_if_present(
+            response.headers_mut(),
+            Some(self.context.request_id.as_str()),
+        )?;
+        Ok(response)
     }
 
     pub(crate) fn into_response<F, Fut>(
@@ -117,12 +124,19 @@ impl AuthenticatedAiWebSocketUpgrade {
             context,
             request_permit,
         } = self;
-        ws.max_frame_size(limits.max_frame_size)
+        let request_id = http::HeaderValue::from_str(&context.request_id)
+            .expect("gateway request ID should be a valid header value");
+        let mut response = ws
+            .max_frame_size(limits.max_frame_size)
             .max_message_size(limits.max_message_size)
             .on_upgrade(move |socket| async move {
                 drop(request_permit);
                 run_session(socket, state, context, prepared).await;
-            })
+            });
+        response
+            .headers_mut()
+            .insert(CONTROL_REQUEST_ID_HEADER, request_id);
+        response
     }
 }
 
@@ -280,6 +294,7 @@ pub(crate) async fn prepare_authenticated_ai_websocket(
     decision.public_query_string = uri.query().map(ToOwned::to_owned);
     let headers = websocket_planning_headers(headers);
     let context = WebSocketRequestContext {
+        request_id: request_context.request_id,
         trace_id,
         headers,
         uri,

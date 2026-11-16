@@ -132,6 +132,7 @@ pub(crate) const TUNNEL_RELAY_AUTH_SECRET_MIN_BYTES: usize = 32;
 pub(crate) const TUNNEL_RELAY_ROLLOUT_PROBE_HEADER: &str = "x-aether-tunnel-rollout-probe";
 pub(crate) const TUNNEL_RELAY_ROLLOUT_PROBE_VALUE: &str = "1";
 const TUNNEL_AFFINITY_AUTH_CONTEXT: &str = "aether.tunnel.affinity-auth.v1";
+const TUNNEL_AFFINITY_REQUEST_NONCE_PREFIX: &str = "affinity_";
 const TUNNEL_AFFINITY_GATEWAY_MARKER: &str = "rust-phase3b-affinity";
 const MAX_TUNNEL_AFFINITY_ID_LEN: usize = 200;
 const OWNER_FORWARD_DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -165,9 +166,10 @@ fn owner_forward_pinned_client_cache_clock() -> &'static AtomicU64 {
     CLOCK.get_or_init(|| AtomicU64::new(0))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TunnelAffinityAuthContext {
     pub(crate) client_ip: std::net::IpAddr,
+    pub(crate) request_id: Option<String>,
 }
 
 pub(crate) struct PendingTunnelAffinityAuth {
@@ -1076,6 +1078,7 @@ fn build_relay_auth_headers(
         forwarded_by,
         rollout_probe,
         tunnel_relay_payload_digest(metadata_envelope, body),
+        uuid::Uuid::new_v4().simple().to_string(),
     )
 }
 
@@ -1087,10 +1090,10 @@ fn build_relay_auth_headers_for_digest(
     forwarded_by: bool,
     rollout_probe: bool,
     payload_digest: TunnelRelayPayloadDigest,
+    nonce: String,
 ) -> Result<RelayAuthHeaders, String> {
     validate_tunnel_relay_auth_secret(secret)?;
     let timestamp_unix_secs = current_unix_secs();
-    let nonce = uuid::Uuid::new_v4().simple().to_string();
     let forwarded_by_value = if forwarded_by { sender_instance_id } else { "" };
     let signature = sign_tunnel_relay_request(
         secret,
@@ -1122,6 +1125,9 @@ struct TunnelAffinityAuthMetadata {
     affinity_forwarded_by: Option<String>,
     affinity_owner_instance_id: Option<String>,
     affinity_node_id: Option<String>,
+    // Accept the signed header used by gateways deployed before the nonce carried this ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
     forwarded_host: Option<String>,
     forwarded_for: Option<String>,
     forwarded_proto: Option<String>,
@@ -1157,6 +1163,7 @@ pub(crate) fn build_tunnel_affinity_auth_metadata(
             headers,
             crate::constants::TUNNEL_AFFINITY_NODE_ID_HEADER,
         )?,
+        request_id: tunnel_affinity_request_id(headers)?,
         forwarded_host: canonical_header_value(headers, crate::constants::FORWARDED_HOST_HEADER)?,
         forwarded_for: canonical_header_value(headers, crate::constants::FORWARDED_FOR_HEADER)?,
         forwarded_proto: canonical_header_value(headers, crate::constants::FORWARDED_PROTO_HEADER)?,
@@ -1198,6 +1205,35 @@ fn canonical_header_value(
         .to_str()
         .map(|value| Some(value.to_string()))
         .map_err(|_| format!("invalid tunnel affinity authentication header: {name}"))
+}
+
+fn tunnel_affinity_request_id(headers: &HeaderMap) -> Result<Option<String>, String> {
+    let Some(value) =
+        canonical_header_value(headers, crate::constants::TUNNEL_AFFINITY_REQUEST_ID_HEADER)?
+    else {
+        return Ok(None);
+    };
+    if !is_canonical_tunnel_affinity_request_id(&value) {
+        return Err("invalid tunnel affinity request ID".to_string());
+    }
+    Ok(Some(value))
+}
+
+fn is_canonical_tunnel_affinity_request_id(value: &str) -> bool {
+    uuid::Uuid::parse_str(value)
+        .ok()
+        .is_some_and(|id| !id.is_nil() && id.hyphenated().to_string() == value)
+}
+
+fn tunnel_affinity_request_id_from_nonce(nonce: &str) -> Result<Option<String>, RelayAuthError> {
+    let Some(encoded) = nonce.strip_prefix(TUNNEL_AFFINITY_REQUEST_NONCE_PREFIX) else {
+        return Ok(None);
+    };
+    let (_, request_id) = encoded.split_once('_').ok_or(RelayAuthError::Invalid)?;
+    if !is_canonical_tunnel_affinity_request_id(request_id) {
+        return Err(RelayAuthError::Invalid);
+    }
+    Ok(Some(request_id.to_string()))
 }
 
 impl EmbeddedTunnelState {
@@ -1445,7 +1481,6 @@ impl EmbeddedTunnelState {
             required_affinity_header(headers, crate::constants::FORWARDED_FOR_HEADER, 45)?
                 .parse::<std::net::IpAddr>()
                 .map_err(|_| RelayAuthError::Invalid)?;
-
         let metadata = build_tunnel_affinity_auth_metadata(method, uri, headers)
             .map_err(|_| RelayAuthError::Invalid)?;
         let relay_auth = self
@@ -1455,8 +1490,17 @@ impl EmbeddedTunnelState {
         if !relay_auth.payload_digest.matches_metadata(&metadata) {
             return Err(RelayAuthError::Invalid);
         }
+        let header_request_id =
+            tunnel_affinity_request_id(headers).map_err(|_| RelayAuthError::Invalid)?;
+        let nonce_request_id = tunnel_affinity_request_id_from_nonce(&relay_auth.nonce)?;
+        if header_request_id.is_some() && nonce_request_id.is_some() {
+            return Err(RelayAuthError::Invalid);
+        }
         Ok(Some(PendingTunnelAffinityAuth {
-            context: TunnelAffinityAuthContext { client_ip },
+            context: TunnelAffinityAuthContext {
+                client_ip,
+                request_id: nonce_request_id.or(header_request_id),
+            },
             relay_auth,
         }))
     }
@@ -1471,6 +1515,38 @@ impl EmbeddedTunnelState {
         }
         self.inner.commit_relay_auth(&pending.relay_auth).await?;
         Ok(pending.context)
+    }
+
+    pub(crate) fn build_tunnel_affinity_relay_auth_headers(
+        &self,
+        owner_instance_id: &str,
+        node_id: &str,
+        request_id: &str,
+        metadata: &[u8],
+        body: &[u8],
+    ) -> Result<RelayAuthHeaders, String> {
+        let secret = self
+            .relay_auth_secret
+            .as_deref()
+            .map_err(|error| error.to_string())?;
+        if !is_canonical_tunnel_affinity_request_id(request_id) {
+            return Err("invalid tunnel affinity request ID".to_string());
+        }
+        // Legacy owners accept the signed nonce as opaque and still verify the original metadata.
+        let nonce = format!(
+            "{TUNNEL_AFFINITY_REQUEST_NONCE_PREFIX}{}_{request_id}",
+            uuid::Uuid::new_v4().simple(),
+        );
+        build_relay_auth_headers_for_digest(
+            secret,
+            self.local_instance_id(),
+            owner_instance_id,
+            node_id,
+            true,
+            false,
+            tunnel_relay_payload_digest(metadata, body),
+            nonce,
+        )
     }
 
     pub(crate) fn build_relay_auth_headers(
@@ -1519,6 +1595,7 @@ impl EmbeddedTunnelState {
             forwarded_by,
             rollout_probe,
             payload_digest,
+            uuid::Uuid::new_v4().simple().to_string(),
         )
     }
 
@@ -1662,7 +1739,7 @@ impl EmbeddedTunnelState {
                 .push_local_request_body(stream_id, Bytes::new(), true)
                 .await?;
             let response = stream
-                .wait_headers(Duration::from_secs(timeout_secs))
+                .wait_headers(Some(Duration::from_secs(timeout_secs)))
                 .await?;
             let Some(mut body_rx) = stream.take_body_receiver() else {
                 return Err("missing tunnel probe response body receiver".to_string());
@@ -2166,8 +2243,7 @@ async fn forward_relay_request_to_owner(
         upstream_request = upstream_request.header(TRACE_ID_HEADER, trace_id);
     }
 
-    let first_byte_timeout = meta
-        .stream
+    let first_byte_timeout = (meta.stream && resolved_timeouts.first_byte_ms > 0)
         .then_some(Duration::from_millis(resolved_timeouts.first_byte_ms));
     let upstream_response =
         match send_owner_forward_request(upstream_request.body(request_body), first_byte_timeout)
@@ -2814,7 +2890,8 @@ mod tests {
         TunnelAttachmentRecord, MAX_OWNER_FORWARD_DNS_ADDRESSES,
     };
     use aether_contracts::tunnel::{
-        try_decode_tunnel_relay_request_meta, TUNNEL_RELAY_FORWARDED_BY_HEADER,
+        try_decode_tunnel_relay_request_meta, TUNNEL_RELAY_AUTH_NONCE_HEADER,
+        TUNNEL_RELAY_AUTH_PAYLOAD_HEADER, TUNNEL_RELAY_FORWARDED_BY_HEADER,
         TUNNEL_RELAY_OWNER_INSTANCE_HEADER,
     };
     use aether_data::repository::proxy_nodes::{
@@ -3137,6 +3214,229 @@ mod tests {
             first,
             build_tunnel_affinity_auth_metadata(&method, &uri, &headers)
                 .expect("metadata should build")
+        );
+    }
+
+    fn signed_affinity_request_headers(request_id: Option<&str>, body: &[u8]) -> HeaderMap {
+        use crate::constants::*;
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            (GATEWAY_HEADER, "rust-phase3b-affinity"),
+            (TUNNEL_RELAY_FORWARDED_BY_HEADER, "gateway-a"),
+            (TUNNEL_AFFINITY_FORWARDED_BY_HEADER, "gateway-a"),
+            (TUNNEL_AFFINITY_OWNER_INSTANCE_HEADER, "gateway-b"),
+            (TUNNEL_AFFINITY_NODE_ID_HEADER, "node-1"),
+            (TRUSTED_AUTH_USER_ID_HEADER, "user-1"),
+            (TRUSTED_AUTH_API_KEY_ID_HEADER, "key-1"),
+            (TRUSTED_AUTH_ACCESS_ALLOWED_HEADER, "true"),
+            (FORWARDED_FOR_HEADER, "203.0.113.10"),
+        ] {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+        if let Some(request_id) = request_id {
+            headers.insert(
+                TUNNEL_AFFINITY_REQUEST_ID_HEADER,
+                HeaderValue::from_str(request_id).unwrap(),
+            );
+        }
+        let metadata = build_tunnel_affinity_auth_metadata(
+            &Method::POST,
+            &"/v1/chat/completions".parse().unwrap(),
+            &headers,
+        )
+        .unwrap();
+        super::build_relay_auth_headers(
+            RELAY_TEST_SECRET.as_bytes(),
+            "gateway-a",
+            "gateway-b",
+            "node-1",
+            true,
+            false,
+            &metadata,
+            body,
+        )
+        .unwrap()
+        .apply_to_headers(&mut headers)
+        .unwrap();
+        headers
+    }
+
+    fn affinity_request_receiver() -> super::EmbeddedTunnelState {
+        super::EmbeddedTunnelState::with_data_and_directory_for_tests(
+            Arc::new(GatewayDataState::disabled()),
+            TunnelAttachmentDirectory::for_tests("gateway-b", None, 90),
+            RELAY_TEST_SECRET,
+        )
+    }
+
+    #[tokio::test]
+    async fn tunnel_affinity_auth_preserves_signed_request_id_and_accepts_legacy_requests() {
+        let request_id = "4dfbf85e-9863-4e82-b973-51e81f51aa23";
+        let body = br#"{"model":"test"}"#;
+        for expected in [Some(request_id), None] {
+            let headers = signed_affinity_request_headers(expected, body);
+            let receiver = affinity_request_receiver();
+            let pending = receiver
+                .prepare_tunnel_affinity_auth_request(
+                    &Method::POST,
+                    &"/v1/chat/completions".parse().unwrap(),
+                    &headers,
+                )
+                .await
+                .unwrap()
+                .expect("signed request should have pending authentication");
+            let verified = receiver
+                .commit_tunnel_affinity_auth_request(pending, body)
+                .await
+                .unwrap();
+            assert_eq!(verified.request_id.as_deref(), expected);
+            assert_eq!(verified.client_ip.to_string(), "203.0.113.10");
+        }
+    }
+
+    #[tokio::test]
+    async fn tunnel_affinity_sender_keeps_the_legacy_digest_and_authenticates_the_request_id() {
+        let request_id = "4dfbf85e-9863-4e82-b973-51e81f51aa23";
+        let body = br#"{"model":"test"}"#;
+        let uri = "/v1/chat/completions".parse().unwrap();
+        let mut headers = signed_affinity_request_headers(None, body);
+        let legacy_digest = headers[TUNNEL_RELAY_AUTH_PAYLOAD_HEADER].clone();
+        let legacy_nonce = headers[TUNNEL_RELAY_AUTH_NONCE_HEADER].clone();
+        let metadata = build_tunnel_affinity_auth_metadata(&Method::POST, &uri, &headers).unwrap();
+        let sender = super::EmbeddedTunnelState::with_data_and_directory_for_tests(
+            Arc::new(GatewayDataState::disabled()),
+            TunnelAttachmentDirectory::for_tests("gateway-a", None, 90),
+            RELAY_TEST_SECRET,
+        );
+        let auth = sender
+            .build_tunnel_affinity_relay_auth_headers(
+                "gateway-b",
+                "node-1",
+                request_id,
+                &metadata,
+                body,
+            )
+            .unwrap();
+        let retry_auth = sender
+            .build_tunnel_affinity_relay_auth_headers(
+                "gateway-b",
+                "node-1",
+                request_id,
+                &metadata,
+                body,
+            )
+            .unwrap();
+        assert_ne!(auth.nonce, retry_auth.nonce);
+        auth.apply_to_headers(&mut headers).unwrap();
+        assert_eq!(headers[TUNNEL_RELAY_AUTH_PAYLOAD_HEADER], legacy_digest);
+        assert!(!headers.contains_key(crate::constants::TUNNEL_AFFINITY_REQUEST_ID_HEADER));
+
+        let receiver = affinity_request_receiver();
+        let pending = receiver
+            .prepare_tunnel_affinity_auth_request(&Method::POST, &uri, &headers)
+            .await
+            .unwrap()
+            .unwrap();
+        let verified = receiver
+            .commit_tunnel_affinity_auth_request(pending, body)
+            .await
+            .unwrap();
+        assert_eq!(verified.request_id.as_deref(), Some(request_id));
+
+        headers.insert(TUNNEL_RELAY_AUTH_NONCE_HEADER, legacy_nonce);
+        assert!(matches!(
+            receiver
+                .prepare_tunnel_affinity_auth_request(&Method::POST, &uri, &headers)
+                .await,
+            Err(super::RelayAuthError::Invalid)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tunnel_affinity_auth_rejects_tampered_or_removed_request_id() {
+        use crate::constants::TUNNEL_AFFINITY_REQUEST_ID_HEADER;
+        let body = b"{}";
+        let original =
+            signed_affinity_request_headers(Some("4dfbf85e-9863-4e82-b973-51e81f51aa23"), body);
+        for replacement in [Some("64c26dfb-4b76-4076-8a1d-2631ea238b55"), None] {
+            let mut headers = original.clone();
+            match replacement {
+                Some(value) => {
+                    headers.insert(
+                        TUNNEL_AFFINITY_REQUEST_ID_HEADER,
+                        HeaderValue::from_static(value),
+                    );
+                }
+                None => {
+                    headers.remove(TUNNEL_AFFINITY_REQUEST_ID_HEADER);
+                }
+            }
+            assert!(matches!(
+                affinity_request_receiver()
+                    .prepare_tunnel_affinity_auth_request(
+                        &Method::POST,
+                        &"/v1/chat/completions".parse().unwrap(),
+                        &headers,
+                    )
+                    .await,
+                Err(super::RelayAuthError::Invalid)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn tunnel_affinity_request_id_alone_does_not_authenticate_a_client() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::constants::TUNNEL_AFFINITY_REQUEST_ID_HEADER,
+            HeaderValue::from_static("4dfbf85e-9863-4e82-b973-51e81f51aa23"),
+        );
+        assert!(affinity_request_receiver()
+            .prepare_tunnel_affinity_auth_request(
+                &Method::POST,
+                &"/v1/chat/completions".parse().unwrap(),
+                &headers,
+            )
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn tunnel_affinity_request_id_requires_a_single_canonical_uuid() {
+        use crate::constants::TUNNEL_AFFINITY_REQUEST_ID_HEADER;
+        let method = Method::POST;
+        let uri = "/v1/chat/completions".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        for value in [
+            "",
+            "client-trace",
+            "4dfbf85e98634e82b97351e81f51aa23",
+            "4DFBF85E-9863-4E82-B973-51E81F51AA23",
+            " 4dfbf85e-9863-4e82-b973-51e81f51aa23",
+            "00000000-0000-0000-0000-000000000000",
+        ] {
+            headers.insert(
+                TUNNEL_AFFINITY_REQUEST_ID_HEADER,
+                HeaderValue::from_str(value).unwrap(),
+            );
+            assert!(build_tunnel_affinity_auth_metadata(&method, &uri, &headers).is_err());
+        }
+        headers.insert(
+            TUNNEL_AFFINITY_REQUEST_ID_HEADER,
+            HeaderValue::from_static("4dfbf85e-9863-4e82-b973-51e81f51aa23"),
+        );
+        headers.append(
+            TUNNEL_AFFINITY_REQUEST_ID_HEADER,
+            HeaderValue::from_static("4dfbf85e-9863-4e82-b973-51e81f51aa23"),
+        );
+        assert!(build_tunnel_affinity_auth_metadata(&method, &uri, &headers).is_err());
+
+        headers.remove(TUNNEL_AFFINITY_REQUEST_ID_HEADER);
+        let legacy_metadata = build_tunnel_affinity_auth_metadata(&method, &uri, &headers).unwrap();
+        assert_eq!(
+            String::from_utf8(legacy_metadata).unwrap(),
+            r#"{"context":"aether.tunnel.affinity-auth.v1","method":"POST","path_and_query":"/v1/chat/completions","gateway_marker":null,"affinity_forwarded_by":null,"affinity_owner_instance_id":null,"affinity_node_id":null,"forwarded_host":null,"forwarded_for":null,"forwarded_proto":null,"trusted_user_id":null,"trusted_api_key_id":null,"trusted_access_allowed":null,"trusted_balance_remaining":null}"#,
         );
     }
 

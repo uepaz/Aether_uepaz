@@ -68,9 +68,11 @@ pub(crate) async fn live_websocket(
                         audit::record_live_websocket_preflight_failure(
                             prepared.state(),
                             &prepared.context().decision,
+                            prepared.context().request_id.as_str(),
                             prepared.context().trace_id.as_str(),
                             prepared.context().uri.path(),
                             prepared.context().uri.query(),
+                            &prepared.context().headers,
                             rejection.status(),
                             rejection.termination(),
                         );

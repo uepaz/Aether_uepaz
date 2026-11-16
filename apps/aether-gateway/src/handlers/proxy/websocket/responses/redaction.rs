@@ -364,6 +364,7 @@ mod tests {
 
     fn websocket_context(decision: GatewayControlDecision) -> WebSocketRequestContext {
         WebSocketRequestContext {
+            request_id: "request-responses-ws-redaction".to_string(),
             trace_id: "trace-responses-ws-redaction".to_string(),
             headers: HeaderMap::new(),
             uri: Uri::from_static("/v1/responses"),

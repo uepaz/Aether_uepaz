@@ -19,6 +19,7 @@ pub(crate) async fn maybe_execute_via_control(
     parts: &http::request::Parts,
     body_bytes: Bytes,
     trace_id: &str,
+    request_id: &str,
     decision: Option<&GatewayControlDecision>,
     require_stream: bool,
 ) -> Result<LocalExecutionRequestOutcome, GatewayError> {
@@ -41,10 +42,10 @@ pub(crate) async fn maybe_execute_via_control(
     }
 
     let response = if require_stream {
-        maybe_execute_stream_request(state, parts, &body_bytes, trace_id, Some(&local_decision))
+        maybe_execute_stream_request(state, parts, &body_bytes, request_id, Some(&local_decision))
             .await?
     } else {
-        maybe_execute_sync_request(state, parts, &body_bytes, trace_id, Some(&local_decision))
+        maybe_execute_sync_request(state, parts, &body_bytes, request_id, Some(&local_decision))
             .await?
     };
 

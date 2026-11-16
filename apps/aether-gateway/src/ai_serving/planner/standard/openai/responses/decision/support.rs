@@ -25,7 +25,8 @@ use crate::ai_serving::planner::decision_input::{
     resolve_local_authenticated_decision_input_with_snapshot,
 };
 use crate::ai_serving::planner::materialization_policy::{
-    build_local_candidate_persistence_policy, LocalCandidatePersistencePolicyKind,
+    build_local_candidate_persistence_policy, LocalCandidatePersistencePolicy,
+    LocalCandidatePersistencePolicyKind,
 };
 use crate::ai_serving::planner::runtime_miss::set_local_runtime_miss_diagnostic_reason;
 use crate::ai_serving::planner::spec_metadata::local_openai_responses_spec_metadata;
@@ -292,20 +293,40 @@ pub(crate) async fn build_local_openai_responses_candidate_attempt_source<'a>(
     body_json: &serde_json::Value,
     spec: LocalOpenAiResponsesSpec,
 ) -> Result<(LocalOpenAiResponsesCandidateAttemptSource<'a>, usize), GatewayError> {
+    build_local_openai_responses_candidate_attempt_source_from(
+        state, trace_id, input, body_json, spec, 0,
+    )
+    .await
+}
+
+pub(crate) async fn build_local_openai_responses_candidate_attempt_source_from<'a>(
+    state: &'a AppState,
+    trace_id: &str,
+    input: &LocalOpenAiResponsesDecisionInput,
+    body_json: &serde_json::Value,
+    spec: LocalOpenAiResponsesSpec,
+    starting_candidate_index: u32,
+) -> Result<(LocalOpenAiResponsesCandidateAttemptSource<'a>, usize), GatewayError> {
     let spec_metadata = local_openai_responses_spec_metadata(spec);
     let request_operation = openai_responses_request_operation(spec_metadata.api_format, body_json);
     let planner_state = PlannerAppState::new(state);
     let sticky_session_token = extract_pool_sticky_session_token(body_json);
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
-    let persistence_policy = build_local_candidate_persistence_policy(
+    let mut persistence_policy = build_local_candidate_persistence_policy(
         auth_context,
         input.required_capabilities.as_ref(),
         LocalCandidatePersistencePolicyKind::OpenAiResponsesDecision,
     );
+    persistence_policy.starting_candidate_index = starting_candidate_index;
     if openai_request_is_image_generation_intent(&input.requested_model, body_json) {
         let (image_candidates, image_candidate_count) =
             build_local_openai_responses_image_candidate_attempt_source(
-                state, trace_id, input, body_json, spec,
+                state,
+                trace_id,
+                input,
+                body_json,
+                spec,
+                persistence_policy,
             )
             .await?;
         if image_candidate_count > 0 {
@@ -384,22 +405,17 @@ pub(crate) async fn build_local_openai_responses_candidate_attempt_source<'a>(
     )
 }
 
-pub(crate) async fn build_local_openai_responses_image_candidate_attempt_source<'a>(
+async fn build_local_openai_responses_image_candidate_attempt_source<'a>(
     state: &'a AppState,
     trace_id: &str,
     input: &LocalOpenAiResponsesDecisionInput,
     body_json: &serde_json::Value,
     spec: LocalOpenAiResponsesSpec,
+    persistence_policy: LocalCandidatePersistencePolicy<'_>,
 ) -> Result<(LocalOpenAiResponsesCandidateAttemptSource<'a>, usize), GatewayError> {
     let spec_metadata = local_openai_responses_spec_metadata(spec);
     let planner_state = PlannerAppState::new(state);
     let sticky_session_token = extract_pool_sticky_session_token(body_json);
-    let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
-    let persistence_policy = build_local_candidate_persistence_policy(
-        auth_context,
-        input.required_capabilities.as_ref(),
-        LocalCandidatePersistencePolicyKind::OpenAiResponsesDecision,
-    );
     let preselection = preselect_local_execution_candidates_for_api_formats_with_serving(
         planner_state,
         &input.model_directive_policy,

@@ -1,5 +1,7 @@
 //! Client-side Responses WebSocket event forwarding and follow-up planning.
 
+use std::time::Instant;
+
 use aether_provider_transport::CodexFingerprintConvergenceContext;
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket};
 use futures_util::SinkExt;
@@ -33,7 +35,7 @@ use super::request::{
 use super::state::BoundResponsesConnection;
 use super::turn::{
     prepare_responses_websocket_turn_decision, ResponsesWebSocketTurnObservation,
-    ResponsesWebSocketTurnOutcome,
+    ResponsesWebSocketTurnOutcome, ResponsesWebSocketUsageStart,
 };
 use super::turn_state::LogicalTurn;
 use super::upstream::{
@@ -196,6 +198,7 @@ pub(super) async fn forward_client_message(
 ) -> RelayDisposition {
     match client_message {
         AxumWsMessage::Text(text) => {
+            let request_started_at = Instant::now();
             let text = text.to_string();
             let mut client_event = match parse_response_create_event(&text) {
                 Ok(event) => event,
@@ -506,6 +509,7 @@ pub(super) async fn forward_client_message(
                     context,
                     planning_parts,
                     client_event,
+                    request_started_at,
                     logical_turn_id,
                     codex_fingerprint_context,
                     turn_control,
@@ -522,6 +526,7 @@ pub(super) async fn forward_client_message(
                 context,
                 planning_parts,
                 client_event,
+                request_started_at,
                 requested_model,
                 logical_turn_id,
                 codex_fingerprint_context,
@@ -574,6 +579,7 @@ async fn forward_pinned_continuation(
     context: &WebSocketRequestContext,
     planning_parts: http::request::Parts,
     client_event: Value,
+    request_started_at: Instant,
     logical_turn_id: String,
     codex_fingerprint_context: CodexFingerprintConvergenceContext,
     turn_control: ResponsesWebSocketTurnControl,
@@ -631,6 +637,7 @@ async fn forward_pinned_continuation(
         None,
         None,
         Some(pinned_candidate),
+        0,
     ))
     .await
     {
@@ -778,6 +785,7 @@ async fn forward_pinned_continuation(
         &client_event,
         plan_usage_policy_snapshot.clone(),
         planned_lease,
+        ResponsesWebSocketUsageStart::New(request_started_at),
     )
     .await
     {
@@ -890,6 +898,7 @@ async fn forward_replanned_response_create(
     context: &WebSocketRequestContext,
     planning_parts: http::request::Parts,
     client_event: Value,
+    request_started_at: Instant,
     requested_model: String,
     logical_turn_id: String,
     codex_fingerprint_context: CodexFingerprintConvergenceContext,
@@ -917,6 +926,7 @@ async fn forward_replanned_response_create(
         excluded_key_ids,
         excluded_codex_account_ids,
         None,
+        0,
     ))
     .await
     {
@@ -1001,6 +1011,7 @@ async fn forward_replanned_response_create(
         &client_event,
         plan_usage_policy_snapshot.clone(),
         planned_lease,
+        ResponsesWebSocketUsageStart::New(request_started_at),
     )
     .await
     {

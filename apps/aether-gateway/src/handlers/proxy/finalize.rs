@@ -60,7 +60,10 @@ pub(super) fn finalize_gateway_response(
 ) -> Response<Body> {
     apply_sensitive_route_cache_policy(response.headers_mut(), path_and_query, control_decision);
     attach_control_decision_headers(&mut response, control_decision);
-    if !response.headers().contains_key(TRACE_ID_HEADER) {
+    let route_class = control_decision
+        .and_then(|decision| decision.route_class.as_deref())
+        .unwrap_or("passthrough");
+    if route_class != "internal_proxy" || !response.headers().contains_key(TRACE_ID_HEADER) {
         response.headers_mut().insert(
             HeaderName::from_static(TRACE_ID_HEADER),
             HeaderValue::from_str(trace_id).expect("trace id should be a valid header value"),
@@ -84,9 +87,6 @@ pub(super) fn finalize_gateway_response(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("none")
         .to_string();
-    let route_class = control_decision
-        .and_then(|decision| decision.route_class.as_deref())
-        .unwrap_or("passthrough");
     let request_id = response
         .headers()
         .get(CONTROL_REQUEST_ID_HEADER)
@@ -294,13 +294,27 @@ fn attach_control_decision_headers(
 
 pub(super) fn finalize_gateway_response_with_context(
     state: &AppState,
-    response: Response<Body>,
+    mut response: Response<Body>,
     remote_addr: &std::net::SocketAddr,
     request_context: &GatewayPublicRequestContext,
     execution_path: &'static str,
     started_at: &Instant,
     request_permit: Option<AdmissionPermit>,
 ) -> Response<Body> {
+    if request_context
+        .control_decision
+        .as_ref()
+        .and_then(|decision| decision.route_class.as_deref())
+        == Some("ai_public")
+        && (execution_path != super::EXECUTION_PATH_TUNNEL_AFFINITY_FORWARD
+            || !response.headers().contains_key(CONTROL_REQUEST_ID_HEADER))
+    {
+        response.headers_mut().insert(
+            HeaderName::from_static(CONTROL_REQUEST_ID_HEADER),
+            HeaderValue::from_str(&request_context.request_id)
+                .expect("gateway request ID should be a valid header value"),
+        );
+    }
     let client_ip = request_context
         .client_ip
         .as_deref()
@@ -495,6 +509,7 @@ mod tests {
     #[test]
     fn request_wants_stream_reads_zstd_encoded_json_body() {
         let request_context = GatewayPublicRequestContext {
+            request_id: "request-1".to_string(),
             trace_id: "trace-zstd-stream".to_string(),
             request_method: Method::POST,
             request_path: "/v1/responses".to_string(),

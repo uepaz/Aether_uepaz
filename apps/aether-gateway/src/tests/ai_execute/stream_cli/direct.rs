@@ -618,6 +618,7 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
         .send()
         .await
         .expect("request should succeed");
+    let request_id = crate::tests::response_request_id(response.headers());
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -764,7 +765,7 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
     assert!(seen_execution_runtime_request.has_context_management);
 
     let stored_candidates = request_candidate_repository
-        .list_by_request_id("trace-codex-cli-stream-local-123")
+        .list_by_request_id(&request_id)
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
@@ -774,7 +775,7 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         stored_usage = usage_repository
-            .find_by_request_id("trace-codex-cli-stream-local-123")
+            .find_by_request_id(&request_id)
             .await
             .expect("usage lookup should succeed");
         if stored_usage
